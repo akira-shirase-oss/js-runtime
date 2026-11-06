@@ -1187,6 +1187,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "jsrt-load"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "libc"
 version = "0.2.191"
 source = "registry+https://github.com/rust-lang/crates.io-index"

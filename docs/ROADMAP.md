@@ -64,8 +64,8 @@ not a thing scripts can rely on.
 
 | Step | Outcome | Invariant | Failure case | Acceptance test |
 |---|---|---|---|---|
-| 7.1 cold start | 1,000 short scripts → p50/p95 startup + steady RSS | recorded machine + commit; laptop numbers stay lab numbers | regressions kept, not rerun | committed results |
-| 7.2 boundary + serve load | 1,000,000 op calls → op overhead; **1,000,000+ HTTP requests through `rt.serve`** → throughput, p50/p95/p99 latency, error rate under saturation (the workspace load-test standard) | measured against the same build; misses kept, not rerun | overload behavior measured (backpressure, refused connections, handler crash rate) — not just throughput | committed results |
+| 7.1 cold start (done) | 1,000 release-binary spawns of `cold.js` → **p50 10.8ms / p95 14.4ms / p99 28.5ms**, max 138ms (one outlier, kept), 0 failures, peak child RSS 21.3MB | recorded machine + commit (`perf/results/m7-1-*`); laptop numbers stay lab numbers | regressions kept, not rerun | `perf/results/m7-1-cold-start-*` committed |
+| 7.2 boundary + serve load (done) | **1,000,000 op calls** → 28.4ns/call (~25.8ns boundary after loop baseline, ~35.2M calls/s). **1,000,000 HTTP requests through `rt.serve`**: 1,000,000/1,000,000 ok, **90,251 rps @32 conns, p50 346µs / p95 430µs / p99 608µs, max 11.7ms, zero errors/refused/timeouts**. Saturation probe @128 conns: rps flat (90,347) while p50 → 1485µs — extra concurrency queues, doesn't buy throughput; the knee is the single-threaded pull-model dispatch loop | measured against the same build; misses kept, not rerun | overload behavior measured — saturation shown as latency growth at flat throughput, not a marketing rps | `perf/results/m7-2*` committed (incl. the broken-workload smoke artifact, kept) |
 | 7.3 soak | one-hour timers/network workload → retained handles, RSS drift | failures are evidence | any growth investigated and written up | committed results |
 
 ## Rejected / deferred, honestly

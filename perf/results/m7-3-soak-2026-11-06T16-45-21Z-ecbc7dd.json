@@ -1,0 +1,3134 @@
+{
+  "milestone": "M7.3",
+  "workload": "soak.js for 20s: setTimeout(0) churn + self-cancelling intervals + loopback fetch every 4th iter; RSS sampled every 60s",
+  "environment": {
+    "commit": "ecbc7dd",
+    "date_utc": "2026-11-06T16:45:21+00:00",
+    "arch": "arm64",
+    "chip": "Apple M2 Pro",
+    "cores": 12,
+    "mem_bytes": 34359738368,
+    "os": "27.0.1",
+    "build": "release (opt-level 3)"
+  },
+  "duration_s": 60,
+  "rss_series": [
+    {
+      "t_s": 60,
+      "soak_rss": 28131328,
+      "serve_rss": 19333120,
+      "soak_alive": true
+    }
+  ],
+  "soak_rss_first_bytes": 28131328,
+  "soak_rss_last_bytes": 28131328,
+  "soak_rss_drift_bytes": 0,
+  "status_reports": [
+    {
+      "iters": 60,
+      "fetches": 0,
+      "fetchErrors": 15,
+      "intervalFires": 60,
+      "pending": 9
+    },
+    {
+      "iters": 120,
+      "fetches": 0,
+      "fetchErrors": 30,
+      "intervalFires": 120,
+      "pending": 9
+    },
+    {
+      "iters": 180,
+      "fetches": 0,
+      "fetchErrors": 45,
+      "intervalFires": 180,
+      "pending": 9
+    },
+    {
+      "iters": 240,
+      "fetches": 0,
+      "fetchErrors": 60,
+      "intervalFires": 242,
+      "pending": 9
+    },
+    {
+      "iters": 300,
+      "fetches": 0,
+      "fetchErrors": 75,
+      "intervalFires": 302,
+      "pending": 9
+    },
+    {
+      "iters": 360,
+      "fetches": 0,
+      "fetchErrors": 90,
+      "intervalFires": 363,
+      "pending": 9
+    },
+    {
+      "iters": 420,
+      "fetches": 0,
+      "fetchErrors": 105,
+      "intervalFires": 423,
+      "pending": 9
+    },
+    {
+      "iters": 480,
+      "fetches": 0,
+      "fetchErrors": 120,
+      "intervalFires": 486,
+      "pending": 9
+    },
+    {
+      "iters": 540,
+      "fetches": 0,
+      "fetchErrors": 135,
+      "intervalFires": 546,
+      "pending": 9
+    },
+    {
+      "iters": 600,
+      "fetches": 0,
+      "fetchErrors": 150,
+      "intervalFires": 606,
+      "pending": 9
+    },
+    {
+      "iters": 660,
+      "fetches": 0,
+      "fetchErrors": 165,
+      "intervalFires": 666,
+      "pending": 9
+    },
+    {
+      "iters": 720,
+      "fetches": 0,
+      "fetchErrors": 180,
+      "intervalFires": 726,
+      "pending": 9
+    },
+    {
+      "iters": 780,
+      "fetches": 0,
+      "fetchErrors": 195,
+      "intervalFires": 786,
+      "pending": 9
+    },
+    {
+      "iters": 840,
+      "fetches": 0,
+      "fetchErrors": 210,
+      "intervalFires": 847,
+      "pending": 9
+    },
+    {
+      "iters": 900,
+      "fetches": 0,
+      "fetchErrors": 225,
+      "intervalFires": 907,
+      "pending": 9
+    },
+    {
+      "iters": 960,
+      "fetches": 0,
+      "fetchErrors": 240,
+      "intervalFires": 967,
+      "pending": 9
+    },
+    {
+      "iters": 1020,
+      "fetches": 0,
+      "fetchErrors": 255,
+      "intervalFires": 1027,
+      "pending": 9
+    },
+    {
+      "iters": 1080,
+      "fetches": 0,
+      "fetchErrors": 270,
+      "intervalFires": 1087,
+      "pending": 9
+    },
+    {
+      "iters": 1140,
+      "fetches": 0,
+      "fetchErrors": 285,
+      "intervalFires": 1147,
+      "pending": 9
+    },
+    {
+      "iters": 1200,
+      "fetches": 0,
+      "fetchErrors": 300,
+      "intervalFires": 1207,
+      "pending": 9
+    },
+    {
+      "iters": 1260,
+      "fetches": 0,
+      "fetchErrors": 315,
+      "intervalFires": 1267,
+      "pending": 9
+    },
+    {
+      "iters": 1320,
+      "fetches": 0,
+      "fetchErrors": 330,
+      "intervalFires": 1330,
+      "pending": 9
+    },
+    {
+      "iters": 1380,
+      "fetches": 0,
+      "fetchErrors": 345,
+      "intervalFires": 1390,
+      "pending": 9
+    },
+    {
+      "iters": 1440,
+      "fetches": 0,
+      "fetchErrors": 360,
+      "intervalFires": 1450,
+      "pending": 9
+    },
+    {
+      "iters": 1500,
+      "fetches": 0,
+      "fetchErrors": 375,
+      "intervalFires": 1510,
+      "pending": 9
+    },
+    {
+      "iters": 1560,
+      "fetches": 0,
+      "fetchErrors": 390,
+      "intervalFires": 1570,
+      "pending": 9
+    },
+    {
+      "iters": 1620,
+      "fetches": 0,
+      "fetchErrors": 405,
+      "intervalFires": 1630,
+      "pending": 9
+    },
+    {
+      "iters": 1680,
+      "fetches": 0,
+      "fetchErrors": 420,
+      "intervalFires": 1690,
+      "pending": 9
+    },
+    {
+      "iters": 1740,
+      "fetches": 0,
+      "fetchErrors": 435,
+      "intervalFires": 1750,
+      "pending": 9
+    },
+    {
+      "iters": 1800,
+      "fetches": 0,
+      "fetchErrors": 450,
+      "intervalFires": 1810,
+      "pending": 9
+    },
+    {
+      "iters": 1860,
+      "fetches": 0,
+      "fetchErrors": 465,
+      "intervalFires": 1870,
+      "pending": 9
+    },
+    {
+      "iters": 1920,
+      "fetches": 0,
+      "fetchErrors": 480,
+      "intervalFires": 1930,
+      "pending": 9
+    },
+    {
+      "iters": 1980,
+      "fetches": 0,
+      "fetchErrors": 495,
+      "intervalFires": 1990,
+      "pending": 9
+    },
+    {
+      "iters": 2040,
+      "fetches": 0,
+      "fetchErrors": 510,
+      "intervalFires": 2050,
+      "pending": 9
+    },
+    {
+      "iters": 2100,
+      "fetches": 0,
+      "fetchErrors": 525,
+      "intervalFires": 2110,
+      "pending": 9
+    },
+    {
+      "iters": 2160,
+      "fetches": 0,
+      "fetchErrors": 540,
+      "intervalFires": 2172,
+      "pending": 9
+    },
+    {
+      "iters": 2220,
+      "fetches": 0,
+      "fetchErrors": 555,
+      "intervalFires": 2232,
+      "pending": 9
+    },
+    {
+      "iters": 2280,
+      "fetches": 0,
+      "fetchErrors": 570,
+      "intervalFires": 2292,
+      "pending": 9
+    },
+    {
+      "iters": 2340,
+      "fetches": 0,
+      "fetchErrors": 585,
+      "intervalFires": 2352,
+      "pending": 9
+    },
+    {
+      "iters": 2400,
+      "fetches": 0,
+      "fetchErrors": 600,
+      "intervalFires": 2412,
+      "pending": 9
+    },
+    {
+      "iters": 2460,
+      "fetches": 0,
+      "fetchErrors": 615,
+      "intervalFires": 2472,
+      "pending": 9
+    },
+    {
+      "iters": 2520,
+      "fetches": 0,
+      "fetchErrors": 630,
+      "intervalFires": 2532,
+      "pending": 9
+    },
+    {
+      "iters": 2580,
+      "fetches": 0,
+      "fetchErrors": 645,
+      "intervalFires": 2592,
+      "pending": 9
+    },
+    {
+      "iters": 2640,
+      "fetches": 0,
+      "fetchErrors": 660,
+      "intervalFires": 2652,
+      "pending": 9
+    },
+    {
+      "iters": 2700,
+      "fetches": 0,
+      "fetchErrors": 675,
+      "intervalFires": 2712,
+      "pending": 9
+    },
+    {
+      "iters": 2760,
+      "fetches": 0,
+      "fetchErrors": 690,
+      "intervalFires": 2772,
+      "pending": 9
+    },
+    {
+      "iters": 2820,
+      "fetches": 0,
+      "fetchErrors": 705,
+      "intervalFires": 2832,
+      "pending": 9
+    },
+    {
+      "iters": 2880,
+      "fetches": 0,
+      "fetchErrors": 720,
+      "intervalFires": 2892,
+      "pending": 9
+    },
+    {
+      "iters": 2940,
+      "fetches": 0,
+      "fetchErrors": 735,
+      "intervalFires": 2952,
+      "pending": 9
+    },
+    {
+      "iters": 3000,
+      "fetches": 0,
+      "fetchErrors": 750,
+      "intervalFires": 3012,
+      "pending": 9
+    },
+    {
+      "iters": 3060,
+      "fetches": 0,
+      "fetchErrors": 765,
+      "intervalFires": 3072,
+      "pending": 9
+    },
+    {
+      "iters": 3120,
+      "fetches": 0,
+      "fetchErrors": 780,
+      "intervalFires": 3132,
+      "pending": 9
+    },
+    {
+      "iters": 3180,
+      "fetches": 0,
+      "fetchErrors": 795,
+      "intervalFires": 3192,
+      "pending": 9
+    },
+    {
+      "iters": 3240,
+      "fetches": 0,
+      "fetchErrors": 810,
+      "intervalFires": 3252,
+      "pending": 9
+    },
+    {
+      "iters": 3300,
+      "fetches": 0,
+      "fetchErrors": 825,
+      "intervalFires": 3312,
+      "pending": 9
+    },
+    {
+      "iters": 3360,
+      "fetches": 0,
+      "fetchErrors": 840,
+      "intervalFires": 3372,
+      "pending": 9
+    },
+    {
+      "iters": 3420,
+      "fetches": 0,
+      "fetchErrors": 855,
+      "intervalFires": 3432,
+      "pending": 9
+    },
+    {
+      "iters": 3480,
+      "fetches": 0,
+      "fetchErrors": 870,
+      "intervalFires": 3492,
+      "pending": 9
+    },
+    {
+      "iters": 3540,
+      "fetches": 0,
+      "fetchErrors": 885,
+      "intervalFires": 3552,
+      "pending": 9
+    },
+    {
+      "iters": 3600,
+      "fetches": 0,
+      "fetchErrors": 900,
+      "intervalFires": 3612,
+      "pending": 9
+    },
+    {
+      "iters": 3660,
+      "fetches": 0,
+      "fetchErrors": 915,
+      "intervalFires": 3672,
+      "pending": 9
+    },
+    {
+      "iters": 3720,
+      "fetches": 0,
+      "fetchErrors": 930,
+      "intervalFires": 3732,
+      "pending": 9
+    },
+    {
+      "iters": 3780,
+      "fetches": 0,
+      "fetchErrors": 945,
+      "intervalFires": 3792,
+      "pending": 9
+    },
+    {
+      "iters": 3840,
+      "fetches": 0,
+      "fetchErrors": 960,
+      "intervalFires": 3852,
+      "pending": 9
+    },
+    {
+      "iters": 3900,
+      "fetches": 0,
+      "fetchErrors": 975,
+      "intervalFires": 3912,
+      "pending": 9
+    },
+    {
+      "iters": 3960,
+      "fetches": 0,
+      "fetchErrors": 990,
+      "intervalFires": 3972,
+      "pending": 9
+    },
+    {
+      "iters": 4020,
+      "fetches": 0,
+      "fetchErrors": 1005,
+      "intervalFires": 4032,
+      "pending": 9
+    },
+    {
+      "iters": 4080,
+      "fetches": 0,
+      "fetchErrors": 1020,
+      "intervalFires": 4092,
+      "pending": 9
+    },
+    {
+      "iters": 4140,
+      "fetches": 0,
+      "fetchErrors": 1035,
+      "intervalFires": 4153,
+      "pending": 9
+    },
+    {
+      "iters": 4200,
+      "fetches": 0,
+      "fetchErrors": 1050,
+      "intervalFires": 4215,
+      "pending": 9
+    },
+    {
+      "iters": 4260,
+      "fetches": 0,
+      "fetchErrors": 1065,
+      "intervalFires": 4276,
+      "pending": 9
+    },
+    {
+      "iters": 4320,
+      "fetches": 0,
+      "fetchErrors": 1080,
+      "intervalFires": 4336,
+      "pending": 9
+    },
+    {
+      "iters": 4380,
+      "fetches": 0,
+      "fetchErrors": 1095,
+      "intervalFires": 4396,
+      "pending": 9
+    },
+    {
+      "iters": 4440,
+      "fetches": 0,
+      "fetchErrors": 1110,
+      "intervalFires": 4456,
+      "pending": 9
+    },
+    {
+      "iters": 4500,
+      "fetches": 0,
+      "fetchErrors": 1125,
+      "intervalFires": 4516,
+      "pending": 9
+    },
+    {
+      "iters": 4560,
+      "fetches": 0,
+      "fetchErrors": 1140,
+      "intervalFires": 4576,
+      "pending": 9
+    },
+    {
+      "iters": 4620,
+      "fetches": 0,
+      "fetchErrors": 1155,
+      "intervalFires": 4636,
+      "pending": 9
+    },
+    {
+      "iters": 4680,
+      "fetches": 0,
+      "fetchErrors": 1170,
+      "intervalFires": 4696,
+      "pending": 9
+    },
+    {
+      "iters": 4740,
+      "fetches": 0,
+      "fetchErrors": 1185,
+      "intervalFires": 4756,
+      "pending": 9
+    },
+    {
+      "iters": 4800,
+      "fetches": 0,
+      "fetchErrors": 1200,
+      "intervalFires": 4816,
+      "pending": 9
+    },
+    {
+      "iters": 4860,
+      "fetches": 0,
+      "fetchErrors": 1215,
+      "intervalFires": 4876,
+      "pending": 9
+    },
+    {
+      "iters": 4920,
+      "fetches": 0,
+      "fetchErrors": 1230,
+      "intervalFires": 4936,
+      "pending": 9
+    },
+    {
+      "iters": 4980,
+      "fetches": 0,
+      "fetchErrors": 1245,
+      "intervalFires": 4996,
+      "pending": 9
+    },
+    {
+      "iters": 5040,
+      "fetches": 0,
+      "fetchErrors": 1260,
+      "intervalFires": 5056,
+      "pending": 9
+    },
+    {
+      "iters": 5100,
+      "fetches": 0,
+      "fetchErrors": 1275,
+      "intervalFires": 5116,
+      "pending": 9
+    },
+    {
+      "iters": 5160,
+      "fetches": 0,
+      "fetchErrors": 1290,
+      "intervalFires": 5177,
+      "pending": 9
+    },
+    {
+      "iters": 5220,
+      "fetches": 0,
+      "fetchErrors": 1305,
+      "intervalFires": 5238,
+      "pending": 9
+    },
+    {
+      "iters": 5280,
+      "fetches": 0,
+      "fetchErrors": 1320,
+      "intervalFires": 5298,
+      "pending": 9
+    },
+    {
+      "iters": 5340,
+      "fetches": 0,
+      "fetchErrors": 1335,
+      "intervalFires": 5361,
+      "pending": 9
+    },
+    {
+      "iters": 5400,
+      "fetches": 0,
+      "fetchErrors": 1350,
+      "intervalFires": 5422,
+      "pending": 9
+    },
+    {
+      "iters": 5460,
+      "fetches": 0,
+      "fetchErrors": 1365,
+      "intervalFires": 5483,
+      "pending": 9
+    },
+    {
+      "iters": 5520,
+      "fetches": 0,
+      "fetchErrors": 1380,
+      "intervalFires": 5543,
+      "pending": 9
+    },
+    {
+      "iters": 5580,
+      "fetches": 0,
+      "fetchErrors": 1395,
+      "intervalFires": 5603,
+      "pending": 9
+    },
+    {
+      "iters": 5640,
+      "fetches": 0,
+      "fetchErrors": 1410,
+      "intervalFires": 5663,
+      "pending": 9
+    },
+    {
+      "iters": 5700,
+      "fetches": 0,
+      "fetchErrors": 1425,
+      "intervalFires": 5723,
+      "pending": 9
+    },
+    {
+      "iters": 5760,
+      "fetches": 0,
+      "fetchErrors": 1440,
+      "intervalFires": 5783,
+      "pending": 9
+    },
+    {
+      "iters": 5820,
+      "fetches": 0,
+      "fetchErrors": 1455,
+      "intervalFires": 5843,
+      "pending": 9
+    },
+    {
+      "iters": 5880,
+      "fetches": 0,
+      "fetchErrors": 1470,
+      "intervalFires": 5903,
+      "pending": 9
+    },
+    {
+      "iters": 5940,
+      "fetches": 0,
+      "fetchErrors": 1485,
+      "intervalFires": 5963,
+      "pending": 9
+    },
+    {
+      "iters": 6000,
+      "fetches": 0,
+      "fetchErrors": 1500,
+      "intervalFires": 6023,
+      "pending": 9
+    },
+    {
+      "iters": 6060,
+      "fetches": 0,
+      "fetchErrors": 1515,
+      "intervalFires": 6083,
+      "pending": 9
+    },
+    {
+      "iters": 6120,
+      "fetches": 0,
+      "fetchErrors": 1530,
+      "intervalFires": 6143,
+      "pending": 9
+    },
+    {
+      "iters": 6180,
+      "fetches": 0,
+      "fetchErrors": 1545,
+      "intervalFires": 6203,
+      "pending": 9
+    },
+    {
+      "iters": 6240,
+      "fetches": 0,
+      "fetchErrors": 1560,
+      "intervalFires": 6263,
+      "pending": 9
+    },
+    {
+      "iters": 6300,
+      "fetches": 0,
+      "fetchErrors": 1575,
+      "intervalFires": 6323,
+      "pending": 9
+    },
+    {
+      "iters": 6360,
+      "fetches": 0,
+      "fetchErrors": 1590,
+      "intervalFires": 6383,
+      "pending": 9
+    },
+    {
+      "iters": 6420,
+      "fetches": 0,
+      "fetchErrors": 1605,
+      "intervalFires": 6443,
+      "pending": 9
+    },
+    {
+      "iters": 6480,
+      "fetches": 0,
+      "fetchErrors": 1620,
+      "intervalFires": 6503,
+      "pending": 9
+    },
+    {
+      "iters": 6540,
+      "fetches": 0,
+      "fetchErrors": 1635,
+      "intervalFires": 6563,
+      "pending": 9
+    },
+    {
+      "iters": 6600,
+      "fetches": 0,
+      "fetchErrors": 1650,
+      "intervalFires": 6623,
+      "pending": 9
+    },
+    {
+      "iters": 6660,
+      "fetches": 0,
+      "fetchErrors": 1665,
+      "intervalFires": 6683,
+      "pending": 9
+    },
+    {
+      "iters": 6720,
+      "fetches": 0,
+      "fetchErrors": 1680,
+      "intervalFires": 6743,
+      "pending": 9
+    },
+    {
+      "iters": 6780,
+      "fetches": 0,
+      "fetchErrors": 1695,
+      "intervalFires": 6803,
+      "pending": 9
+    },
+    {
+      "iters": 6840,
+      "fetches": 0,
+      "fetchErrors": 1710,
+      "intervalFires": 6863,
+      "pending": 9
+    },
+    {
+      "iters": 6900,
+      "fetches": 0,
+      "fetchErrors": 1725,
+      "intervalFires": 6923,
+      "pending": 9
+    },
+    {
+      "iters": 6960,
+      "fetches": 0,
+      "fetchErrors": 1740,
+      "intervalFires": 6983,
+      "pending": 9
+    },
+    {
+      "iters": 7020,
+      "fetches": 0,
+      "fetchErrors": 1755,
+      "intervalFires": 7043,
+      "pending": 9
+    },
+    {
+      "iters": 7080,
+      "fetches": 0,
+      "fetchErrors": 1770,
+      "intervalFires": 7103,
+      "pending": 9
+    },
+    {
+      "iters": 7140,
+      "fetches": 0,
+      "fetchErrors": 1785,
+      "intervalFires": 7163,
+      "pending": 9
+    },
+    {
+      "iters": 7200,
+      "fetches": 0,
+      "fetchErrors": 1800,
+      "intervalFires": 7223,
+      "pending": 9
+    },
+    {
+      "iters": 7260,
+      "fetches": 0,
+      "fetchErrors": 1815,
+      "intervalFires": 7283,
+      "pending": 9
+    },
+    {
+      "iters": 7320,
+      "fetches": 0,
+      "fetchErrors": 1830,
+      "intervalFires": 7343,
+      "pending": 9
+    },
+    {
+      "iters": 7380,
+      "fetches": 0,
+      "fetchErrors": 1845,
+      "intervalFires": 7403,
+      "pending": 9
+    },
+    {
+      "iters": 7440,
+      "fetches": 0,
+      "fetchErrors": 1860,
+      "intervalFires": 7463,
+      "pending": 9
+    },
+    {
+      "iters": 7500,
+      "fetches": 0,
+      "fetchErrors": 1875,
+      "intervalFires": 7523,
+      "pending": 9
+    },
+    {
+      "iters": 7560,
+      "fetches": 0,
+      "fetchErrors": 1890,
+      "intervalFires": 7583,
+      "pending": 9
+    },
+    {
+      "iters": 7620,
+      "fetches": 0,
+      "fetchErrors": 1905,
+      "intervalFires": 7643,
+      "pending": 9
+    },
+    {
+      "iters": 7680,
+      "fetches": 0,
+      "fetchErrors": 1920,
+      "intervalFires": 7703,
+      "pending": 9
+    },
+    {
+      "iters": 7740,
+      "fetches": 0,
+      "fetchErrors": 1935,
+      "intervalFires": 7763,
+      "pending": 9
+    },
+    {
+      "iters": 7800,
+      "fetches": 0,
+      "fetchErrors": 1950,
+      "intervalFires": 7823,
+      "pending": 9
+    },
+    {
+      "iters": 7860,
+      "fetches": 0,
+      "fetchErrors": 1965,
+      "intervalFires": 7883,
+      "pending": 9
+    },
+    {
+      "iters": 7920,
+      "fetches": 0,
+      "fetchErrors": 1980,
+      "intervalFires": 7943,
+      "pending": 9
+    },
+    {
+      "iters": 7980,
+      "fetches": 0,
+      "fetchErrors": 1995,
+      "intervalFires": 8003,
+      "pending": 9
+    },
+    {
+      "iters": 8040,
+      "fetches": 0,
+      "fetchErrors": 2010,
+      "intervalFires": 8063,
+      "pending": 9
+    },
+    {
+      "iters": 8100,
+      "fetches": 0,
+      "fetchErrors": 2025,
+      "intervalFires": 8123,
+      "pending": 9
+    },
+    {
+      "iters": 8160,
+      "fetches": 0,
+      "fetchErrors": 2040,
+      "intervalFires": 8183,
+      "pending": 9
+    },
+    {
+      "iters": 8220,
+      "fetches": 0,
+      "fetchErrors": 2055,
+      "intervalFires": 8243,
+      "pending": 9
+    },
+    {
+      "iters": 8280,
+      "fetches": 0,
+      "fetchErrors": 2070,
+      "intervalFires": 8303,
+      "pending": 9
+    },
+    {
+      "iters": 8340,
+      "fetches": 0,
+      "fetchErrors": 2085,
+      "intervalFires": 8363,
+      "pending": 9
+    },
+    {
+      "iters": 8400,
+      "fetches": 0,
+      "fetchErrors": 2100,
+      "intervalFires": 8423,
+      "pending": 9
+    },
+    {
+      "iters": 8460,
+      "fetches": 0,
+      "fetchErrors": 2115,
+      "intervalFires": 8483,
+      "pending": 9
+    },
+    {
+      "iters": 8520,
+      "fetches": 0,
+      "fetchErrors": 2130,
+      "intervalFires": 8543,
+      "pending": 9
+    },
+    {
+      "iters": 8580,
+      "fetches": 0,
+      "fetchErrors": 2145,
+      "intervalFires": 8603,
+      "pending": 9
+    },
+    {
+      "iters": 8640,
+      "fetches": 0,
+      "fetchErrors": 2160,
+      "intervalFires": 8663,
+      "pending": 9
+    },
+    {
+      "iters": 8700,
+      "fetches": 0,
+      "fetchErrors": 2175,
+      "intervalFires": 8723,
+      "pending": 9
+    },
+    {
+      "iters": 8760,
+      "fetches": 0,
+      "fetchErrors": 2190,
+      "intervalFires": 8783,
+      "pending": 9
+    },
+    {
+      "iters": 8820,
+      "fetches": 0,
+      "fetchErrors": 2205,
+      "intervalFires": 8843,
+      "pending": 9
+    },
+    {
+      "iters": 8880,
+      "fetches": 0,
+      "fetchErrors": 2220,
+      "intervalFires": 8903,
+      "pending": 9
+    },
+    {
+      "iters": 8940,
+      "fetches": 0,
+      "fetchErrors": 2235,
+      "intervalFires": 8963,
+      "pending": 9
+    },
+    {
+      "iters": 9000,
+      "fetches": 0,
+      "fetchErrors": 2250,
+      "intervalFires": 9023,
+      "pending": 9
+    },
+    {
+      "iters": 9060,
+      "fetches": 0,
+      "fetchErrors": 2265,
+      "intervalFires": 9083,
+      "pending": 9
+    },
+    {
+      "iters": 9120,
+      "fetches": 0,
+      "fetchErrors": 2280,
+      "intervalFires": 9143,
+      "pending": 9
+    },
+    {
+      "iters": 9180,
+      "fetches": 0,
+      "fetchErrors": 2295,
+      "intervalFires": 9203,
+      "pending": 9
+    },
+    {
+      "iters": 9240,
+      "fetches": 0,
+      "fetchErrors": 2310,
+      "intervalFires": 9263,
+      "pending": 9
+    },
+    {
+      "iters": 9300,
+      "fetches": 0,
+      "fetchErrors": 2325,
+      "intervalFires": 9323,
+      "pending": 9
+    },
+    {
+      "iters": 9360,
+      "fetches": 0,
+      "fetchErrors": 2340,
+      "intervalFires": 9383,
+      "pending": 9
+    },
+    {
+      "iters": 9420,
+      "fetches": 0,
+      "fetchErrors": 2355,
+      "intervalFires": 9443,
+      "pending": 9
+    },
+    {
+      "iters": 9480,
+      "fetches": 0,
+      "fetchErrors": 2370,
+      "intervalFires": 9503,
+      "pending": 9
+    },
+    {
+      "iters": 9540,
+      "fetches": 0,
+      "fetchErrors": 2385,
+      "intervalFires": 9563,
+      "pending": 9
+    },
+    {
+      "iters": 9600,
+      "fetches": 0,
+      "fetchErrors": 2400,
+      "intervalFires": 9623,
+      "pending": 9
+    },
+    {
+      "iters": 9660,
+      "fetches": 0,
+      "fetchErrors": 2415,
+      "intervalFires": 9683,
+      "pending": 9
+    },
+    {
+      "iters": 9720,
+      "fetches": 0,
+      "fetchErrors": 2430,
+      "intervalFires": 9743,
+      "pending": 9
+    },
+    {
+      "iters": 9780,
+      "fetches": 0,
+      "fetchErrors": 2445,
+      "intervalFires": 9803,
+      "pending": 9
+    },
+    {
+      "iters": 9840,
+      "fetches": 0,
+      "fetchErrors": 2460,
+      "intervalFires": 9863,
+      "pending": 9
+    },
+    {
+      "iters": 9900,
+      "fetches": 0,
+      "fetchErrors": 2475,
+      "intervalFires": 9923,
+      "pending": 9
+    },
+    {
+      "iters": 9960,
+      "fetches": 0,
+      "fetchErrors": 2490,
+      "intervalFires": 9983,
+      "pending": 9
+    },
+    {
+      "iters": 10020,
+      "fetches": 0,
+      "fetchErrors": 2505,
+      "intervalFires": 10043,
+      "pending": 9
+    },
+    {
+      "iters": 10080,
+      "fetches": 0,
+      "fetchErrors": 2520,
+      "intervalFires": 10103,
+      "pending": 9
+    },
+    {
+      "iters": 10140,
+      "fetches": 0,
+      "fetchErrors": 2535,
+      "intervalFires": 10163,
+      "pending": 9
+    },
+    {
+      "iters": 10200,
+      "fetches": 0,
+      "fetchErrors": 2550,
+      "intervalFires": 10223,
+      "pending": 9
+    },
+    {
+      "iters": 10260,
+      "fetches": 0,
+      "fetchErrors": 2565,
+      "intervalFires": 10283,
+      "pending": 9
+    },
+    {
+      "iters": 10320,
+      "fetches": 0,
+      "fetchErrors": 2580,
+      "intervalFires": 10343,
+      "pending": 9
+    },
+    {
+      "iters": 10380,
+      "fetches": 0,
+      "fetchErrors": 2595,
+      "intervalFires": 10403,
+      "pending": 9
+    },
+    {
+      "iters": 10440,
+      "fetches": 0,
+      "fetchErrors": 2610,
+      "intervalFires": 10463,
+      "pending": 9
+    },
+    {
+      "iters": 10500,
+      "fetches": 0,
+      "fetchErrors": 2625,
+      "intervalFires": 10523,
+      "pending": 9
+    },
+    {
+      "iters": 10560,
+      "fetches": 0,
+      "fetchErrors": 2640,
+      "intervalFires": 10583,
+      "pending": 9
+    },
+    {
+      "iters": 10620,
+      "fetches": 0,
+      "fetchErrors": 2655,
+      "intervalFires": 10643,
+      "pending": 9
+    },
+    {
+      "iters": 10680,
+      "fetches": 0,
+      "fetchErrors": 2670,
+      "intervalFires": 10703,
+      "pending": 9
+    },
+    {
+      "iters": 10740,
+      "fetches": 0,
+      "fetchErrors": 2685,
+      "intervalFires": 10763,
+      "pending": 9
+    },
+    {
+      "iters": 10800,
+      "fetches": 0,
+      "fetchErrors": 2700,
+      "intervalFires": 10823,
+      "pending": 9
+    },
+    {
+      "iters": 10860,
+      "fetches": 0,
+      "fetchErrors": 2715,
+      "intervalFires": 10883,
+      "pending": 9
+    },
+    {
+      "iters": 10920,
+      "fetches": 0,
+      "fetchErrors": 2730,
+      "intervalFires": 10943,
+      "pending": 9
+    },
+    {
+      "iters": 10980,
+      "fetches": 0,
+      "fetchErrors": 2745,
+      "intervalFires": 11003,
+      "pending": 9
+    },
+    {
+      "iters": 11040,
+      "fetches": 0,
+      "fetchErrors": 2760,
+      "intervalFires": 11063,
+      "pending": 9
+    },
+    {
+      "iters": 11100,
+      "fetches": 0,
+      "fetchErrors": 2775,
+      "intervalFires": 11123,
+      "pending": 9
+    },
+    {
+      "iters": 11160,
+      "fetches": 0,
+      "fetchErrors": 2790,
+      "intervalFires": 11183,
+      "pending": 9
+    },
+    {
+      "iters": 11220,
+      "fetches": 0,
+      "fetchErrors": 2805,
+      "intervalFires": 11243,
+      "pending": 9
+    },
+    {
+      "iters": 11280,
+      "fetches": 0,
+      "fetchErrors": 2820,
+      "intervalFires": 11303,
+      "pending": 9
+    },
+    {
+      "iters": 11340,
+      "fetches": 0,
+      "fetchErrors": 2835,
+      "intervalFires": 11363,
+      "pending": 9
+    },
+    {
+      "iters": 11400,
+      "fetches": 0,
+      "fetchErrors": 2850,
+      "intervalFires": 11423,
+      "pending": 9
+    },
+    {
+      "iters": 11460,
+      "fetches": 0,
+      "fetchErrors": 2865,
+      "intervalFires": 11483,
+      "pending": 9
+    },
+    {
+      "iters": 11520,
+      "fetches": 0,
+      "fetchErrors": 2880,
+      "intervalFires": 11543,
+      "pending": 9
+    },
+    {
+      "iters": 11580,
+      "fetches": 0,
+      "fetchErrors": 2895,
+      "intervalFires": 11603,
+      "pending": 9
+    },
+    {
+      "iters": 11640,
+      "fetches": 0,
+      "fetchErrors": 2910,
+      "intervalFires": 11663,
+      "pending": 9
+    },
+    {
+      "iters": 11700,
+      "fetches": 0,
+      "fetchErrors": 2925,
+      "intervalFires": 11724,
+      "pending": 9
+    },
+    {
+      "iters": 11760,
+      "fetches": 0,
+      "fetchErrors": 2940,
+      "intervalFires": 11784,
+      "pending": 9
+    },
+    {
+      "iters": 11820,
+      "fetches": 0,
+      "fetchErrors": 2955,
+      "intervalFires": 11844,
+      "pending": 9
+    },
+    {
+      "iters": 11880,
+      "fetches": 0,
+      "fetchErrors": 2970,
+      "intervalFires": 11904,
+      "pending": 9
+    },
+    {
+      "iters": 11940,
+      "fetches": 0,
+      "fetchErrors": 2985,
+      "intervalFires": 11964,
+      "pending": 9
+    },
+    {
+      "iters": 12000,
+      "fetches": 0,
+      "fetchErrors": 3000,
+      "intervalFires": 12024,
+      "pending": 9
+    },
+    {
+      "iters": 12060,
+      "fetches": 0,
+      "fetchErrors": 3015,
+      "intervalFires": 12084,
+      "pending": 9
+    },
+    {
+      "iters": 12120,
+      "fetches": 0,
+      "fetchErrors": 3030,
+      "intervalFires": 12144,
+      "pending": 9
+    },
+    {
+      "iters": 12180,
+      "fetches": 0,
+      "fetchErrors": 3045,
+      "intervalFires": 12204,
+      "pending": 9
+    },
+    {
+      "iters": 12240,
+      "fetches": 0,
+      "fetchErrors": 3060,
+      "intervalFires": 12264,
+      "pending": 9
+    },
+    {
+      "iters": 12300,
+      "fetches": 0,
+      "fetchErrors": 3075,
+      "intervalFires": 12324,
+      "pending": 9
+    },
+    {
+      "iters": 12360,
+      "fetches": 0,
+      "fetchErrors": 3090,
+      "intervalFires": 12384,
+      "pending": 9
+    },
+    {
+      "iters": 12420,
+      "fetches": 0,
+      "fetchErrors": 3105,
+      "intervalFires": 12444,
+      "pending": 9
+    },
+    {
+      "iters": 12480,
+      "fetches": 0,
+      "fetchErrors": 3120,
+      "intervalFires": 12504,
+      "pending": 9
+    },
+    {
+      "iters": 12540,
+      "fetches": 0,
+      "fetchErrors": 3135,
+      "intervalFires": 12564,
+      "pending": 9
+    },
+    {
+      "iters": 12600,
+      "fetches": 0,
+      "fetchErrors": 3150,
+      "intervalFires": 12624,
+      "pending": 9
+    },
+    {
+      "iters": 12660,
+      "fetches": 0,
+      "fetchErrors": 3165,
+      "intervalFires": 12684,
+      "pending": 9
+    },
+    {
+      "iters": 12720,
+      "fetches": 0,
+      "fetchErrors": 3180,
+      "intervalFires": 12744,
+      "pending": 9
+    },
+    {
+      "iters": 12780,
+      "fetches": 0,
+      "fetchErrors": 3195,
+      "intervalFires": 12804,
+      "pending": 9
+    },
+    {
+      "iters": 12840,
+      "fetches": 0,
+      "fetchErrors": 3210,
+      "intervalFires": 12864,
+      "pending": 9
+    },
+    {
+      "iters": 12900,
+      "fetches": 0,
+      "fetchErrors": 3225,
+      "intervalFires": 12924,
+      "pending": 9
+    },
+    {
+      "iters": 12960,
+      "fetches": 0,
+      "fetchErrors": 3240,
+      "intervalFires": 12985,
+      "pending": 9
+    },
+    {
+      "iters": 13020,
+      "fetches": 0,
+      "fetchErrors": 3255,
+      "intervalFires": 13045,
+      "pending": 9
+    },
+    {
+      "iters": 13080,
+      "fetches": 0,
+      "fetchErrors": 3270,
+      "intervalFires": 13105,
+      "pending": 9
+    },
+    {
+      "iters": 13140,
+      "fetches": 0,
+      "fetchErrors": 3285,
+      "intervalFires": 13165,
+      "pending": 9
+    },
+    {
+      "iters": 13200,
+      "fetches": 0,
+      "fetchErrors": 3300,
+      "intervalFires": 13231,
+      "pending": 9
+    },
+    {
+      "iters": 13260,
+      "fetches": 0,
+      "fetchErrors": 3315,
+      "intervalFires": 13291,
+      "pending": 9
+    },
+    {
+      "iters": 13320,
+      "fetches": 0,
+      "fetchErrors": 3330,
+      "intervalFires": 13351,
+      "pending": 9
+    },
+    {
+      "iters": 13380,
+      "fetches": 0,
+      "fetchErrors": 3345,
+      "intervalFires": 13411,
+      "pending": 9
+    },
+    {
+      "iters": 13440,
+      "fetches": 0,
+      "fetchErrors": 3360,
+      "intervalFires": 13471,
+      "pending": 9
+    },
+    {
+      "iters": 13500,
+      "fetches": 0,
+      "fetchErrors": 3375,
+      "intervalFires": 13531,
+      "pending": 9
+    },
+    {
+      "iters": 13560,
+      "fetches": 0,
+      "fetchErrors": 3390,
+      "intervalFires": 13591,
+      "pending": 9
+    },
+    {
+      "iters": 13620,
+      "fetches": 0,
+      "fetchErrors": 3405,
+      "intervalFires": 13652,
+      "pending": 9
+    },
+    {
+      "iters": 13680,
+      "fetches": 0,
+      "fetchErrors": 3420,
+      "intervalFires": 13712,
+      "pending": 9
+    },
+    {
+      "iters": 13740,
+      "fetches": 0,
+      "fetchErrors": 3435,
+      "intervalFires": 13773,
+      "pending": 9
+    },
+    {
+      "iters": 13800,
+      "fetches": 0,
+      "fetchErrors": 3450,
+      "intervalFires": 13833,
+      "pending": 9
+    },
+    {
+      "iters": 13860,
+      "fetches": 0,
+      "fetchErrors": 3465,
+      "intervalFires": 13893,
+      "pending": 9
+    },
+    {
+      "iters": 13920,
+      "fetches": 0,
+      "fetchErrors": 3480,
+      "intervalFires": 13953,
+      "pending": 9
+    },
+    {
+      "iters": 13980,
+      "fetches": 0,
+      "fetchErrors": 3495,
+      "intervalFires": 14013,
+      "pending": 9
+    },
+    {
+      "iters": 14040,
+      "fetches": 0,
+      "fetchErrors": 3510,
+      "intervalFires": 14074,
+      "pending": 9
+    },
+    {
+      "iters": 14100,
+      "fetches": 0,
+      "fetchErrors": 3525,
+      "intervalFires": 14134,
+      "pending": 9
+    },
+    {
+      "iters": 14160,
+      "fetches": 0,
+      "fetchErrors": 3540,
+      "intervalFires": 14194,
+      "pending": 9
+    },
+    {
+      "iters": 14220,
+      "fetches": 0,
+      "fetchErrors": 3555,
+      "intervalFires": 14254,
+      "pending": 9
+    },
+    {
+      "iters": 14280,
+      "fetches": 0,
+      "fetchErrors": 3570,
+      "intervalFires": 14315,
+      "pending": 9
+    },
+    {
+      "iters": 14340,
+      "fetches": 0,
+      "fetchErrors": 3585,
+      "intervalFires": 14375,
+      "pending": 9
+    },
+    {
+      "iters": 14400,
+      "fetches": 0,
+      "fetchErrors": 3600,
+      "intervalFires": 14436,
+      "pending": 9
+    },
+    {
+      "iters": 14460,
+      "fetches": 0,
+      "fetchErrors": 3615,
+      "intervalFires": 14498,
+      "pending": 9
+    },
+    {
+      "iters": 14520,
+      "fetches": 0,
+      "fetchErrors": 3630,
+      "intervalFires": 14558,
+      "pending": 9
+    },
+    {
+      "iters": 14580,
+      "fetches": 0,
+      "fetchErrors": 3645,
+      "intervalFires": 14618,
+      "pending": 9
+    },
+    {
+      "iters": 14640,
+      "fetches": 0,
+      "fetchErrors": 3660,
+      "intervalFires": 14678,
+      "pending": 9
+    },
+    {
+      "iters": 14700,
+      "fetches": 0,
+      "fetchErrors": 3675,
+      "intervalFires": 14738,
+      "pending": 9
+    },
+    {
+      "iters": 14760,
+      "fetches": 0,
+      "fetchErrors": 3690,
+      "intervalFires": 14798,
+      "pending": 9
+    },
+    {
+      "iters": 14820,
+      "fetches": 0,
+      "fetchErrors": 3705,
+      "intervalFires": 14858,
+      "pending": 9
+    },
+    {
+      "iters": 14880,
+      "fetches": 0,
+      "fetchErrors": 3720,
+      "intervalFires": 14918,
+      "pending": 9
+    },
+    {
+      "iters": 14940,
+      "fetches": 0,
+      "fetchErrors": 3735,
+      "intervalFires": 14978,
+      "pending": 9
+    },
+    {
+      "iters": 15000,
+      "fetches": 0,
+      "fetchErrors": 3750,
+      "intervalFires": 15038,
+      "pending": 9
+    },
+    {
+      "iters": 15060,
+      "fetches": 0,
+      "fetchErrors": 3765,
+      "intervalFires": 15098,
+      "pending": 9
+    },
+    {
+      "iters": 15120,
+      "fetches": 0,
+      "fetchErrors": 3780,
+      "intervalFires": 15159,
+      "pending": 9
+    },
+    {
+      "iters": 15180,
+      "fetches": 0,
+      "fetchErrors": 3795,
+      "intervalFires": 15222,
+      "pending": 9
+    },
+    {
+      "iters": 15240,
+      "fetches": 0,
+      "fetchErrors": 3810,
+      "intervalFires": 15282,
+      "pending": 9
+    },
+    {
+      "iters": 15300,
+      "fetches": 0,
+      "fetchErrors": 3825,
+      "intervalFires": 15342,
+      "pending": 9
+    },
+    {
+      "iters": 15360,
+      "fetches": 0,
+      "fetchErrors": 3840,
+      "intervalFires": 15406,
+      "pending": 9
+    },
+    {
+      "iters": 15420,
+      "fetches": 0,
+      "fetchErrors": 3855,
+      "intervalFires": 15466,
+      "pending": 9
+    },
+    {
+      "iters": 15480,
+      "fetches": 0,
+      "fetchErrors": 3870,
+      "intervalFires": 15526,
+      "pending": 9
+    },
+    {
+      "iters": 15540,
+      "fetches": 0,
+      "fetchErrors": 3885,
+      "intervalFires": 15586,
+      "pending": 9
+    },
+    {
+      "iters": 15600,
+      "fetches": 0,
+      "fetchErrors": 3900,
+      "intervalFires": 15646,
+      "pending": 9
+    },
+    {
+      "iters": 15660,
+      "fetches": 0,
+      "fetchErrors": 3915,
+      "intervalFires": 15708,
+      "pending": 9
+    },
+    {
+      "iters": 15720,
+      "fetches": 0,
+      "fetchErrors": 3930,
+      "intervalFires": 15768,
+      "pending": 9
+    },
+    {
+      "iters": 15780,
+      "fetches": 0,
+      "fetchErrors": 3945,
+      "intervalFires": 15828,
+      "pending": 9
+    },
+    {
+      "iters": 15840,
+      "fetches": 0,
+      "fetchErrors": 3960,
+      "intervalFires": 15888,
+      "pending": 9
+    },
+    {
+      "iters": 15900,
+      "fetches": 0,
+      "fetchErrors": 3975,
+      "intervalFires": 15951,
+      "pending": 9
+    },
+    {
+      "iters": 15960,
+      "fetches": 0,
+      "fetchErrors": 3990,
+      "intervalFires": 16011,
+      "pending": 9
+    },
+    {
+      "iters": 16020,
+      "fetches": 0,
+      "fetchErrors": 4005,
+      "intervalFires": 16071,
+      "pending": 9
+    },
+    {
+      "iters": 16080,
+      "fetches": 0,
+      "fetchErrors": 4020,
+      "intervalFires": 16131,
+      "pending": 9
+    },
+    {
+      "iters": 16140,
+      "fetches": 0,
+      "fetchErrors": 4035,
+      "intervalFires": 16191,
+      "pending": 9
+    },
+    {
+      "iters": 16200,
+      "fetches": 0,
+      "fetchErrors": 4050,
+      "intervalFires": 16251,
+      "pending": 9
+    },
+    {
+      "iters": 16260,
+      "fetches": 0,
+      "fetchErrors": 4065,
+      "intervalFires": 16311,
+      "pending": 9
+    },
+    {
+      "iters": 16320,
+      "fetches": 0,
+      "fetchErrors": 4080,
+      "intervalFires": 16371,
+      "pending": 9
+    },
+    {
+      "iters": 16380,
+      "fetches": 0,
+      "fetchErrors": 4095,
+      "intervalFires": 16431,
+      "pending": 9
+    },
+    {
+      "iters": 16440,
+      "fetches": 0,
+      "fetchErrors": 4110,
+      "intervalFires": 16491,
+      "pending": 9
+    },
+    {
+      "iters": 16500,
+      "fetches": 0,
+      "fetchErrors": 4125,
+      "intervalFires": 16551,
+      "pending": 9
+    },
+    {
+      "iters": 16560,
+      "fetches": 0,
+      "fetchErrors": 4140,
+      "intervalFires": 16611,
+      "pending": 9
+    },
+    {
+      "iters": 16620,
+      "fetches": 0,
+      "fetchErrors": 4155,
+      "intervalFires": 16671,
+      "pending": 9
+    },
+    {
+      "iters": 16680,
+      "fetches": 0,
+      "fetchErrors": 4170,
+      "intervalFires": 16731,
+      "pending": 9
+    },
+    {
+      "iters": 16740,
+      "fetches": 0,
+      "fetchErrors": 4185,
+      "intervalFires": 16791,
+      "pending": 9
+    },
+    {
+      "iters": 16800,
+      "fetches": 0,
+      "fetchErrors": 4200,
+      "intervalFires": 16851,
+      "pending": 9
+    },
+    {
+      "iters": 16860,
+      "fetches": 0,
+      "fetchErrors": 4215,
+      "intervalFires": 16911,
+      "pending": 9
+    },
+    {
+      "iters": 16920,
+      "fetches": 0,
+      "fetchErrors": 4230,
+      "intervalFires": 16971,
+      "pending": 9
+    },
+    {
+      "iters": 16980,
+      "fetches": 0,
+      "fetchErrors": 4245,
+      "intervalFires": 17031,
+      "pending": 9
+    },
+    {
+      "iters": 17040,
+      "fetches": 0,
+      "fetchErrors": 4260,
+      "intervalFires": 17091,
+      "pending": 9
+    },
+    {
+      "iters": 17100,
+      "fetches": 0,
+      "fetchErrors": 4275,
+      "intervalFires": 17151,
+      "pending": 9
+    },
+    {
+      "iters": 17160,
+      "fetches": 0,
+      "fetchErrors": 4290,
+      "intervalFires": 17211,
+      "pending": 9
+    },
+    {
+      "iters": 17220,
+      "fetches": 0,
+      "fetchErrors": 4305,
+      "intervalFires": 17271,
+      "pending": 9
+    },
+    {
+      "iters": 17280,
+      "fetches": 0,
+      "fetchErrors": 4320,
+      "intervalFires": 17332,
+      "pending": 9
+    },
+    {
+      "iters": 17340,
+      "fetches": 0,
+      "fetchErrors": 4335,
+      "intervalFires": 17392,
+      "pending": 9
+    },
+    {
+      "iters": 17400,
+      "fetches": 0,
+      "fetchErrors": 4350,
+      "intervalFires": 17452,
+      "pending": 9
+    },
+    {
+      "iters": 17460,
+      "fetches": 0,
+      "fetchErrors": 4365,
+      "intervalFires": 17512,
+      "pending": 9
+    },
+    {
+      "iters": 17520,
+      "fetches": 0,
+      "fetchErrors": 4380,
+      "intervalFires": 17572,
+      "pending": 9
+    },
+    {
+      "iters": 17580,
+      "fetches": 0,
+      "fetchErrors": 4395,
+      "intervalFires": 17632,
+      "pending": 9
+    },
+    {
+      "iters": 17640,
+      "fetches": 0,
+      "fetchErrors": 4410,
+      "intervalFires": 17692,
+      "pending": 9
+    },
+    {
+      "iters": 17700,
+      "fetches": 0,
+      "fetchErrors": 4425,
+      "intervalFires": 17752,
+      "pending": 9
+    },
+    {
+      "iters": 17760,
+      "fetches": 0,
+      "fetchErrors": 4440,
+      "intervalFires": 17812,
+      "pending": 9
+    },
+    {
+      "iters": 17820,
+      "fetches": 0,
+      "fetchErrors": 4455,
+      "intervalFires": 17872,
+      "pending": 9
+    },
+    {
+      "iters": 17880,
+      "fetches": 0,
+      "fetchErrors": 4470,
+      "intervalFires": 17932,
+      "pending": 9
+    },
+    {
+      "iters": 17940,
+      "fetches": 0,
+      "fetchErrors": 4485,
+      "intervalFires": 17992,
+      "pending": 9
+    },
+    {
+      "iters": 18000,
+      "fetches": 0,
+      "fetchErrors": 4500,
+      "intervalFires": 18052,
+      "pending": 9
+    },
+    {
+      "iters": 18060,
+      "fetches": 0,
+      "fetchErrors": 4515,
+      "intervalFires": 18112,
+      "pending": 9
+    },
+    {
+      "iters": 18120,
+      "fetches": 0,
+      "fetchErrors": 4530,
+      "intervalFires": 18172,
+      "pending": 9
+    },
+    {
+      "iters": 18180,
+      "fetches": 0,
+      "fetchErrors": 4545,
+      "intervalFires": 18232,
+      "pending": 9
+    },
+    {
+      "iters": 18240,
+      "fetches": 0,
+      "fetchErrors": 4560,
+      "intervalFires": 18292,
+      "pending": 9
+    },
+    {
+      "iters": 18300,
+      "fetches": 0,
+      "fetchErrors": 4575,
+      "intervalFires": 18352,
+      "pending": 9
+    },
+    {
+      "iters": 18360,
+      "fetches": 0,
+      "fetchErrors": 4590,
+      "intervalFires": 18412,
+      "pending": 9
+    },
+    {
+      "iters": 18420,
+      "fetches": 0,
+      "fetchErrors": 4605,
+      "intervalFires": 18472,
+      "pending": 9
+    },
+    {
+      "iters": 18480,
+      "fetches": 0,
+      "fetchErrors": 4620,
+      "intervalFires": 18532,
+      "pending": 9
+    },
+    {
+      "iters": 18540,
+      "fetches": 0,
+      "fetchErrors": 4635,
+      "intervalFires": 18592,
+      "pending": 9
+    },
+    {
+      "iters": 18600,
+      "fetches": 0,
+      "fetchErrors": 4650,
+      "intervalFires": 18652,
+      "pending": 9
+    },
+    {
+      "iters": 18660,
+      "fetches": 0,
+      "fetchErrors": 4665,
+      "intervalFires": 18712,
+      "pending": 9
+    },
+    {
+      "iters": 18720,
+      "fetches": 0,
+      "fetchErrors": 4680,
+      "intervalFires": 18772,
+      "pending": 9
+    },
+    {
+      "iters": 18780,
+      "fetches": 0,
+      "fetchErrors": 4695,
+      "intervalFires": 18832,
+      "pending": 9
+    },
+    {
+      "iters": 18840,
+      "fetches": 0,
+      "fetchErrors": 4710,
+      "intervalFires": 18892,
+      "pending": 9
+    },
+    {
+      "iters": 18900,
+      "fetches": 0,
+      "fetchErrors": 4725,
+      "intervalFires": 18952,
+      "pending": 9
+    },
+    {
+      "iters": 18960,
+      "fetches": 0,
+      "fetchErrors": 4740,
+      "intervalFires": 19012,
+      "pending": 9
+    },
+    {
+      "iters": 19020,
+      "fetches": 0,
+      "fetchErrors": 4755,
+      "intervalFires": 19072,
+      "pending": 9
+    },
+    {
+      "iters": 19080,
+      "fetches": 0,
+      "fetchErrors": 4770,
+      "intervalFires": 19132,
+      "pending": 9
+    },
+    {
+      "iters": 19140,
+      "fetches": 0,
+      "fetchErrors": 4785,
+      "intervalFires": 19192,
+      "pending": 9
+    },
+    {
+      "iters": 19200,
+      "fetches": 0,
+      "fetchErrors": 4800,
+      "intervalFires": 19252,
+      "pending": 9
+    },
+    {
+      "iters": 19260,
+      "fetches": 0,
+      "fetchErrors": 4815,
+      "intervalFires": 19312,
+      "pending": 9
+    },
+    {
+      "iters": 19320,
+      "fetches": 0,
+      "fetchErrors": 4830,
+      "intervalFires": 19372,
+      "pending": 9
+    },
+    {
+      "iters": 19380,
+      "fetches": 0,
+      "fetchErrors": 4845,
+      "intervalFires": 19432,
+      "pending": 9
+    },
+    {
+      "iters": 19440,
+      "fetches": 0,
+      "fetchErrors": 4860,
+      "intervalFires": 19492,
+      "pending": 9
+    },
+    {
+      "iters": 19500,
+      "fetches": 0,
+      "fetchErrors": 4875,
+      "intervalFires": 19552,
+      "pending": 9
+    },
+    {
+      "iters": 19560,
+      "fetches": 0,
+      "fetchErrors": 4890,
+      "intervalFires": 19612,
+      "pending": 9
+    },
+    {
+      "iters": 19620,
+      "fetches": 0,
+      "fetchErrors": 4905,
+      "intervalFires": 19672,
+      "pending": 9
+    },
+    {
+      "iters": 19680,
+      "fetches": 0,
+      "fetchErrors": 4920,
+      "intervalFires": 19732,
+      "pending": 9
+    },
+    {
+      "iters": 19740,
+      "fetches": 0,
+      "fetchErrors": 4935,
+      "intervalFires": 19792,
+      "pending": 9
+    },
+    {
+      "iters": 19800,
+      "fetches": 0,
+      "fetchErrors": 4950,
+      "intervalFires": 19856,
+      "pending": 9
+    },
+    {
+      "iters": 19860,
+      "fetches": 0,
+      "fetchErrors": 4965,
+      "intervalFires": 19916,
+      "pending": 9
+    },
+    {
+      "iters": 19920,
+      "fetches": 0,
+      "fetchErrors": 4980,
+      "intervalFires": 19976,
+      "pending": 9
+    },
+    {
+      "iters": 19980,
+      "fetches": 0,
+      "fetchErrors": 4995,
+      "intervalFires": 20036,
+      "pending": 9
+    },
+    {
+      "iters": 20040,
+      "fetches": 0,
+      "fetchErrors": 5010,
+      "intervalFires": 20096,
+      "pending": 9
+    },
+    {
+      "iters": 20100,
+      "fetches": 0,
+      "fetchErrors": 5025,
+      "intervalFires": 20156,
+      "pending": 9
+    },
+    {
+      "iters": 20160,
+      "fetches": 0,
+      "fetchErrors": 5040,
+      "intervalFires": 20218,
+      "pending": 9
+    },
+    {
+      "iters": 20220,
+      "fetches": 0,
+      "fetchErrors": 5055,
+      "intervalFires": 20278,
+      "pending": 9
+    },
+    {
+      "iters": 20280,
+      "fetches": 0,
+      "fetchErrors": 5070,
+      "intervalFires": 20340,
+      "pending": 9
+    },
+    {
+      "iters": 20340,
+      "fetches": 0,
+      "fetchErrors": 5085,
+      "intervalFires": 20400,
+      "pending": 9
+    },
+    {
+      "iters": 20400,
+      "fetches": 0,
+      "fetchErrors": 5100,
+      "intervalFires": 20461,
+      "pending": 9
+    },
+    {
+      "iters": 20460,
+      "fetches": 0,
+      "fetchErrors": 5115,
+      "intervalFires": 20521,
+      "pending": 9
+    },
+    {
+      "iters": 20520,
+      "fetches": 0,
+      "fetchErrors": 5130,
+      "intervalFires": 20582,
+      "pending": 1
+    },
+    {
+      "iters": 20580,
+      "fetches": 0,
+      "fetchErrors": 5145,
+      "intervalFires": 20642,
+      "pending": 9
+    },
+    {
+      "iters": 20640,
+      "fetches": 0,
+      "fetchErrors": 5160,
+      "intervalFires": 20703,
+      "pending": 9
+    },
+    {
+      "iters": 20700,
+      "fetches": 0,
+      "fetchErrors": 5175,
+      "intervalFires": 20764,
+      "pending": 9
+    },
+    {
+      "iters": 20760,
+      "fetches": 0,
+      "fetchErrors": 5190,
+      "intervalFires": 20824,
+      "pending": 9
+    },
+    {
+      "iters": 20820,
+      "fetches": 0,
+      "fetchErrors": 5205,
+      "intervalFires": 20884,
+      "pending": 9
+    },
+    {
+      "iters": 20880,
+      "fetches": 0,
+      "fetchErrors": 5220,
+      "intervalFires": 20944,
+      "pending": 9
+    },
+    {
+      "iters": 20940,
+      "fetches": 0,
+      "fetchErrors": 5235,
+      "intervalFires": 21004,
+      "pending": 9
+    },
+    {
+      "iters": 21000,
+      "fetches": 0,
+      "fetchErrors": 5250,
+      "intervalFires": 21064,
+      "pending": 9
+    },
+    {
+      "iters": 21060,
+      "fetches": 0,
+      "fetchErrors": 5265,
+      "intervalFires": 21124,
+      "pending": 9
+    },
+    {
+      "iters": 21120,
+      "fetches": 0,
+      "fetchErrors": 5280,
+      "intervalFires": 21185,
+      "pending": 9
+    },
+    {
+      "iters": 21180,
+      "fetches": 0,
+      "fetchErrors": 5295,
+      "intervalFires": 21246,
+      "pending": 9
+    },
+    {
+      "iters": 21240,
+      "fetches": 0,
+      "fetchErrors": 5310,
+      "intervalFires": 21306,
+      "pending": 9
+    },
+    {
+      "iters": 21300,
+      "fetches": 0,
+      "fetchErrors": 5325,
+      "intervalFires": 21366,
+      "pending": 9
+    },
+    {
+      "iters": 21360,
+      "fetches": 0,
+      "fetchErrors": 5340,
+      "intervalFires": 21427,
+      "pending": 1
+    },
+    {
+      "iters": 21420,
+      "fetches": 0,
+      "fetchErrors": 5355,
+      "intervalFires": 21487,
+      "pending": 9
+    },
+    {
+      "iters": 21480,
+      "fetches": 0,
+      "fetchErrors": 5370,
+      "intervalFires": 21547,
+      "pending": 9
+    },
+    {
+      "iters": 21540,
+      "fetches": 0,
+      "fetchErrors": 5385,
+      "intervalFires": 21607,
+      "pending": 9
+    },
+    {
+      "iters": 21600,
+      "fetches": 0,
+      "fetchErrors": 5400,
+      "intervalFires": 21667,
+      "pending": 9
+    },
+    {
+      "iters": 21660,
+      "fetches": 0,
+      "fetchErrors": 5415,
+      "intervalFires": 21727,
+      "pending": 9
+    },
+    {
+      "iters": 21720,
+      "fetches": 0,
+      "fetchErrors": 5430,
+      "intervalFires": 21787,
+      "pending": 9
+    },
+    {
+      "iters": 21780,
+      "fetches": 0,
+      "fetchErrors": 5445,
+      "intervalFires": 21847,
+      "pending": 9
+    },
+    {
+      "iters": 21840,
+      "fetches": 0,
+      "fetchErrors": 5460,
+      "intervalFires": 21907,
+      "pending": 9
+    },
+    {
+      "iters": 21900,
+      "fetches": 0,
+      "fetchErrors": 5475,
+      "intervalFires": 21968,
+      "pending": 9
+    },
+    {
+      "iters": 21960,
+      "fetches": 0,
+      "fetchErrors": 5490,
+      "intervalFires": 22029,
+      "pending": 9
+    },
+    {
+      "iters": 22020,
+      "fetches": 0,
+      "fetchErrors": 5505,
+      "intervalFires": 22089,
+      "pending": 9
+    },
+    {
+      "iters": 22080,
+      "fetches": 0,
+      "fetchErrors": 5520,
+      "intervalFires": 22151,
+      "pending": 9
+    },
+    {
+      "iters": 22140,
+      "fetches": 0,
+      "fetchErrors": 5535,
+      "intervalFires": 22211,
+      "pending": 9
+    },
+    {
+      "iters": 22200,
+      "fetches": 0,
+      "fetchErrors": 5550,
+      "intervalFires": 22271,
+      "pending": 9
+    },
+    {
+      "iters": 22260,
+      "fetches": 0,
+      "fetchErrors": 5565,
+      "intervalFires": 22331,
+      "pending": 9
+    },
+    {
+      "iters": 22320,
+      "fetches": 0,
+      "fetchErrors": 5580,
+      "intervalFires": 22391,
+      "pending": 9
+    },
+    {
+      "iters": 22380,
+      "fetches": 0,
+      "fetchErrors": 5595,
+      "intervalFires": 22452,
+      "pending": 9
+    },
+    {
+      "iters": 22440,
+      "fetches": 0,
+      "fetchErrors": 5610,
+      "intervalFires": 22514,
+      "pending": 9
+    },
+    {
+      "iters": 22500,
+      "fetches": 0,
+      "fetchErrors": 5625,
+      "intervalFires": 22574,
+      "pending": 9
+    },
+    {
+      "iters": 22560,
+      "fetches": 0,
+      "fetchErrors": 5640,
+      "intervalFires": 22634,
+      "pending": 9
+    },
+    {
+      "iters": 22620,
+      "fetches": 0,
+      "fetchErrors": 5655,
+      "intervalFires": 22694,
+      "pending": 9
+    },
+    {
+      "iters": 22680,
+      "fetches": 0,
+      "fetchErrors": 5670,
+      "intervalFires": 22754,
+      "pending": 9
+    },
+    {
+      "iters": 22740,
+      "fetches": 0,
+      "fetchErrors": 5685,
+      "intervalFires": 22814,
+      "pending": 9
+    },
+    {
+      "iters": 22800,
+      "fetches": 0,
+      "fetchErrors": 5700,
+      "intervalFires": 22874,
+      "pending": 9
+    },
+    {
+      "iters": 22860,
+      "fetches": 0,
+      "fetchErrors": 5715,
+      "intervalFires": 22934,
+      "pending": 9
+    },
+    {
+      "iters": 22920,
+      "fetches": 0,
+      "fetchErrors": 5730,
+      "intervalFires": 22994,
+      "pending": 9
+    },
+    {
+      "iters": 22980,
+      "fetches": 0,
+      "fetchErrors": 5745,
+      "intervalFires": 23054,
+      "pending": 9
+    },
+    {
+      "iters": 23040,
+      "fetches": 0,
+      "fetchErrors": 5760,
+      "intervalFires": 23114,
+      "pending": 9
+    },
+    {
+      "iters": 23100,
+      "fetches": 0,
+      "fetchErrors": 5775,
+      "intervalFires": 23174,
+      "pending": 9
+    },
+    {
+      "iters": 23160,
+      "fetches": 0,
+      "fetchErrors": 5790,
+      "intervalFires": 23234,
+      "pending": 9
+    },
+    {
+      "iters": 23220,
+      "fetches": 0,
+      "fetchErrors": 5805,
+      "intervalFires": 23294,
+      "pending": 9
+    },
+    {
+      "iters": 23280,
+      "fetches": 0,
+      "fetchErrors": 5820,
+      "intervalFires": 23354,
+      "pending": 9
+    },
+    {
+      "iters": 23340,
+      "fetches": 0,
+      "fetchErrors": 5835,
+      "intervalFires": 23414,
+      "pending": 9
+    },
+    {
+      "iters": 23400,
+      "fetches": 0,
+      "fetchErrors": 5850,
+      "intervalFires": 23474,
+      "pending": 9
+    },
+    {
+      "iters": 23460,
+      "fetches": 0,
+      "fetchErrors": 5865,
+      "intervalFires": 23534,
+      "pending": 9
+    },
+    {
+      "iters": 23520,
+      "fetches": 0,
+      "fetchErrors": 5880,
+      "intervalFires": 23594,
+      "pending": 9
+    },
+    {
+      "iters": 23580,
+      "fetches": 0,
+      "fetchErrors": 5895,
+      "intervalFires": 23654,
+      "pending": 9
+    },
+    {
+      "iters": 23640,
+      "fetches": 0,
+      "fetchErrors": 5910,
+      "intervalFires": 23714,
+      "pending": 9
+    },
+    {
+      "iters": 23700,
+      "fetches": 0,
+      "fetchErrors": 5925,
+      "intervalFires": 23774,
+      "pending": 9
+    },
+    {
+      "iters": 23760,
+      "fetches": 0,
+      "fetchErrors": 5940,
+      "intervalFires": 23834,
+      "pending": 9
+    },
+    {
+      "iters": 23820,
+      "fetches": 0,
+      "fetchErrors": 5955,
+      "intervalFires": 23894,
+      "pending": 9
+    },
+    {
+      "iters": 23880,
+      "fetches": 0,
+      "fetchErrors": 5970,
+      "intervalFires": 23954,
+      "pending": 9
+    },
+    {
+      "iters": 23940,
+      "fetches": 0,
+      "fetchErrors": 5985,
+      "intervalFires": 24014,
+      "pending": 9
+    },
+    {
+      "iters": 24000,
+      "fetches": 0,
+      "fetchErrors": 6000,
+      "intervalFires": 24074,
+      "pending": 9
+    },
+    {
+      "iters": 24060,
+      "fetches": 0,
+      "fetchErrors": 6015,
+      "intervalFires": 24134,
+      "pending": 9
+    },
+    {
+      "iters": 24120,
+      "fetches": 0,
+      "fetchErrors": 6030,
+      "intervalFires": 24194,
+      "pending": 9
+    },
+    {
+      "iters": 24180,
+      "fetches": 0,
+      "fetchErrors": 6045,
+      "intervalFires": 24255,
+      "pending": 9
+    },
+    {
+      "iters": 24240,
+      "fetches": 0,
+      "fetchErrors": 6060,
+      "intervalFires": 24315,
+      "pending": 9
+    },
+    {
+      "iters": 24300,
+      "fetches": 0,
+      "fetchErrors": 6075,
+      "intervalFires": 24375,
+      "pending": 9
+    },
+    {
+      "iters": 24360,
+      "fetches": 0,
+      "fetchErrors": 6090,
+      "intervalFires": 24437,
+      "pending": 9
+    },
+    {
+      "iters": 24420,
+      "fetches": 0,
+      "fetchErrors": 6105,
+      "intervalFires": 24497,
+      "pending": 9
+    },
+    {
+      "iters": 24480,
+      "fetches": 0,
+      "fetchErrors": 6120,
+      "intervalFires": 24557,
+      "pending": 9
+    },
+    {
+      "iters": 24540,
+      "fetches": 0,
+      "fetchErrors": 6135,
+      "intervalFires": 24617,
+      "pending": 9
+    },
+    {
+      "iters": 24600,
+      "fetches": 0,
+      "fetchErrors": 6150,
+      "intervalFires": 24677,
+      "pending": 9
+    },
+    {
+      "iters": 24660,
+      "fetches": 0,
+      "fetchErrors": 6165,
+      "intervalFires": 24737,
+      "pending": 9
+    },
+    {
+      "iters": 24720,
+      "fetches": 0,
+      "fetchErrors": 6180,
+      "intervalFires": 24797,
+      "pending": 9
+    },
+    {
+      "iters": 24780,
+      "fetches": 0,
+      "fetchErrors": 6195,
+      "intervalFires": 24857,
+      "pending": 9
+    },
+    {
+      "iters": 24840,
+      "fetches": 0,
+      "fetchErrors": 6210,
+      "intervalFires": 24917,
+      "pending": 9
+    },
+    {
+      "iters": 24900,
+      "fetches": 0,
+      "fetchErrors": 6225,
+      "intervalFires": 24977,
+      "pending": 9
+    },
+    {
+      "iters": 24960,
+      "fetches": 0,
+      "fetchErrors": 6240,
+      "intervalFires": 25037,
+      "pending": 9
+    },
+    {
+      "iters": 25020,
+      "fetches": 0,
+      "fetchErrors": 6255,
+      "intervalFires": 25097,
+      "pending": 9
+    },
+    {
+      "iters": 25080,
+      "fetches": 0,
+      "fetchErrors": 6270,
+      "intervalFires": 25157,
+      "pending": 9
+    },
+    {
+      "iters": 25140,
+      "fetches": 0,
+      "fetchErrors": 6285,
+      "intervalFires": 25217,
+      "pending": 9
+    },
+    {
+      "iters": 25200,
+      "fetches": 0,
+      "fetchErrors": 6300,
+      "intervalFires": 25277,
+      "pending": 9
+    },
+    {
+      "iters": 25260,
+      "fetches": 0,
+      "fetchErrors": 6315,
+      "intervalFires": 25337,
+      "pending": 9
+    },
+    {
+      "iters": 25320,
+      "fetches": 0,
+      "fetchErrors": 6330,
+      "intervalFires": 25397,
+      "pending": 9
+    },
+    {
+      "iters": 25380,
+      "fetches": 0,
+      "fetchErrors": 6345,
+      "intervalFires": 25457,
+      "pending": 9
+    },
+    {
+      "iters": 25440,
+      "fetches": 0,
+      "fetchErrors": 6360,
+      "intervalFires": 25517,
+      "pending": 9
+    },
+    {
+      "iters": 25500,
+      "fetches": 0,
+      "fetchErrors": 6375,
+      "intervalFires": 25577,
+      "pending": 9
+    },
+    {
+      "iters": 25560,
+      "fetches": 0,
+      "fetchErrors": 6390,
+      "intervalFires": 25637,
+      "pending": 9
+    },
+    {
+      "iters": 25620,
+      "fetches": 0,
+      "fetchErrors": 6405,
+      "intervalFires": 25697,
+      "pending": 9
+    },
+    {
+      "iters": 25680,
+      "fetches": 0,
+      "fetchErrors": 6420,
+      "intervalFires": 25757,
+      "pending": 9
+    },
+    {
+      "iters": 25740,
+      "fetches": 0,
+      "fetchErrors": 6435,
+      "intervalFires": 25817,
+      "pending": 9
+    },
+    {
+      "iters": 25800,
+      "fetches": 0,
+      "fetchErrors": 6450,
+      "intervalFires": 25878,
+      "pending": 9
+    },
+    {
+      "iters": 25860,
+      "fetches": 0,
+      "fetchErrors": 6465,
+      "intervalFires": 25938,
+      "pending": 9
+    },
+    {
+      "iters": 25920,
+      "fetches": 0,
+      "fetchErrors": 6480,
+      "intervalFires": 25998,
+      "pending": 9
+    },
+    {
+      "iters": 25980,
+      "fetches": 0,
+      "fetchErrors": 6495,
+      "intervalFires": 26058,
+      "pending": 9
+    },
+    {
+      "iters": 26040,
+      "fetches": 0,
+      "fetchErrors": 6510,
+      "intervalFires": 26118,
+      "pending": 9
+    },
+    {
+      "iters": 26100,
+      "fetches": 0,
+      "fetchErrors": 6525,
+      "intervalFires": 26178,
+      "pending": 9
+    },
+    {
+      "iters": 26160,
+      "fetches": 0,
+      "fetchErrors": 6540,
+      "intervalFires": 26238,
+      "pending": 9
+    },
+    {
+      "iters": 26220,
+      "fetches": 0,
+      "fetchErrors": 6555,
+      "intervalFires": 26298,
+      "pending": 9
+    },
+    {
+      "iters": 26280,
+      "fetches": 0,
+      "fetchErrors": 6570,
+      "intervalFires": 26358,
+      "pending": 9
+    },
+    {
+      "iters": 26340,
+      "fetches": 0,
+      "fetchErrors": 6585,
+      "intervalFires": 26418,
+      "pending": 9
+    },
+    {
+      "iters": 26400,
+      "fetches": 0,
+      "fetchErrors": 6600,
+      "intervalFires": 26478,
+      "pending": 9
+    },
+    {
+      "iters": 26460,
+      "fetches": 0,
+      "fetchErrors": 6615,
+      "intervalFires": 26538,
+      "pending": 9
+    },
+    {
+      "iters": 26520,
+      "fetches": 0,
+      "fetchErrors": 6630,
+      "intervalFires": 26598,
+      "pending": 9
+    }
+  ],
+  "last_status": {
+    "iters": 26520,
+    "fetches": 0,
+    "fetchErrors": 6630,
+    "intervalFires": 26598,
+    "pending": 9
+  },
+  "soak_exit": -15,
+  "caveats": [
+    "RSS sampled via ps once/min \u2014 coarse, drift is the signal not the level",
+    "interval churn reschedules continuously; a cancel-path leak shows as pending growth in last_status"
+  ]
+}
