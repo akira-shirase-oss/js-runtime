@@ -561,3 +561,21 @@ fn an_oversized_body_is_cut_off() {
         stderr(&out)
     );
 }
+
+#[test]
+fn a_script_can_see_its_own_pending_timers() {
+    let rig = Rig::new();
+    let script = rig.script(
+        "t.js",
+        "const id = rt.setTimeout(() => {}, 60000);\n\
+         rt.unrefTimer(id);\n\
+         rt.print('pending=' + rt.pendingTimers() + '\\n');\n\
+         rt.clearTimeout(id);\n\
+         rt.print('after=' + rt.pendingTimers() + '\\n');\n",
+    );
+    let out = rig.run_script(&script, &[]);
+    assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("pending=1"), "stdout: {stdout}");
+    assert!(stdout.contains("after=0"), "stdout: {stdout}");
+}

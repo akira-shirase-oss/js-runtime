@@ -46,6 +46,42 @@ pub struct HostOptions {
     pub fetch_deadline: Option<Duration>,
 }
 
+/// What a run left behind when it ended, counted from the activity tracker
+/// the moment before the isolate drops. These die with the runtime — the
+/// point of reporting them is that a leak is *seen*, not silently dropped.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct PendingCounts {
+    pub timers: usize,
+    pub intervals: usize,
+    pub ops: usize,
+    pub resources: usize,
+}
+
+/// The run's outcome plus what was still open at teardown.
+#[derive(Debug)]
+pub struct RunReport {
+    pub result: Result<(), HostError>,
+    pub pending: PendingCounts,
+}
+
+/// Count pending JS-visible activity just before the isolate drops.
+fn pending_counts(runtime: &JsRuntime) -> PendingCounts {
+    let snapshot = runtime
+        .runtime_activity_stats_factory()
+        .capture(&deno_core::stats::RuntimeActivityStatsFilter::all())
+        .dump();
+    let mut counts = PendingCounts::default();
+    for activity in snapshot.active {
+        match activity.activity() {
+            deno_core::stats::RuntimeActivityType::Timer => counts.timers += 1,
+            deno_core::stats::RuntimeActivityType::Interval => counts.intervals += 1,
+            deno_core::stats::RuntimeActivityType::AsyncOp => counts.ops += 1,
+            _ => counts.resources += 1,
+        }
+    }
+    counts
+}
+
 impl Default for HostOptions {
     fn default() -> Self {
         Self {
@@ -81,15 +117,33 @@ fn build_runtime(options: &HostOptions) -> JsRuntime {
 /// Run an ES module file to completion: evaluate it, drive the event loop
 /// until pending work settles, and classify every way it can end.
 pub async fn run_file(entry: &Path, options: &HostOptions) -> Result<(), HostError> {
+    run_file_report(entry, options).await.result
+}
+
+/// `run_file` with the teardown report — what was still open when the run
+/// ended, counted before the isolate dropped it.
+pub async fn run_file_report(entry: &Path, options: &HostOptions) -> RunReport {
     if !entry.is_file() {
-        return Err(HostError::Load(format!(
-            "no such file: {}",
-            entry.display()
-        )));
+        return RunReport {
+            result: Err(HostError::Load(format!(
+                "no such file: {}",
+                entry.display()
+            ))),
+            pending: PendingCounts::default(),
+        };
     }
     let cwd = std::env::current_dir().unwrap_or_else(|_| Path::new(".").to_path_buf());
     let specifier = deno_core::resolve_path(&entry.to_string_lossy(), &cwd)
-        .map_err(|e| HostError::Load(format!("cannot resolve {}: {e}", entry.display())))?;
+        .map_err(|e| HostError::Load(format!("cannot resolve {}: {e}", entry.display())));
+    let specifier = match specifier {
+        Ok(s) => s,
+        Err(e) => {
+            return RunReport {
+                result: Err(e),
+                pending: PendingCounts::default(),
+            };
+        }
+    };
 
     let mut runtime = build_runtime(options);
     let done = Arc::new(AtomicBool::new(false));
@@ -112,13 +166,28 @@ pub async fn run_file(entry: &Path, options: &HostOptions) -> Result<(), HostErr
     // Whatever the outcome, the run is over — the watchdog must not fire into
     // a dropped isolate or escalate against a finished process.
     done.store(true, Ordering::SeqCst);
-    result
+    let pending = pending_counts(&runtime);
+    RunReport { result, pending }
 }
 
 /// Run an in-memory module — the test path. Same lifecycle as `run_file`.
 pub async fn run_source(name: &str, source: &str, options: &HostOptions) -> Result<(), HostError> {
+    run_source_report(name, source, options).await.result
+}
+
+/// `run_source` with the teardown report.
+pub async fn run_source_report(name: &str, source: &str, options: &HostOptions) -> RunReport {
     let specifier = ModuleSpecifier::parse(&format!("file:///{name}"))
-        .map_err(|e| HostError::Load(format!("bad specifier {name}: {e}")))?;
+        .map_err(|e| HostError::Load(format!("bad specifier {name}: {e}")));
+    let specifier = match specifier {
+        Ok(s) => s,
+        Err(e) => {
+            return RunReport {
+                result: Err(e),
+                pending: PendingCounts::default(),
+            };
+        }
+    };
     let mut runtime = build_runtime(options);
     let done = Arc::new(AtomicBool::new(false));
     let terminated = spawn_watchdog(
@@ -137,7 +206,8 @@ pub async fn run_source(name: &str, source: &str, options: &HostOptions) -> Resu
     }
     .await;
     done.store(true, Ordering::SeqCst);
-    result
+    let pending = pending_counts(&runtime);
+    RunReport { result, pending }
 }
 
 /// Spawn the termination watchdog and return the flag it sets when it fires.
@@ -281,5 +351,70 @@ mod tests {
             matches!(classified, super::HostError::Syntax(_)),
             "expected Syntax, got {classified:?}"
         );
+    }
+
+    // ---- M2.3: what a script leaves open is counted, and dies with the run.
+
+    /// A timer a script abandons is *seen* at teardown — an unref'd pending
+    /// timer shows up in the report and then dies with the isolate.
+    #[tokio::test]
+    async fn an_abandoned_unrefed_timer_is_counted_at_teardown() {
+        let report = super::run_source_report(
+            "leak.js",
+            // Two unref'd pending timers (the loop may leave, they stay
+            // tracked) plus a cleared one that must NOT be counted.
+            "const a = rt.setTimeout(() => {}, 60000);\n\
+             const b = rt.setTimeout(() => {}, 60000);\n\
+             rt.unrefTimer(a);\n\
+             rt.unrefTimer(b);\n\
+             rt.clearTimeout(rt.setTimeout(() => {}, 1));",
+            &super::HostOptions::default(),
+        )
+        .await;
+        assert!(report.result.is_ok(), "run: {:?}", report.result);
+        assert_eq!(
+            report.pending.timers, 2,
+            "both unref'd timers still tracked, cleared one gone: {:?}",
+            report.pending
+        );
+    }
+
+    /// A pending *interval* holds the loop; the watchdog ends the run, and the
+    /// report still names the interval that was in flight when it died.
+    #[tokio::test]
+    async fn a_pending_interval_is_reported_on_termination() {
+        let options = super::HostOptions {
+            timeout: Some(std::time::Duration::from_millis(200)),
+            ..Default::default()
+        };
+        let report =
+            super::run_source_report("leak.js", "rt.setInterval(() => {}, 5000);", &options).await;
+        assert!(
+            matches!(report.result, Err(super::HostError::Terminated(_))),
+            "expected Terminated, got {:?}",
+            report.result
+        );
+        assert!(
+            report.pending.intervals >= 1,
+            "report: {:?}",
+            report.pending
+        );
+    }
+
+    /// Nothing outlives the runtime: a second run in the same process and
+    /// tokio runtime completes cleanly — zombie work would show up here as
+    /// interference or a hang.
+    #[tokio::test]
+    async fn a_second_run_after_teardown_is_unaffected() {
+        let options = super::HostOptions::default();
+        let first = super::run_source_report(
+            "one.js",
+            "const id = rt.setTimeout(() => {}, 60000); rt.unrefTimer(id);",
+            &options,
+        )
+        .await;
+        assert!(first.result.is_ok());
+        let second = super::run_source("two.js", "rt.print('still fine');", &options).await;
+        assert!(second.is_ok(), "second run: {second:?}");
     }
 }

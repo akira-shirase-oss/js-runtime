@@ -76,4 +76,6 @@ globalThis.rt = {
 		const t = timers.get(id);
 		if (t !== undefined) Deno.core.refTimer(t);
 	},
+	/** Timer ids this script still owns (fired one-shots remove themselves). */
+	pendingTimers: () => timers.size,
 };

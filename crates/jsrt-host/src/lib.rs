@@ -13,4 +13,6 @@ pub mod runtime;
 
 pub use capability::Capabilities;
 pub use error::HostError;
-pub use runtime::{run_file, run_source, HostOptions};
+pub use runtime::{
+    run_file, run_file_report, run_source, run_source_report, HostOptions, PendingCounts, RunReport,
+};
