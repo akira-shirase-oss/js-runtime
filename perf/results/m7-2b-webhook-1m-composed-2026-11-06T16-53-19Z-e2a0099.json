@@ -1,0 +1,38 @@
+{
+  "milestone": "M7.2b-composed",
+  "workload": "1,000,000 POST /hooks/github X-Delivery-Id:d1 through the REAL webhook app \u2014 the dedup path: serve dispatch + rt.kv.get on a live store, not a trivial handler. 32 keep-alive connections.",
+  "environment": {
+    "commit": "e2a0099",
+    "date_utc": "2026-11-06T16:53:19+00:00",
+    "arch": "arm64",
+    "chip": "Apple M2 Pro",
+    "cores": 12,
+    "mem_bytes": 34359738368,
+    "os": "27.0.1",
+    "build": "release (opt-level 3)"
+  },
+  "driver": {
+    "concurrency": 32,
+    "error_rate": 0.0,
+    "latency_us": {
+      "max": 10586,
+      "p50": 635,
+      "p95": 729,
+      "p99": 804
+    },
+    "method": "POST",
+    "outcomes": {
+      "client_err": 0,
+      "non2xx": 0,
+      "ok": 1000000,
+      "refused": 0,
+      "timeout": 0
+    },
+    "requests_issued": 1000000,
+    "requests_target": 1000000,
+    "rps": 52203,
+    "url": "http://127.0.0.1:9400/hooks/github",
+    "wall_ms": 19155
+  },
+  "finding": "the composed app path (parse->dispatch->kv.get->JSON) runs ~52k rps vs ~90k rps for the trivial handler \u2014 the kv.get + handler work adds ~8us of serialized per-request cost inside the single-threaded dispatch loop. Zero errors; the seeded key stayed single (dedup never wrote a second row \u2014 verified post-run)."
+}

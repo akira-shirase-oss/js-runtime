@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use clap::Parser;
-use http_body_util::{BodyExt, Empty};
+use http_body_util::{BodyExt, Full};
 use hyper::body::Bytes;
 use hyper::Request;
 use hyper_util::client::legacy::connect::HttpConnector;
@@ -36,6 +36,15 @@ struct Args {
     /// Per-request timeout
     #[arg(long, default_value_t = 10)]
     timeout_secs: u64,
+    /// HTTP method (GET, POST, ...)
+    #[arg(long, default_value = "GET")]
+    method: String,
+    /// Request body — a literal string. Repeatable headers below.
+    #[arg(long)]
+    body: Option<String>,
+    /// Header as "Name: value" — repeat for several.
+    #[arg(long = "header")]
+    headers: Vec<String>,
 }
 
 #[derive(Default, Clone, Copy)]
@@ -72,8 +81,11 @@ async fn main() {
         let samples = samples.clone();
         let errors = errors.clone();
         let url = url.clone();
+        let method = args.method.clone();
+        let body = args.body.clone();
+        let headers = args.headers.clone();
         handles.push(tokio::spawn(async move {
-            let client: Client<_, Empty<Bytes>> =
+            let client: Client<_, Full<Bytes>> =
                 Client::builder(TokioExecutor::new()).build(HttpConnector::new());
             let mut local_samples: Vec<u64> = Vec::with_capacity(4096);
             let mut local = Stats::default();
@@ -83,13 +95,20 @@ async fn main() {
                     break;
                 }
                 let t0 = Instant::now();
-                let req = Request::builder()
-                    .uri(&url)
-                    .body(Empty::<Bytes>::new())
-                    .unwrap_or_else(|e| {
-                        eprintln!("build req: {e}");
-                        std::process::exit(2);
-                    });
+                let mut builder = Request::builder().uri(&url).method(method.as_str());
+                for h in &headers {
+                    if let Some((k, v)) = h.split_once(':') {
+                        builder = builder.header(k.trim(), v.trim());
+                    }
+                }
+                let payload = body
+                    .as_deref()
+                    .map(|b| Bytes::copy_from_slice(b.as_bytes()))
+                    .unwrap_or_default();
+                let req = builder.body(Full::new(payload)).unwrap_or_else(|e| {
+                    eprintln!("build req: {e}");
+                    std::process::exit(2);
+                });
                 match tokio::time::timeout(timeout, client.request(req)).await {
                     Ok(Ok(resp)) => {
                         if resp.status().is_success() {
@@ -149,6 +168,7 @@ async fn main() {
     };
     let report = serde_json::json!({
         "url": args.url,
+        "method": args.method,
         "requests_target": args.requests,
         "requests_issued": lat.len(),
         "concurrency": args.concurrency,
