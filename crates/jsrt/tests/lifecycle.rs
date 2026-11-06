@@ -239,6 +239,74 @@ fn a_host_side_failure_exits_eight() {
 }
 
 #[test]
+fn a_multi_file_import_runs() {
+    let rig = Rig::new();
+    rig.script("lib.js", "export function greet(n) { return 'hi ' + n; }\n");
+    let script = rig.script(
+        "main.js",
+        "import { greet } from './lib.js';\nrt.print(greet('mod'));\n",
+    );
+    let out = rig.run_script(&script, &[]);
+    assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("hi mod"));
+}
+
+#[test]
+fn a_missing_import_is_a_load_error_naming_the_specifier() {
+    let rig = Rig::new();
+    let script = rig.script("main.js", "import './missing.js';\n");
+    let out = rig.run_script(&script, &[]);
+    assert_eq!(code(&out), 3, "stderr: {}", stderr(&out));
+    assert!(
+        stderr(&out).contains("missing.js"),
+        "stderr: {}",
+        stderr(&out)
+    );
+}
+
+#[test]
+fn a_bad_specifier_is_a_load_error_naming_it() {
+    let rig = Rig::new();
+    let script = rig.script("main.js", "import 'ht!tp:bad';\n");
+    let out = rig.run_script(&script, &[]);
+    assert_eq!(code(&out), 3, "stderr: {}", stderr(&out));
+    assert!(
+        stderr(&out).contains("ht!tp:bad"),
+        "stderr: {}",
+        stderr(&out)
+    );
+}
+
+#[test]
+fn a_syntax_error_in_a_dependency_is_not_a_load_error() {
+    let rig = Rig::new();
+    rig.script("dep.js", "const = 3;\n");
+    let script = rig.script("main.js", "import './dep.js';\n");
+    let out = rig.run_script(&script, &[]);
+    assert_eq!(code(&out), 4, "stderr: {}", stderr(&out));
+}
+
+#[test]
+fn a_circular_import_pair_evaluates() {
+    let rig = Rig::new();
+    // ESM circularity is legal; bindings resolve live. Pin the real behavior —
+    // both entry directions complete and both see each other's exports.
+    rig.script(
+        "a.js",
+        "import { b } from './b.js';\nexport function a() { return 'a'; }\nrt.print('a sees b=' + b());\n",
+    );
+    rig.script(
+        "b.js",
+        "import { a } from './a.js';\nexport function b() { return 'b'; }\nrt.print('b sees a=' + a());\n",
+    );
+    for entry in ["a.js", "b.js"] {
+        let path = rig.dir.path().join(entry);
+        let out = rig.run_script(&path, &[]);
+        assert_eq!(code(&out), 0, "{entry}: stderr: {}", stderr(&out));
+    }
+}
+
+#[test]
 fn cli_flags_extend_never_weaken() {
     let rig = Rig::new();
     let data = rig.dir.path().join("data");

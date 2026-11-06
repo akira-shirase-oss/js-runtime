@@ -17,6 +17,7 @@ use std::time::Duration;
 
 use deno_core::error::CoreErrorKind;
 use deno_core::{FsModuleLoader, JsRuntime, ModuleSpecifier, PollEventLoopOptions, RuntimeOptions};
+use deno_error::JsErrorClass;
 
 use crate::capability::Capabilities;
 use crate::error::HostError;
@@ -228,6 +229,48 @@ fn classify(err: &deno_core::error::CoreError, terminated: &AtomicBool) -> HostE
                 _ => HostError::Exception(detail),
             }
         }
+        // Module-machinery failures (missing deps, bad specifiers) arrive as
+        // structured Rust errors, not JS exceptions — their Display names the
+        // failing specifier, which is what the operator needs. Registered op
+        // classes still take precedence if one ever surfaces this way.
+        CoreErrorKind::JsBox(jsbox) => match jsbox.get_class().as_ref() {
+            "CapabilityError" => HostError::Capability(jsbox.to_string()),
+            "HostError" => HostError::Host(jsbox.to_string()),
+            _ => HostError::Load(jsbox.to_string()),
+        },
         _ => HostError::Exception(err.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use deno_core::ModuleSpecifier;
+
+    /// A syntax error inside an imported file must classify as Syntax, not
+    /// Load or Exception — run_source can't import files, so this needs the
+    /// real loader path and lives here instead of in lifecycle.rs.
+    #[tokio::test]
+    async fn syntax_error_in_dependency_is_syntax() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("tempdir: {e}"));
+        for (name, src) in [
+            ("dep.js", "const = 3;\n"),
+            ("main.js", "import './dep.js';\n"),
+        ] {
+            std::fs::write(dir.path().join(name), src)
+                .unwrap_or_else(|e| panic!("write {name}: {e}"));
+        }
+        let options = super::HostOptions::default();
+        let specifier = ModuleSpecifier::from_file_path(dir.path().join("main.js"))
+            .unwrap_or_else(|e| panic!("specifier: {e:?}"));
+        let mut runtime = super::build_runtime(&options);
+        let err = match runtime.load_main_es_module(&specifier).await {
+            Err(e) => e,
+            Ok(_) => panic!("must fail"),
+        };
+        let classified = super::classify(&err, &std::sync::atomic::AtomicBool::new(false));
+        assert!(
+            matches!(classified, super::HostError::Syntax(_)),
+            "expected Syntax, got {classified:?}"
+        );
     }
 }
