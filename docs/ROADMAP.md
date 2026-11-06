@@ -35,8 +35,8 @@ not a thing scripts can rely on.
 
 | Step | Outcome | Invariant | Failure case | Acceptance test |
 |---|---|---|---|---|
-| 3.1 manifest complete | paths, destinations, budgets declared per entry point — **and module resolution**: a custom loader resolves imports only inside declared read paths (today `FsModuleLoader` lets a script `import` any file, bypassing `may_read` — this step closes that hole) | ops and the loader read the manifest fresh — never cached stale | manifest mid-run change is out of scope; boot-time parse errors fail fast | matrix test per op × denied/allowed; import-outside-path refused |
-| 3.2 escape suite | `..`, symlinks, URL tricks, userinfo, ports, schemes | the real target is what's checked | every documented bypass refused | adversarial test file |
+| 3.1 manifest complete (done) | paths, destinations, budgets declared per entry point — **and module resolution**: `JsrtModuleLoader` wraps `FsModuleLoader` and gates every non-entry file specifier at `resolve()`+`load()` through declared read paths + the entry's own dir (implicit program-space for modules only; ops still manifest-only). Existing-outside → `CapabilityError` (7) naming the path; missing stays Load (3); `..`/symlinks fail closed via canonicalization; dynamic-import rejections lose their class at the V8 boundary, so `classify()` recognizes the loader's refusal prefix — uncaught still exits 7 | ops and the loader read the manifest fresh — never cached stale | manifest mid-run change is out of scope; boot-time parse errors fail fast | 9 lifecycle tests (outside, missing-still-3, grant-opens, deep-dep laundering, dynamic caught+uncaught, symlink, entry-ungated, grant-covers-both) — `d71f6e4` |
+| 3.2 escape suite | `..`, symlinks, URL tricks, userinfo, ports, schemes — *loader escapes partially proven in 3.1; what remains is mostly the net side:* fetch authority tricks | the real target is what's checked | every documented bypass refused | adversarial test file |
 
 ## M4 — supervise
 
