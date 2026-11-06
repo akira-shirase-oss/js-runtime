@@ -8,6 +8,7 @@
 
 pub mod capability;
 pub mod error;
+pub mod module_loader;
 pub mod ops;
 pub mod runtime;
 

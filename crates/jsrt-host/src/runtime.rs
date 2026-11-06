@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use deno_core::error::CoreErrorKind;
-use deno_core::{FsModuleLoader, JsRuntime, ModuleSpecifier, PollEventLoopOptions, RuntimeOptions};
+use deno_core::{JsRuntime, ModuleSpecifier, PollEventLoopOptions, RuntimeOptions};
 use deno_error::JsErrorClass;
 
 use crate::capability::Capabilities;
@@ -94,9 +94,18 @@ impl Default for HostOptions {
 }
 
 /// Build a runtime wired with our ops and the given capabilities.
-fn build_runtime(options: &HostOptions) -> JsRuntime {
+///
+/// `entry_dir` is the program's own directory — an implicit read path for
+/// the *module loader only*. The operator chose this program, so its local
+/// module graph is program-space; ops still see only the manifest's grants.
+fn build_runtime(options: &HostOptions, entry_dir: Option<&Path>) -> JsRuntime {
+    let mut grants = options.capabilities.clone().into_grants();
+    if let Some(dir) = entry_dir.and_then(|d| d.canonicalize().ok()) {
+        grants.read_paths.push(dir);
+    }
+    let loader_capabilities = Capabilities::from_grants(grants);
     let runtime = JsRuntime::new(RuntimeOptions {
-        module_loader: Some(Rc::new(FsModuleLoader)),
+        module_loader: Some(crate::module_loader::gated_loader(&loader_capabilities)),
         extensions: vec![jsrt_core::init()],
         ..Default::default()
     });
@@ -145,7 +154,7 @@ pub async fn run_file_report(entry: &Path, options: &HostOptions) -> RunReport {
         }
     };
 
-    let mut runtime = build_runtime(options);
+    let mut runtime = build_runtime(options, entry.parent());
     let done = Arc::new(AtomicBool::new(false));
     let terminated = spawn_watchdog(
         &mut runtime,
@@ -188,7 +197,9 @@ pub async fn run_source_report(name: &str, source: &str, options: &HostOptions) 
             };
         }
     };
-    let mut runtime = build_runtime(options);
+    // An embedded run is "as if" run from cwd — same entry-dir convention.
+    let cwd = std::env::current_dir().unwrap_or_else(|_| Path::new(".").to_path_buf());
+    let mut runtime = build_runtime(options, Some(cwd.as_path()));
     let done = Arc::new(AtomicBool::new(false));
     let terminated = spawn_watchdog(
         &mut runtime,
@@ -300,6 +311,17 @@ fn classify(err: &deno_core::error::CoreError, terminated: &AtomicBool) -> HostE
                 .trim_start_matches("Uncaught (in promise) ")
                 .trim_start_matches("Uncaught ")
                 .to_string();
+            // Dynamic-import refusals reach here flattened: V8 rejects the
+            // import promise with a TypeError carrying our message, losing
+            // the CapabilityError class. The loader is the only emitter of
+            // the prefix, so an uncaught one still exits 7. `detail` is
+            // "{name}: {message}" — skip the class name to reach it.
+            if detail
+                .strip_prefix(&format!("{name}: "))
+                .is_some_and(|m| m.starts_with(crate::module_loader::IMPORT_DENIED_PREFIX))
+            {
+                return HostError::Capability(format!("CapabilityError: {detail}"));
+            }
             match name {
                 "SyntaxError" => HostError::Syntax(detail),
                 "CapabilityError" => HostError::Capability(format!("{name}: {detail}")),
@@ -341,7 +363,7 @@ mod tests {
         let options = super::HostOptions::default();
         let specifier = ModuleSpecifier::from_file_path(dir.path().join("main.js"))
             .unwrap_or_else(|e| panic!("specifier: {e:?}"));
-        let mut runtime = super::build_runtime(&options);
+        let mut runtime = super::build_runtime(&options, Some(dir.path()));
         let err = match runtime.load_main_es_module(&specifier).await {
             Err(e) => e,
             Ok(_) => panic!("must fail"),

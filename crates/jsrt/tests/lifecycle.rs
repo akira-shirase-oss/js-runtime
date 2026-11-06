@@ -28,6 +28,12 @@ impl Rig {
         path
     }
 
+    /// Write `source` at an absolute path inside the rig (e.g. `app/main.js`).
+    fn script_at(&self, path: &Path, source: &str) -> PathBuf {
+        fs::write(path, source).unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
+        path.to_path_buf()
+    }
+
     fn run(&self, args: &[&str]) -> Output {
         Command::new(JSRT)
             .args(args)
@@ -578,4 +584,209 @@ fn a_script_can_see_its_own_pending_timers() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("pending=1"), "stdout: {stdout}");
     assert!(stdout.contains("after=0"), "stdout: {stdout}");
+}
+
+// ---- M3.1: the loader is inside the fence ------------------------------------
+//
+// Before this step, `FsModuleLoader` resolved any import to any file on disk —
+// `may_read` gated ops but the module graph walked straight past it. Now the
+// rule is: the entry's own directory is program-space (implicit, loader-only),
+// anything beyond it needs a declared read path, and a canonicalized escape is
+// a CapabilityError (7) — while a genuinely missing dep stays a Load error (3).
+
+/// Entry lives in `app/`; its siblings are program-space, anything above is not.
+fn app_rig() -> (Rig, PathBuf) {
+    let rig = Rig::new();
+    let app = rig.dir.path().join("app");
+    fs::create_dir(&app).unwrap_or_else(|e| panic!("mkdir app: {e}"));
+    (rig, app)
+}
+
+#[test]
+fn an_import_outside_the_entry_dir_is_a_capability_refusal() {
+    let (rig, app) = app_rig();
+    fs::write(
+        rig.dir.path().join("secret.js"),
+        "export const s = 'leak';\n",
+    )
+    .unwrap_or_else(|e| panic!("write: {e}"));
+    let script = rig.script_at(&app.join("main.js"), "import '../secret.js';\n");
+    let out = rig.run_script(&script, &[]);
+    assert_eq!(code(&out), 7, "stderr: {}", stderr(&out));
+    assert!(
+        stderr(&out).contains("secret.js"),
+        "stderr: {}",
+        stderr(&out)
+    );
+}
+
+#[test]
+fn a_missing_import_still_classifies_as_load_not_capability() {
+    let (rig, app) = app_rig();
+    // Missing: canonicalize fails → the gate passes it to the loader, which
+    // reports a real Load error (3) — we do not turn absence into a refusal.
+    let script = rig.script_at(&app.join("main.js"), "import '../nope.js';\n");
+    let out = rig.run_script(&script, &[]);
+    assert_eq!(code(&out), 3, "stderr: {}", stderr(&out));
+    assert!(stderr(&out).contains("nope.js"), "stderr: {}", stderr(&out));
+}
+
+#[test]
+fn a_manifest_read_grant_opens_the_path_to_imports() {
+    let (rig, app) = app_rig();
+    let shared = rig.dir.path().join("shared");
+    fs::create_dir(&shared).unwrap_or_else(|e| panic!("mkdir shared: {e}"));
+    fs::write(shared.join("util.js"), "export const u = 'granted';\n")
+        .unwrap_or_else(|e| panic!("write: {e}"));
+    let manifest = rig.script("m.manifest.json", "{ \"read\": [\"shared\"] }\n");
+    let script = rig.script_at(
+        &app.join("main.js"),
+        "import { u } from '../shared/util.js';\nrt.print('u=' + u);\n",
+    );
+    let out = rig.run_script(
+        &script,
+        &[
+            "--manifest",
+            manifest.to_str().unwrap_or_else(|| panic!("utf8")),
+        ],
+    );
+    assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("u=granted"));
+}
+
+#[test]
+fn a_deep_dependency_cannot_launder_an_outside_import() {
+    let (rig, app) = app_rig();
+    fs::write(rig.dir.path().join("vault.js"), "export const v = 'no';\n")
+        .unwrap_or_else(|e| panic!("write: {e}"));
+    // lib.js is inside the entry dir and loads fine; its own import is the
+    // one that must be refused. The fence applies at every edge, not just
+    // the first.
+    rig.script_at(&app.join("lib.js"), "export { v } from '../vault.js';\n");
+    let script = rig.script_at(&app.join("main.js"), "import './lib.js';\n");
+    let out = rig.run_script(&script, &[]);
+    assert_eq!(code(&out), 7, "stderr: {}", stderr(&out));
+    assert!(
+        stderr(&out).contains("vault.js"),
+        "stderr: {}",
+        stderr(&out)
+    );
+}
+
+#[test]
+fn a_dynamic_import_outside_the_fence_is_also_refused() {
+    let (rig, app) = app_rig();
+    fs::write(rig.dir.path().join("dyn.js"), "export const d = 'no';\n")
+        .unwrap_or_else(|e| panic!("write: {e}"));
+    let script = rig.script_at(
+        &app.join("main.js"),
+        "try { await import('../dyn.js'); rt.print('loaded\\n'); } catch (e) { rt.print(e.name + '|' + e.message + '\\n'); }\n",
+    );
+    let out = rig.run_script(&script, &[]);
+    assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
+    // Honest quirk: V8 rejects a dynamic import through a path that flattens
+    // the class — the script sees TypeError, not CapabilityError. The refusal
+    // itself is real (nothing loads) and the message still says why.
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("TypeError"), "stdout: {stdout}");
+    assert!(
+        stdout.contains("outside every declared read path"),
+        "stdout: {stdout}"
+    );
+}
+
+#[test]
+fn an_uncaught_dynamic_import_refusal_still_exits_seven() {
+    let (rig, app) = app_rig();
+    fs::write(rig.dir.path().join("dyn.js"), "export const d = 'no';\n")
+        .unwrap_or_else(|e| panic!("write: {e}"));
+    // Uncaught: the rejection reaches the host flattened to TypeError, but
+    // the classifier recognizes the loader's own refusal prefix — a refusal
+    // is a refusal, whichever door it left through.
+    let script = rig.script_at(&app.join("main.js"), "await import('../dyn.js');\n");
+    let out = rig.run_script(&script, &[]);
+    assert_eq!(code(&out), 7, "stderr: {}", stderr(&out));
+    assert!(
+        stderr(&out).contains("capability"),
+        "stderr: {}",
+        stderr(&out)
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn a_symlink_inside_the_fence_cannot_point_out() {
+    let (rig, app) = app_rig();
+    fs::write(
+        rig.dir.path().join("target.js"),
+        "export const t = 'esc';\n",
+    )
+    .unwrap_or_else(|e| panic!("write: {e}"));
+    std::os::unix::fs::symlink(rig.dir.path().join("target.js"), app.join("link.js"))
+        .unwrap_or_else(|e| panic!("symlink: {e}"));
+    // The specifier looks inside the fence; canonicalization reveals the
+    // real target outside it. The checked path is the path that loads.
+    let script = rig.script_at(&app.join("main.js"), "import './link.js';\n");
+    let out = rig.run_script(&script, &[]);
+    assert_eq!(code(&out), 7, "stderr: {}", stderr(&out));
+    assert!(
+        stderr(&out).contains("target.js"),
+        "stderr: {}",
+        stderr(&out)
+    );
+}
+
+#[test]
+fn the_entry_itself_is_never_capability_gated() {
+    let (rig, app) = app_rig();
+    // Manifest grants only `data/`; the entry at app/main.js is the
+    // operator's choice and must still load, evaluate, and use its own dir.
+    let data = rig.dir.path().join("data");
+    fs::create_dir(&data).unwrap_or_else(|e| panic!("mkdir data: {e}"));
+    fs::write(data.join("note.txt"), "via manifest").unwrap_or_else(|e| panic!("write: {e}"));
+    let manifest = rig.script("m.manifest.json", "{ \"read\": [\"data\"] }\n");
+    rig.script_at(&app.join("lib.js"), "export const l = 'local';\n");
+    let script = rig.script_at(
+        &app.join("main.js"),
+        "import { l } from './lib.js';\nrt.print(l + '|' + await rt.readText('data/note.txt') + '\\n');\n",
+    );
+    let out = rig.run_script(
+        &script,
+        &[
+            "--manifest",
+            manifest.to_str().unwrap_or_else(|| panic!("utf8")),
+        ],
+    );
+    assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("local|via manifest"),
+        "stdout: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
+#[test]
+fn a_manifest_granted_dir_is_also_importable() {
+    let (rig, app) = app_rig();
+    // Both an op-read and a module-import land in the same granted dir —
+    // one manifest covers the whole surface, not two separate fences.
+    let lib = rig.dir.path().join("lib");
+    fs::create_dir(&lib).unwrap_or_else(|e| panic!("mkdir lib: {e}"));
+    fs::write(lib.join("mod.js"), "export const m = 'mod';\n")
+        .unwrap_or_else(|e| panic!("write: {e}"));
+    fs::write(lib.join("note.txt"), "note").unwrap_or_else(|e| panic!("write: {e}"));
+    let manifest = rig.script("m.manifest.json", "{ \"read\": [\"lib\"] }\n");
+    let script = rig.script_at(
+        &app.join("main.js"),
+        "import { m } from '../lib/mod.js';\nrt.print(m + '|' + await rt.readText('lib/note.txt') + '\\n');\n",
+    );
+    let out = rig.run_script(
+        &script,
+        &[
+            "--manifest",
+            manifest.to_str().unwrap_or_else(|| panic!("utf8")),
+        ],
+    );
+    assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("mod|note"));
 }

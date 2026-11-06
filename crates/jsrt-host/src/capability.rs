@@ -84,6 +84,15 @@ impl Capabilities {
         Ok(caps)
     }
 
+    /// The allowlist check on an already-canonical path — the module
+    /// loader's gate uses this so an unresolvable path stays a *load*
+    /// failure instead of becoming a refusal it isn't.
+    pub fn is_read_allowed(&self, resolved: &Path) -> bool {
+        self.read_paths
+            .iter()
+            .any(|root| resolved.starts_with(root))
+    }
+
     /// Check whether `path` may be read. Returns the canonical path on
     /// success — callers must use the returned path so the checked path is
     /// the read path (no TOCTOU window between check and use).
@@ -94,11 +103,7 @@ impl Capabilities {
                 path.display()
             ))
         })?;
-        let allowed = self
-            .read_paths
-            .iter()
-            .any(|root| resolved.starts_with(root));
-        if !allowed {
+        if !self.is_read_allowed(&resolved) {
             return Err(HostError::Capability(format!(
                 "read denied: {} is outside every declared read path",
                 resolved.display()
