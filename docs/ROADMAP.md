@@ -29,7 +29,7 @@ acceptance test. Nothing is called done without its evidence.
 
 | Step | Outcome | Invariant | Failure case | Acceptance test |
 |---|---|---|---|---|
-| 3.1 manifest complete | paths, destinations, budgets declared per entry point | ops read the manifest fresh — never cached stale | manifest mid-run change is out of scope; boot-time parse errors fail fast | matrix test per op × denied/allowed |
+| 3.1 manifest complete | paths, destinations, budgets declared per entry point — **and module resolution**: a custom loader resolves imports only inside declared read paths (today `FsModuleLoader` lets a script `import` any file, bypassing `may_read` — this step closes that hole) | ops and the loader read the manifest fresh — never cached stale | manifest mid-run change is out of scope; boot-time parse errors fail fast | matrix test per op × denied/allowed; import-outside-path refused |
 | 3.2 escape suite | `..`, symlinks, URL tricks, userinfo, ports, schemes | the real target is what's checked | every documented bypass refused | adversarial test file |
 
 ## M4 — supervise
@@ -38,6 +38,7 @@ acceptance test. Nothing is called done without its evidence.
 |---|---|---|---|---|
 | 4.1 worker processes | isolate per process, supervised; memory + CPU budgets enforced by the OS | the supervisor never dies with its worker | infinite loop → killed inside budget + grace | supervision drill |
 | 4.2 memory boundary | near-heap-limit → controlled death, classified `terminated` | a memory bomb is an OS problem, not an in-process flag | allocation bomb dies bounded, supervisor reports it | bomb test with evidence |
+| 4.3 structured diagnostics | per-run JSON log records — run ID, timestamps, outcome class, resource use — with byte limits, rotation, and a visible dropped-record count | a flooded log limits itself predictably and says so; diagnostics are never confused with a workflow journal | disk pressure / log storm → bounded output, supervisor preserved, failure exposed not hidden | flood test: records dropped+counted, host survives |
 
 ## M5 — stdlib wave 1
 
@@ -69,3 +70,5 @@ acceptance test. Nothing is called done without its evidence.
 | Deno/Node compat | Purpose-built host, not a compatibility target — per the guide |
 | Memory sandbox in-process | `terminate_execution` stops CPU; only a process boundary stops allocation — that's why M4 exists |
 | Durable workflow journal | Diagnostic logs are not a journal — that lives in project 04 (Durable Workflow Runner) |
+| V8 inspector (devtools) | In the guide's full direction, but value shows up once real apps run on it — lands alongside M6's operate work if needed, not before |
+| TypeScript transformation | Separate contract per the guide — scripts are JavaScript; TS support is a stated later item, not silently assumed |
