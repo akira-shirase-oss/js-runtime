@@ -1081,6 +1081,7 @@ dependencies = [
  "anyhow",
  "clap",
  "jsrt-host",
+ "libc",
  "serde_json",
  "tempfile",
  "tokio",
