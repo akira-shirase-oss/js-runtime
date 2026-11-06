@@ -186,9 +186,172 @@ async fn op_fetch(
     })
 }
 
+// ---- rt.kv — the embedded store ------------------------------------------
+//
+// One lazily-opened SQLite connection per run, held in OpState. Sync ops on
+// purpose: the store is a local file, ops are bounded by SQLite speed, and
+// an honest block beats a fake async. The grant lives in the state cell —
+// the op asks the same question every other op asks: is this declared?
+
+/// Per-run KV handle: the grant plus the connection opened on first use.
+/// A script that never touches `rt.kv` never creates the file.
+pub struct KvState {
+    grant: crate::capability::KvGrant,
+    conn: Option<rusqlite::Connection>,
+}
+
+impl KvState {
+    pub fn new(grant: crate::capability::KvGrant) -> Self {
+        Self { grant, conn: None }
+    }
+
+    fn conn(&mut self) -> Result<&rusqlite::Connection, JsErrorBox> {
+        if self.conn.is_none() {
+            let c = rusqlite::Connection::open(&self.grant.path)
+                .map_err(|e| host_err(format!("kv open {}: {e}", self.grant.path.display())))?;
+            c.execute_batch("CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT NOT NULL);")
+                .map_err(|e| host_err(format!("kv init: {e}")))?;
+            self.conn = Some(c);
+        }
+        self.conn
+            .as_ref()
+            .ok_or_else(|| host_err("kv connection lost".into()))
+    }
+}
+
+fn kv_cell(state: &Rc<RefCell<OpState>>) -> Result<Rc<RefCell<KvState>>, JsErrorBox> {
+    state
+        .borrow()
+        .try_borrow::<Rc<RefCell<KvState>>>()
+        .cloned()
+        .ok_or_else(|| {
+            JsErrorBox::new(
+                "CapabilityError",
+                "kv denied: no store declared in the manifest".to_string(),
+            )
+        })
+}
+
+/// `rt.kv.get(key)` — the value, or null. `serde_json::Value` because op2
+/// doesn't take `Option<String>`; a null is the honest miss.
+#[op2]
+#[serde]
+fn op_kv_get(
+    state: Rc<RefCell<OpState>>,
+    #[string] key: String,
+) -> Result<serde_json::Value, JsErrorBox> {
+    use rusqlite::OptionalExtension;
+    let cell = kv_cell(&state)?;
+    let mut kv = cell.borrow_mut();
+    let conn = kv.conn()?;
+    let hit: Option<String> = conn
+        .query_row("SELECT v FROM kv WHERE k = ?1", [&key], |r| r.get(0))
+        .optional()
+        .map_err(|e| host_err(format!("kv get: {e}")))?;
+    Ok(hit.map_or(serde_json::Value::Null, serde_json::Value::String))
+}
+
+/// `rt.kv.put(key, value)` — upsert under the file-size quota.
+#[op2(fast)]
+fn op_kv_put(
+    state: Rc<RefCell<OpState>>,
+    #[string] key: String,
+    #[string] value: String,
+) -> Result<(), JsErrorBox> {
+    let cell = kv_cell(&state)?;
+    let mut kv = cell.borrow_mut();
+    // The quota is the db file's own size — simple, honest, and what the
+    // operator actually budgets. Projection is conservative: current file
+    // bytes + payload + a page of SQLite slack.
+    let file_bytes = std::fs::metadata(&kv.grant.path)
+        .map(|m| m.len())
+        .unwrap_or(0);
+    let projected = file_bytes + key.len() as u64 + value.len() as u64 + 4096;
+    if projected > kv.grant.max_bytes {
+        return Err(JsErrorBox::new(
+            "CapabilityError",
+            format!(
+                "kv quota exceeded: {} is {file_bytes}B; this write projects {projected}B over the {}B grant",
+                kv.grant.path.display(),
+                kv.grant.max_bytes
+            ),
+        ));
+    }
+    let conn = kv.conn()?;
+    conn.execute(
+        "INSERT INTO kv (k, v) VALUES (?1, ?2) \
+         ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+        [&key, &value],
+    )
+    .map_err(|e| host_err(format!("kv put: {e}")))?;
+    Ok(())
+}
+
+/// `rt.kv.delete(key)` — whether anything was removed.
+#[op2(fast)]
+fn op_kv_delete(state: Rc<RefCell<OpState>>, #[string] key: String) -> Result<bool, JsErrorBox> {
+    let cell = kv_cell(&state)?;
+    let mut kv = cell.borrow_mut();
+    let conn = kv.conn()?;
+    let n = conn
+        .execute("DELETE FROM kv WHERE k = ?1", [&key])
+        .map_err(|e| host_err(format!("kv delete: {e}")))?;
+    Ok(n > 0)
+}
+
+/// `rt.kv.list(prefix)` — `{key, value}` entries under an exact prefix
+/// (substr match, not LIKE — a prefix is a prefix, not a pattern).
+#[derive(Serialize)]
+struct KvEntry {
+    key: String,
+    value: String,
+}
+
+#[op2]
+#[serde]
+fn op_kv_list(
+    state: Rc<RefCell<OpState>>,
+    #[string] prefix: String,
+    limit: u32,
+) -> Result<Vec<KvEntry>, JsErrorBox> {
+    let cell = kv_cell(&state)?;
+    let mut kv = cell.borrow_mut();
+    let conn = kv.conn()?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT k, v FROM kv WHERE substr(k, 1, length(?1)) = ?1 \
+             ORDER BY k LIMIT ?2",
+        )
+        .map_err(|e| host_err(format!("kv list: {e}")))?;
+    let rows = stmt
+        .query_map(rusqlite::params![prefix, limit], |r| {
+            Ok(KvEntry {
+                key: r.get(0)?,
+                value: r.get(1)?,
+            })
+        })
+        .map_err(|e| host_err(format!("kv list: {e}")))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row.map_err(|e| host_err(format!("kv list row: {e}")))?);
+    }
+    Ok(out)
+}
+
 deno_core::extension!(
     jsrt_core,
-    ops = [op_host_info, op_now, op_sleep, op_read_text, op_fetch, op_noop],
+    ops = [
+        op_host_info,
+        op_now,
+        op_sleep,
+        op_read_text,
+        op_fetch,
+        op_noop,
+        op_kv_get,
+        op_kv_put,
+        op_kv_delete,
+        op_kv_list,
+    ],
     esm_entry_point = "ext:jsrt_core/bootstrap.js",
     esm = [dir "js", "bootstrap.js"],
 );

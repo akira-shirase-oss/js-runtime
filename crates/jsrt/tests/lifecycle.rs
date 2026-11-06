@@ -820,3 +820,134 @@ fn a_manifest_granted_dir_is_also_importable() {
     assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
     assert!(String::from_utf8_lossy(&out.stdout).contains("mod|note"));
 }
+
+// ---- rt.kv — the embedded store -------------------------------------------
+//
+// The honest surface: no grant means CapabilityError, puts persist on disk
+// (a second run reads what the first wrote), the quota is the file's own
+// size, and list is an exact-prefix scan.
+
+#[test]
+fn kv_without_a_grant_refuses() {
+    let rig = Rig::new();
+    let script = rig.script("s.js", "rt.kv.get('k');\n");
+    let out = rig.run_script(&script, &[]);
+    assert_eq!(code(&out), 7, "stderr: {}", stderr(&out));
+    assert!(
+        stderr(&out).contains("kv denied"),
+        "stderr: {}",
+        stderr(&out)
+    );
+}
+
+#[test]
+fn kv_put_get_delete_roundtrip() {
+    let rig = Rig::new();
+    fs::create_dir_all(rig.dir.path().join("data")).unwrap_or_else(|e| panic!("mkdir: {e}"));
+    let manifest = rig.script(
+        "m.manifest.json",
+        "{ \"kv\": { \"path\": \"data/app.kv\" } }\n",
+    );
+    let script = rig.script(
+        "s.js",
+        "rt.kv.put('a', 'one');\n\
+         rt.print(rt.kv.get('a') + '|' + rt.kv.delete('a') + '|' + rt.kv.get('a') + '\\n');\n",
+    );
+    let out = rig.run_script(
+        &script,
+        &[
+            "--manifest",
+            manifest.to_str().unwrap_or_else(|| panic!("utf8")),
+        ],
+    );
+    assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "one|true|null\n");
+}
+
+#[test]
+fn kv_persists_across_runs() {
+    let rig = Rig::new();
+    fs::create_dir_all(rig.dir.path().join("data")).unwrap_or_else(|e| panic!("mkdir: {e}"));
+    let manifest = rig.script(
+        "m.manifest.json",
+        "{ \"kv\": { \"path\": \"data/app.kv\" } }\n",
+    );
+    let mpath = manifest
+        .to_str()
+        .unwrap_or_else(|| panic!("utf8"))
+        .to_string();
+    let put = rig.script("put.js", "rt.kv.put('kept', 'across');\n");
+    let out = rig.run_script(&put, &["--manifest", &mpath]);
+    assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
+    let get = rig.script("get.js", "rt.print('read:' + rt.kv.get('kept') + '\\n');\n");
+    let out = rig.run_script(&get, &["--manifest", &mpath]);
+    assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "read:across\n");
+}
+
+#[test]
+fn kv_quota_refuses_the_write() {
+    let rig = Rig::new();
+    fs::create_dir_all(rig.dir.path().join("data")).unwrap_or_else(|e| panic!("mkdir: {e}"));
+    // One byte of quota: even the db's own pages blow past it.
+    let manifest = rig.script(
+        "m.manifest.json",
+        "{ \"kv\": { \"path\": \"data/app.kv\", \"max_bytes\": 1 } }\n",
+    );
+    let script = rig.script("s.js", "rt.kv.put('a', 'x');\n");
+    let out = rig.run_script(
+        &script,
+        &[
+            "--manifest",
+            manifest.to_str().unwrap_or_else(|| panic!("utf8")),
+        ],
+    );
+    assert_eq!(code(&out), 7, "stderr: {}", stderr(&out));
+    assert!(
+        stderr(&out).contains("kv quota exceeded"),
+        "stderr: {}",
+        stderr(&out)
+    );
+}
+
+#[test]
+fn kv_list_returns_entries_under_an_exact_prefix() {
+    let rig = Rig::new();
+    fs::create_dir_all(rig.dir.path().join("data")).unwrap_or_else(|e| panic!("mkdir: {e}"));
+    let manifest = rig.script(
+        "m.manifest.json",
+        "{ \"kv\": { \"path\": \"data/app.kv\" } }\n",
+    );
+    let script = rig.script(
+        "s.js",
+        "rt.kv.put('user/2', 'b');\n\
+         rt.kv.put('user/1', 'a');\n\
+         rt.kv.put('other', 'o');\n\
+         rt.print(rt.kv.list('user/').map(e => e.key + '=' + e.value).join(',') + '\\n');\n",
+    );
+    let out = rig.run_script(
+        &script,
+        &[
+            "--manifest",
+            manifest.to_str().unwrap_or_else(|| panic!("utf8")),
+        ],
+    );
+    assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "user/1=a,user/2=b\n");
+}
+
+#[test]
+fn kv_flag_grants_a_store() {
+    let rig = Rig::new();
+    let db = rig.dir.path().join("flag.kv");
+    let script = rig.script(
+        "s.js",
+        "rt.kv.put('x', 'y'); rt.print(rt.kv.get('x') + '\\n');\n",
+    );
+    let out = rig.run_script(
+        &script,
+        &["--kv", db.to_str().unwrap_or_else(|| panic!("utf8"))],
+    );
+    assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "y\n");
+}

@@ -78,4 +78,19 @@ globalThis.rt = {
 	},
 	/** Timer ids this script still owns (fired one-shots remove themselves). */
 	pendingTimers: () => timers.size,
+	/**
+	 * The embedded store, gated by the manifest's "kv" line. Synchronous on
+	 * purpose: SQLite on a local file answers in microseconds, and an honest
+	 * block beats a fake async. No grant -> every call throws CapabilityError.
+	 */
+	kv: {
+		/** The value, or null. */
+		get: (key) => ops.op_kv_get(String(key)),
+		/** Upsert; throws CapabilityError past the declared quota. */
+		put: (key, value) => ops.op_kv_put(String(key), String(value)),
+		/** Whether anything was removed. */
+		delete: (key) => ops.op_kv_delete(String(key)),
+		/** [{key, value}] under an exact prefix, key-sorted. */
+		list: (prefix = "", limit = 1000) => ops.op_kv_list(String(prefix), limit),
+	},
 };

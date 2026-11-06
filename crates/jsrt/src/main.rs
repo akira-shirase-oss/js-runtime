@@ -38,6 +38,13 @@ struct RunArgs {
     /// Extra net destinations, host or host:port (joined with the manifest's).
     #[arg(long)]
     net: Vec<String>,
+    /// Embedded KV store path — joins with the manifest's "kv" grant
+    /// (a manifest line wins over the flag's default quota).
+    #[arg(long)]
+    kv: Option<PathBuf>,
+    /// KV quota in MiB when granting via --kv (default 64).
+    #[arg(long, default_value_t = 64)]
+    kv_max_mb: u64,
     /// Per-fetch deadline in milliseconds (0 = the built-in 10s bound).
     #[arg(long, default_value_t = 0)]
     fetch_timeout: u64,
@@ -58,6 +65,10 @@ impl RunArgs {
         for n in &self.net {
             v.extend(["--net".into(), n.clone()]);
         }
+        if let Some(kv) = &self.kv {
+            v.extend(["--kv".into(), kv.to_string_lossy().into_owned()]);
+        }
+        v.extend(["--kv-max-mb".into(), self.kv_max_mb.to_string()]);
         v.extend(["--fetch-timeout".into(), self.fetch_timeout.to_string()]);
         v
     }
@@ -147,7 +158,7 @@ async fn execute(run: RunArgs) -> Result<(), HostError> {
         Some(path) => Capabilities::from_manifest_file(path)?,
         None => Capabilities::deny_all(),
     };
-    let capabilities = merge_cli_grants(capabilities, run.read, run.net)?;
+    let capabilities = merge_cli_grants(capabilities, run.read, run.net, run.kv, run.kv_max_mb)?;
     let options = HostOptions {
         capabilities,
         timeout: (run.timeout > 0).then(|| Duration::from_millis(run.timeout)),
@@ -165,8 +176,10 @@ fn merge_cli_grants(
     caps: Capabilities,
     read: Vec<PathBuf>,
     net: Vec<String>,
+    kv: Option<PathBuf>,
+    kv_max_mb: u64,
 ) -> Result<Capabilities, HostError> {
-    if read.is_empty() && net.is_empty() {
+    if read.is_empty() && net.is_empty() && kv.is_none() {
         return Ok(caps);
     }
     let mut merged = caps.into_grants();
@@ -177,5 +190,28 @@ fn merge_cli_grants(
         merged.read_paths.push(resolved);
     }
     merged.net_hosts.extend(net);
+    if let Some(path) = kv {
+        // Only extend, never weaken: a manifest "kv" line keeps its own
+        // quota over the flag's default.
+        if merged.kv.is_none() {
+            let parent = path
+                .parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| PathBuf::from("."));
+            let canonical = std::fs::canonicalize(&parent).map_err(|e| {
+                HostError::Host(format!(
+                    "--kv {} parent does not resolve: {e}",
+                    path.display()
+                ))
+            })?;
+            let file_name = path.file_name().map(|n| n.to_os_string()).ok_or_else(|| {
+                HostError::Host(format!("--kv {} has no file name", path.display()))
+            })?;
+            merged.kv = Some(jsrt_host::capability::KvGrant {
+                path: canonical.join(file_name),
+                max_bytes: kv_max_mb * 1024 * 1024,
+            });
+        }
+    }
     Ok(Capabilities::from_grants(merged))
 }

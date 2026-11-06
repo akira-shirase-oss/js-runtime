@@ -20,6 +20,18 @@ use crate::error::HostError;
 /// a buffering accident.
 const MAX_READ_BYTES: u64 = 4 * 1024 * 1024;
 
+/// The default KV quota when the manifest doesn't declare one.
+const DEFAULT_KV_MAX_BYTES: u64 = 64 * 1024 * 1024;
+
+/// A declared embedded-KV store: the file the script may open and the
+/// quota it must stay under. The `path`'s parent is canonicalized at
+/// load time — the db file itself need not exist yet.
+#[derive(Debug, Clone)]
+pub struct KvGrant {
+    pub path: PathBuf,
+    pub max_bytes: u64,
+}
+
 /// What a script may reach. Every field is an allowlist; empty means denied.
 #[derive(Debug, Clone, Default)]
 pub struct Capabilities {
@@ -27,6 +39,8 @@ pub struct Capabilities {
     read_paths: Vec<PathBuf>,
     /// `host` or `host:port` destinations the script may fetch.
     net_hosts: Vec<String>,
+    /// The embedded KV store, if declared.
+    kv: Option<KvGrant>,
 }
 
 /// The manifest file format (`jsrt.manifest.json`).
@@ -39,6 +53,16 @@ struct Manifest {
     /// `host` or `host:port` entries. `host` alone allows any port.
     #[serde(default)]
     net: Vec<String>,
+    /// The KV grant: {"kv": {"path": "app.kv", "max_bytes": 67108864}}.
+    #[serde(default)]
+    kv: Option<ManifestKv>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ManifestKv {
+    path: PathBuf,
+    #[serde(default)]
+    max_bytes: Option<u64>,
 }
 
 impl Capabilities {
@@ -52,6 +76,20 @@ impl Capabilities {
         Self {
             read_paths,
             net_hosts,
+            kv: None,
+        }
+    }
+
+    /// Build with a KV grant attached (the CLI `--kv` path).
+    pub fn grant_with_kv(
+        read_paths: Vec<PathBuf>,
+        net_hosts: Vec<String>,
+        kv: Option<KvGrant>,
+    ) -> Self {
+        Self {
+            read_paths,
+            net_hosts,
+            kv,
         }
     }
 
@@ -81,7 +119,44 @@ impl Capabilities {
             caps.read_paths.push(resolved);
         }
         caps.net_hosts = manifest.net;
+        if let Some(kv) = manifest.kv {
+            let joined = base.join(&kv.path);
+            // The db file itself may not exist yet — its parent must. The
+            // stored path is canonicalized-parent + file name, same rule as
+            // read paths.
+            let parent = joined
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| PathBuf::from("."));
+            let canonical_parent = fs::canonicalize(&parent).map_err(|e| {
+                HostError::Host(format!(
+                    "manifest kv path {} parent does not resolve: {e}",
+                    joined.display()
+                ))
+            })?;
+            let file_name = joined
+                .file_name()
+                .map(|n| n.to_os_string())
+                .ok_or_else(|| {
+                    HostError::Host(format!(
+                        "manifest kv path {} has no file name",
+                        joined.display()
+                    ))
+                })?;
+            caps.kv = Some(KvGrant {
+                path: canonical_parent.join(file_name),
+                max_bytes: kv.max_bytes.unwrap_or(DEFAULT_KV_MAX_BYTES),
+            });
+        }
         Ok(caps)
+    }
+
+    /// The KV grant, if declared — cloned so the caller never holds a
+    /// borrow into the manifest.
+    pub fn may_kv(&self) -> Result<KvGrant, HostError> {
+        self.kv.clone().ok_or_else(|| {
+            HostError::Capability("kv denied: no store declared in the manifest".into())
+        })
     }
 
     /// The allowlist check on an already-canonical path — the module
@@ -147,7 +222,7 @@ impl Capabilities {
     /// True when no capabilities were granted — used by ops that want to give
     /// a clearer error than a bare refusal.
     pub fn is_empty(&self) -> bool {
-        self.read_paths.is_empty() && self.net_hosts.is_empty()
+        self.read_paths.is_empty() && self.net_hosts.is_empty() && self.kv.is_none()
     }
 
     /// Decompose into the raw grant lists (for callers that merge sources).
@@ -155,6 +230,7 @@ impl Capabilities {
         Grants {
             read_paths: self.read_paths,
             net_hosts: self.net_hosts,
+            kv: self.kv,
         }
     }
 
@@ -164,6 +240,7 @@ impl Capabilities {
         Self {
             read_paths: grants.read_paths,
             net_hosts: grants.net_hosts,
+            kv: grants.kv,
         }
     }
 }
@@ -173,6 +250,7 @@ impl Capabilities {
 pub struct Grants {
     pub read_paths: Vec<PathBuf>,
     pub net_hosts: Vec<String>,
+    pub kv: Option<KvGrant>,
 }
 
 /// Extract `host` and `port` (defaulted by scheme) from an http(s) URL

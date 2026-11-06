@@ -119,6 +119,13 @@ fn build_runtime(options: &HostOptions, entry_dir: Option<&Path>) -> JsRuntime {
             ..Default::default()
         };
         state.put(Rc::new(budgets));
+        // The KV grant becomes a state cell only when declared — the op
+        // finds no cell and refuses, same door as every other capability.
+        if let Ok(grant) = options.capabilities.may_kv() {
+            state.put(Rc::new(std::cell::RefCell::new(crate::ops::KvState::new(
+                grant,
+            ))));
+        }
     }
     runtime
 }
