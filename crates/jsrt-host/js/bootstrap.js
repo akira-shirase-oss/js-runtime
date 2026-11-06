@@ -93,4 +93,15 @@ globalThis.rt = {
 		/** [{key, value}] under an exact prefix, key-sorted. */
 		list: (prefix = "", limit = 1000) => ops.op_kv_list(String(prefix), limit),
 	},
+	/**
+	 * Content-addressed media store, gated by the manifest's "media" line.
+	 * put streams a read-granted file into the store under its sha256 name --
+	 * never a whole-file buffer, and a mid-upload failure cleans its partial.
+	 */
+	media: {
+		/** {name, bytes, sha256, state:"stored"}; name is the sha256 hex. */
+		put: (srcPath) => ops.op_media_put(String(srcPath)),
+		/** {name, bytes} for a stored name, else null. */
+		stat: (name) => ops.op_media_stat(String(name)),
+	},
 };

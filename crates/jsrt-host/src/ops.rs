@@ -338,6 +338,171 @@ fn op_kv_list(
     Ok(out)
 }
 
+// ---- rt.media — streamed, content-addressed uploads -----------------------
+//
+// Local-disk backend: the script hands over a path it may read, the host
+// streams it into the declared media root under its sha256 name. Two rules
+// keep the story honest: the upload *streams* (64 KiB chunks, never a
+// whole-file buffer) and a name is the content — dedup is free because the
+// destination filename is the hash.
+
+/// Chunk size for the upload stream — big enough to amortize syscalls,
+/// small enough that "streaming" isn't a euphemism for buffering.
+const MEDIA_CHUNK: usize = 64 * 1024;
+
+fn media_grant(
+    state: &Rc<RefCell<OpState>>,
+) -> Result<Rc<crate::capability::MediaGrant>, JsErrorBox> {
+    state
+        .borrow()
+        .try_borrow::<Rc<crate::capability::MediaGrant>>()
+        .cloned()
+        .ok_or_else(|| {
+            JsErrorBox::new(
+                "CapabilityError",
+                "media denied: no store declared in the manifest".to_string(),
+            )
+        })
+}
+
+#[derive(Serialize)]
+struct MediaPutResult {
+    name: String,
+    bytes: u64,
+    sha256: String,
+    /// "stored" is the only success state a local backend can report. A
+    /// future network backend adds "uncertain" for mid-flight failures —
+    /// never "uploaded" on less than the backend's own confirmation.
+    state: &'static str,
+}
+
+/// `rt.media.put(srcPath)` — stream a read-granted file into the store.
+/// Returns {name, bytes, sha256, state}; the name is the sha256 hex.
+#[op2]
+#[serde]
+fn op_media_put(
+    state: Rc<RefCell<OpState>>,
+    #[string] src: String,
+) -> Result<MediaPutResult, JsErrorBox> {
+    use sha2::Digest;
+    use std::io::{Read, Write};
+
+    let caps = capabilities(&state)?;
+    let grant = media_grant(&state)?;
+    // Reading requires a read grant — media never bypasses that gate. The
+    // check is is_read_allowed, NOT may_read: may_read's 4 MiB cap is a
+    // materialization limit for readText, and this op never materializes.
+    let resolved = std::fs::canonicalize(&src).map_err(|e| {
+        JsErrorBox::new(
+            "CapabilityError",
+            format!("read denied: {src} does not resolve ({e})"),
+        )
+    })?;
+    if !caps.is_read_allowed(&resolved) {
+        return Err(JsErrorBox::new(
+            "CapabilityError",
+            format!(
+                "read denied: {} is outside every declared read path",
+                resolved.display()
+            ),
+        ));
+    }
+    let mut input = std::fs::File::open(&resolved)
+        .map_err(|e| host_err(format!("media put: open {}: {e}", resolved.display())))?;
+
+    // Unique-enough tmp name in the same dir as the destination — rename
+    // across a filesystem boundary wouldn't be atomic.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let tmp = grant
+        .root
+        .join(format!(".media-tmp-{}-{nanos}", std::process::id()));
+
+    let streamed = (|| -> Result<(String, u64), JsErrorBox> {
+        let mut out = std::fs::File::create(&tmp)
+            .map_err(|e| host_err(format!("media put: create tmp: {e}")))?;
+        let mut hasher = sha2::Sha256::new();
+        let mut total: u64 = 0;
+        let mut buf = vec![0u8; MEDIA_CHUNK];
+        loop {
+            let n = input
+                .read(&mut buf)
+                .map_err(|e| host_err(format!("media put: read src: {e}")))?;
+            if n == 0 {
+                break;
+            }
+            total += n as u64;
+            if total > grant.max_bytes {
+                return Err(JsErrorBox::new(
+                    "CapabilityError",
+                    format!(
+                        "media put: {} exceeds the {}-byte grant",
+                        resolved.display(),
+                        grant.max_bytes
+                    ),
+                ));
+            }
+            hasher.update(&buf[..n]);
+            out.write_all(&buf[..n])
+                .map_err(|e| host_err(format!("media put: write tmp: {e}")))?;
+        }
+        out.sync_all()
+            .map_err(|e| host_err(format!("media put: sync tmp: {e}")))?;
+        Ok((format!("{:x}", hasher.finalize()), total))
+    })();
+
+    match streamed {
+        Ok((hex, total)) => {
+            let dest = grant.root.join(&hex);
+            if dest.exists() {
+                // The name is the content — already stored.
+                let _ = std::fs::remove_file(&tmp);
+            } else {
+                std::fs::rename(&tmp, &dest)
+                    .map_err(|e| host_err(format!("media put: commit: {e}")))?;
+            }
+            Ok(MediaPutResult {
+                name: hex.clone(),
+                bytes: total,
+                sha256: hex,
+                state: "stored",
+            })
+        }
+        Err(e) => {
+            // Whatever failed, the partial goes with us — the store only
+            // ever contains complete, name-matches-content files.
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
+}
+
+/// `rt.media.stat(name)` — {name, bytes} for a stored name, else null.
+/// Names are validated, never joined blindly — a stat can't become a path.
+#[op2]
+#[serde]
+fn op_media_stat(
+    state: Rc<RefCell<OpState>>,
+    #[string] name: String,
+) -> Result<serde_json::Value, JsErrorBox> {
+    let grant = media_grant(&state)?;
+    let valid = name.len() == 64
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase());
+    if !valid {
+        return Err(JsErrorBox::type_error(
+            "rt.media.stat: name must be a 64-char lowercase sha256 hex",
+        ));
+    }
+    let path = grant.root.join(&name);
+    match std::fs::metadata(&path) {
+        Ok(m) if m.is_file() => Ok(serde_json::json!({ "name": name, "bytes": m.len() })),
+        _ => Ok(serde_json::Value::Null),
+    }
+}
+
 deno_core::extension!(
     jsrt_core,
     ops = [
@@ -351,6 +516,8 @@ deno_core::extension!(
         op_kv_put,
         op_kv_delete,
         op_kv_list,
+        op_media_put,
+        op_media_stat,
     ],
     esm_entry_point = "ext:jsrt_core/bootstrap.js",
     esm = [dir "js", "bootstrap.js"],

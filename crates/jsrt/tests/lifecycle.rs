@@ -951,3 +951,205 @@ fn kv_flag_grants_a_store() {
     assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
     assert_eq!(String::from_utf8_lossy(&out.stdout), "y\n");
 }
+
+// ---- rt.media — streamed, content-addressed uploads -----------------------
+//
+// The honest surface: no grant means CapabilityError, uploads stream into
+// the declared root under their sha256 name, a mid-upload failure removes
+// its partial, and reading the source still requires a read grant.
+
+#[test]
+fn media_without_a_grant_refuses() {
+    let rig = Rig::new();
+    let script = rig.script("s.js", "rt.media.put('x.bin');\n");
+    let out = rig.run_script(&script, &[]);
+    assert_eq!(code(&out), 7, "stderr: {}", stderr(&out));
+    assert!(
+        stderr(&out).contains("media denied"),
+        "stderr: {}",
+        stderr(&out)
+    );
+}
+
+#[test]
+fn media_put_streams_and_names_by_content() {
+    let rig = Rig::new();
+    fs::create_dir_all(rig.dir.path().join("scratch")).unwrap_or_else(|e| panic!("mkdir: {e}"));
+    fs::create_dir_all(rig.dir.path().join("media")).unwrap_or_else(|e| panic!("mkdir: {e}"));
+    rig.script_at(
+        &rig.dir.path().join("scratch/blob.bin"),
+        "the quick brown fox",
+    );
+    let manifest = rig.script(
+        "m.manifest.json",
+        "{ \"read\": [\"scratch\"], \"media\": {\"backend\": \"local\", \"root\": \"media\"} }\n",
+    );
+    let script = rig.script(
+        "s.js",
+        "const r = rt.media.put('scratch/blob.bin');\n\
+         rt.print(r.state + '|' + r.bytes + '|' + r.name.length + '|' + (r.sha256 === r.name) + '\\n');\n\
+         const s = rt.media.stat(r.name);\n\
+         rt.print('stat:' + s.bytes + '|miss:' + JSON.stringify(rt.media.stat('0'.repeat(64))) + '\\n');\n",
+    );
+    let out = rig.run_script(
+        &script,
+        &[
+            "--manifest",
+            manifest.to_str().unwrap_or_else(|| panic!("utf8")),
+        ],
+    );
+    assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "stored|19|64|true\nstat:19|miss:null\n"
+    );
+    // And the store really holds one file named by the content hash.
+    let entries: Vec<_> = fs::read_dir(rig.dir.path().join("media"))
+        .unwrap_or_else(|e| panic!("readdir: {e}"))
+        .collect();
+    assert_eq!(entries.len(), 1, "store should hold exactly the blob");
+}
+
+#[test]
+fn media_put_dedups_identical_content() {
+    let rig = Rig::new();
+    fs::create_dir_all(rig.dir.path().join("scratch")).unwrap_or_else(|e| panic!("mkdir: {e}"));
+    fs::create_dir_all(rig.dir.path().join("media")).unwrap_or_else(|e| panic!("mkdir: {e}"));
+    rig.script_at(&rig.dir.path().join("scratch/a.bin"), "same bytes");
+    rig.script_at(&rig.dir.path().join("scratch/b.bin"), "same bytes");
+    let manifest = rig.script(
+        "m.manifest.json",
+        "{ \"read\": [\"scratch\"], \"media\": {\"backend\": \"local\", \"root\": \"media\"} }\n",
+    );
+    let script = rig.script(
+        "s.js",
+        "const a = rt.media.put('scratch/a.bin');\n\
+         const b = rt.media.put('scratch/b.bin');\n\
+         rt.print((a.name === b.name) + '\\n');\n",
+    );
+    let out = rig.run_script(
+        &script,
+        &[
+            "--manifest",
+            manifest.to_str().unwrap_or_else(|| panic!("utf8")),
+        ],
+    );
+    assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "true\n");
+    let entries: Vec<_> = fs::read_dir(rig.dir.path().join("media"))
+        .unwrap_or_else(|e| panic!("readdir: {e}"))
+        .collect();
+    assert_eq!(entries.len(), 1, "dedup: one name, one file");
+}
+
+#[test]
+fn media_put_of_a_source_outside_read_grants_refuses() {
+    let rig = Rig::new();
+    fs::create_dir_all(rig.dir.path().join("media")).unwrap_or_else(|e| panic!("mkdir: {e}"));
+    // Media grant present, but scratch/ is NOT in the read allowlist —
+    // uploading must not bypass read gating.
+    rig.script_at(&rig.dir.path().join("secret.bin"), "nope");
+    let manifest = rig.script(
+        "m.manifest.json",
+        "{ \"media\": {\"backend\": \"local\", \"root\": \"media\"} }\n",
+    );
+    let script = rig.script("s.js", "rt.media.put('secret.bin');\n");
+    let out = rig.run_script(
+        &script,
+        &[
+            "--manifest",
+            manifest.to_str().unwrap_or_else(|| panic!("utf8")),
+        ],
+    );
+    assert_eq!(code(&out), 7, "stderr: {}", stderr(&out));
+    assert!(
+        stderr(&out).contains("read denied"),
+        "stderr: {}",
+        stderr(&out)
+    );
+}
+
+#[test]
+fn media_over_cap_refuses_and_leaves_no_partial() {
+    let rig = Rig::new();
+    fs::create_dir_all(rig.dir.path().join("scratch")).unwrap_or_else(|e| panic!("mkdir: {e}"));
+    fs::create_dir_all(rig.dir.path().join("media")).unwrap_or_else(|e| panic!("mkdir: {e}"));
+    // 200KB source against a 1KB cap — the stream must abort mid-upload,
+    // refuse as a capability breach, and leave no .media-tmp residue.
+    let big = vec![b'x'; 200 * 1024];
+    fs::write(rig.dir.path().join("scratch/big.bin"), &big)
+        .unwrap_or_else(|e| panic!("write: {e}"));
+    let manifest = rig.script(
+        "m.manifest.json",
+        "{ \"read\": [\"scratch\"], \"media\": {\"backend\": \"local\", \"root\": \"media\", \"max_bytes\": 1024} }\n",
+    );
+    let script = rig.script("s.js", "rt.media.put('scratch/big.bin');\n");
+    let out = rig.run_script(
+        &script,
+        &[
+            "--manifest",
+            manifest.to_str().unwrap_or_else(|| panic!("utf8")),
+        ],
+    );
+    assert_eq!(code(&out), 7, "stderr: {}", stderr(&out));
+    assert!(
+        stderr(&out).contains("exceeds the 1024-byte grant"),
+        "stderr: {}",
+        stderr(&out)
+    );
+    let entries: Vec<_> = fs::read_dir(rig.dir.path().join("media"))
+        .unwrap_or_else(|e| panic!("readdir: {e}"))
+        .collect();
+    assert!(
+        entries.is_empty(),
+        "aborted upload must leave no partial, found: {entries:?}"
+    );
+}
+
+#[test]
+fn media_flag_grants_a_store() {
+    let rig = Rig::new();
+    fs::create_dir_all(rig.dir.path().join("scratch")).unwrap_or_else(|e| panic!("mkdir: {e}"));
+    fs::create_dir_all(rig.dir.path().join("media")).unwrap_or_else(|e| panic!("mkdir: {e}"));
+    rig.script_at(&rig.dir.path().join("scratch/x.bin"), "via flag");
+    let script = rig.script(
+        "s.js",
+        "const r = rt.media.put('scratch/x.bin'); rt.print(r.state + '|' + r.bytes + '\\n');\n",
+    );
+    let root = rig.dir.path().join("media");
+    let out = rig.run_script(
+        &script,
+        &[
+            "--read",
+            "scratch",
+            "--media-root",
+            root.to_str().unwrap_or_else(|| panic!("utf8")),
+        ],
+    );
+    assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "stored|8\n");
+}
+
+#[test]
+fn an_unimplemented_media_backend_fails_at_manifest_parse() {
+    let rig = Rig::new();
+    fs::create_dir_all(rig.dir.path().join("media")).unwrap_or_else(|e| panic!("mkdir: {e}"));
+    let manifest = rig.script(
+        "m.manifest.json",
+        "{ \"media\": {\"backend\": \"bunny\", \"root\": \"media\"} }\n",
+    );
+    let script = rig.script("s.js", "rt.print('hi');\n");
+    let out = rig.run_script(
+        &script,
+        &[
+            "--manifest",
+            manifest.to_str().unwrap_or_else(|| panic!("utf8")),
+        ],
+    );
+    assert_eq!(code(&out), 8, "stderr: {}", stderr(&out));
+    assert!(
+        stderr(&out).contains("not implemented"),
+        "stderr: {}",
+        stderr(&out)
+    );
+}

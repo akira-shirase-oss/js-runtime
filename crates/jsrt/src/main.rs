@@ -45,6 +45,12 @@ struct RunArgs {
     /// KV quota in MiB when granting via --kv (default 64).
     #[arg(long, default_value_t = 64)]
     kv_max_mb: u64,
+    /// Local media store root — joins with the manifest's "media" grant.
+    #[arg(long)]
+    media_root: Option<PathBuf>,
+    /// Per-upload media cap in MiB when granting via --media-root (default 256).
+    #[arg(long, default_value_t = 256)]
+    media_max_mb: u64,
     /// Per-fetch deadline in milliseconds (0 = the built-in 10s bound).
     #[arg(long, default_value_t = 0)]
     fetch_timeout: u64,
@@ -69,6 +75,10 @@ impl RunArgs {
             v.extend(["--kv".into(), kv.to_string_lossy().into_owned()]);
         }
         v.extend(["--kv-max-mb".into(), self.kv_max_mb.to_string()]);
+        if let Some(root) = &self.media_root {
+            v.extend(["--media-root".into(), root.to_string_lossy().into_owned()]);
+        }
+        v.extend(["--media-max-mb".into(), self.media_max_mb.to_string()]);
         v.extend(["--fetch-timeout".into(), self.fetch_timeout.to_string()]);
         v
     }
@@ -158,7 +168,15 @@ async fn execute(run: RunArgs) -> Result<(), HostError> {
         Some(path) => Capabilities::from_manifest_file(path)?,
         None => Capabilities::deny_all(),
     };
-    let capabilities = merge_cli_grants(capabilities, run.read, run.net, run.kv, run.kv_max_mb)?;
+    let capabilities = merge_cli_grants(
+        capabilities,
+        run.read,
+        run.net,
+        run.kv,
+        run.kv_max_mb,
+        run.media_root,
+        run.media_max_mb,
+    )?;
     let options = HostOptions {
         capabilities,
         timeout: (run.timeout > 0).then(|| Duration::from_millis(run.timeout)),
@@ -178,8 +196,10 @@ fn merge_cli_grants(
     net: Vec<String>,
     kv: Option<PathBuf>,
     kv_max_mb: u64,
+    media_root: Option<PathBuf>,
+    media_max_mb: u64,
 ) -> Result<Capabilities, HostError> {
-    if read.is_empty() && net.is_empty() && kv.is_none() {
+    if read.is_empty() && net.is_empty() && kv.is_none() && media_root.is_none() {
         return Ok(caps);
     }
     let mut merged = caps.into_grants();
@@ -210,6 +230,26 @@ fn merge_cli_grants(
             merged.kv = Some(jsrt_host::capability::KvGrant {
                 path: canonical.join(file_name),
                 max_bytes: kv_max_mb * 1024 * 1024,
+            });
+        }
+    }
+    if let Some(root) = media_root {
+        if merged.media.is_none() {
+            let canonical = std::fs::canonicalize(&root).map_err(|e| {
+                HostError::Host(format!(
+                    "--media-root {} does not resolve: {e}",
+                    root.display()
+                ))
+            })?;
+            if !canonical.is_dir() {
+                return Err(HostError::Host(format!(
+                    "--media-root {} is not a directory",
+                    canonical.display()
+                )));
+            }
+            merged.media = Some(jsrt_host::capability::MediaGrant {
+                root: canonical,
+                max_bytes: media_max_mb * 1024 * 1024,
             });
         }
     }

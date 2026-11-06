@@ -22,6 +22,8 @@ const MAX_READ_BYTES: u64 = 4 * 1024 * 1024;
 
 /// The default KV quota when the manifest doesn't declare one.
 const DEFAULT_KV_MAX_BYTES: u64 = 64 * 1024 * 1024;
+/// The default per-upload media cap.
+const DEFAULT_MEDIA_MAX_BYTES: u64 = 256 * 1024 * 1024;
 
 /// A declared embedded-KV store: the file the script may open and the
 /// quota it must stay under. The `path`'s parent is canonicalized at
@@ -29,6 +31,14 @@ const DEFAULT_KV_MAX_BYTES: u64 = 64 * 1024 * 1024;
 #[derive(Debug, Clone)]
 pub struct KvGrant {
     pub path: PathBuf,
+    pub max_bytes: u64,
+}
+
+/// A declared media store: the directory the script may write to and the
+/// per-upload cap. The root is canonicalized at load time — it must exist.
+#[derive(Debug, Clone)]
+pub struct MediaGrant {
+    pub root: PathBuf,
     pub max_bytes: u64,
 }
 
@@ -41,6 +51,8 @@ pub struct Capabilities {
     net_hosts: Vec<String>,
     /// The embedded KV store, if declared.
     kv: Option<KvGrant>,
+    /// The media store, if declared.
+    media: Option<MediaGrant>,
 }
 
 /// The manifest file format (`jsrt.manifest.json`).
@@ -56,11 +68,25 @@ struct Manifest {
     /// The KV grant: {"kv": {"path": "app.kv", "max_bytes": 67108864}}.
     #[serde(default)]
     kv: Option<ManifestKv>,
+    /// The media grant: {"media": {"backend": "local", "root": "media/",
+    /// "max_bytes": 268435456}}.
+    #[serde(default)]
+    media: Option<ManifestMedia>,
 }
 
 #[derive(Debug, Deserialize)]
 struct ManifestKv {
     path: PathBuf,
+    #[serde(default)]
+    max_bytes: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ManifestMedia {
+    /// Only "local" ships today — anything else is a manifest error, not a
+    /// silent fallback.
+    backend: String,
+    root: PathBuf,
     #[serde(default)]
     max_bytes: Option<u64>,
 }
@@ -77,6 +103,7 @@ impl Capabilities {
             read_paths,
             net_hosts,
             kv: None,
+            media: None,
         }
     }
 
@@ -90,6 +117,7 @@ impl Capabilities {
             read_paths,
             net_hosts,
             kv,
+            media: None,
         }
     }
 
@@ -148,6 +176,31 @@ impl Capabilities {
                 max_bytes: kv.max_bytes.unwrap_or(DEFAULT_KV_MAX_BYTES),
             });
         }
+        if let Some(media) = manifest.media {
+            if media.backend != "local" {
+                return Err(HostError::Host(format!(
+                    "manifest media backend '{}' is not implemented — only 'local' ships today",
+                    media.backend
+                )));
+            }
+            let joined = base.join(&media.root);
+            let root = fs::canonicalize(&joined).map_err(|e| {
+                HostError::Host(format!(
+                    "manifest media root {} does not resolve: {e}",
+                    joined.display()
+                ))
+            })?;
+            if !root.is_dir() {
+                return Err(HostError::Host(format!(
+                    "manifest media root {} is not a directory",
+                    root.display()
+                )));
+            }
+            caps.media = Some(MediaGrant {
+                root,
+                max_bytes: media.max_bytes.unwrap_or(DEFAULT_MEDIA_MAX_BYTES),
+            });
+        }
         Ok(caps)
     }
 
@@ -156,6 +209,13 @@ impl Capabilities {
     pub fn may_kv(&self) -> Result<KvGrant, HostError> {
         self.kv.clone().ok_or_else(|| {
             HostError::Capability("kv denied: no store declared in the manifest".into())
+        })
+    }
+
+    /// The media grant, if declared.
+    pub fn may_media(&self) -> Result<MediaGrant, HostError> {
+        self.media.clone().ok_or_else(|| {
+            HostError::Capability("media denied: no store declared in the manifest".into())
         })
     }
 
@@ -222,7 +282,10 @@ impl Capabilities {
     /// True when no capabilities were granted — used by ops that want to give
     /// a clearer error than a bare refusal.
     pub fn is_empty(&self) -> bool {
-        self.read_paths.is_empty() && self.net_hosts.is_empty() && self.kv.is_none()
+        self.read_paths.is_empty()
+            && self.net_hosts.is_empty()
+            && self.kv.is_none()
+            && self.media.is_none()
     }
 
     /// Decompose into the raw grant lists (for callers that merge sources).
@@ -231,6 +294,7 @@ impl Capabilities {
             read_paths: self.read_paths,
             net_hosts: self.net_hosts,
             kv: self.kv,
+            media: self.media,
         }
     }
 
@@ -241,6 +305,7 @@ impl Capabilities {
             read_paths: grants.read_paths,
             net_hosts: grants.net_hosts,
             kv: grants.kv,
+            media: grants.media,
         }
     }
 }
@@ -251,6 +316,7 @@ pub struct Grants {
     pub read_paths: Vec<PathBuf>,
     pub net_hosts: Vec<String>,
     pub kv: Option<KvGrant>,
+    pub media: Option<MediaGrant>,
 }
 
 /// Extract `host` and `port` (defaulted by scheme) from an http(s) URL

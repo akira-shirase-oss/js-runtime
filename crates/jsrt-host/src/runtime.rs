@@ -126,6 +126,9 @@ fn build_runtime(options: &HostOptions, entry_dir: Option<&Path>) -> JsRuntime {
                 grant,
             ))));
         }
+        if let Ok(grant) = options.capabilities.may_media() {
+            state.put(Rc::new(grant));
+        }
     }
     runtime
 }
