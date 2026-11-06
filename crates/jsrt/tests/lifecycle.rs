@@ -538,6 +538,36 @@ fn a_slow_endpoint_dies_at_the_deadline() {
 }
 
 #[test]
+fn an_authority_smuggle_is_refused_not_connecting_elsewhere() {
+    let rig = Rig::new();
+    let stub = Stub::start(respond("200 OK", b"x", 0));
+    // Grant the stub's host:port, then fetch a URL whose *string* shows a
+    // userinfo-looking `granted` authority after a backslash — but whose
+    // real destination (per WHATWG parsing, and reqwest) is 127.0.0.1:80.
+    // The check must follow the connection, not the string.
+    // Rust \\\\ -> JS source \\ -> JS string \: the URL must carry a real
+    // backslash, or JS quietly eats it and the test proves nothing.
+    let url = format!("http://127.0.0.1\\\\@127.0.0.1:{}/x", stub.port);
+    let script = fetch_script(&rig, &url);
+    let out = rig.run_script(&script, &["--net", &format!("127.0.0.1:{}", stub.port)]);
+    assert_eq!(code(&out), 7, "stderr: {}", stderr(&out));
+    assert!(
+        stderr(&out).contains("127.0.0.1:80"),
+        "stderr: {}",
+        stderr(&out)
+    );
+}
+
+#[test]
+fn a_fetch_to_a_file_url_is_refused() {
+    let rig = Rig::new();
+    // file:// never reaches the net check — the scheme gate fails closed.
+    let script = rig.script("f.js", "await rt.fetch('file:///etc/passwd');\n");
+    let out = rig.run_script(&script, &["--net", "127.0.0.1"]);
+    assert_eq!(code(&out), 7, "stderr: {}", stderr(&out));
+}
+
+#[test]
 fn a_five_hundred_is_a_result_not_a_crash() {
     let rig = Rig::new();
     let stub = Stub::start(respond("500 Internal Server Error", b"oops", 0));

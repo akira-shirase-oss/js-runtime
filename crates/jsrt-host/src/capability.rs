@@ -123,13 +123,18 @@ impl Capabilities {
 
     /// Check whether a URL's authority is on the net allowlist. Entries of
     /// `host` allow any port; `host:port` requires an exact port match.
+    /// Both sides are normalized (case, trailing DNS dot, IPv6 brackets)
+    /// before comparison — the checked host is the one the client connects
+    /// to, not the one that merely appears in the string.
     pub fn may_net(&self, url: &str) -> Result<(), HostError> {
         let (host, port) = url_authority(url)
             .ok_or_else(|| HostError::Capability(format!("fetch denied: unparseable URL {url}")))?;
         let allowed = self.net_hosts.iter().any(|entry| {
-            entry == host
-                || (!entry.contains(':') && entry == host)
-                || entry == &format!("{host}:{port}")
+            match parse_net_grant(entry) {
+                Some((gh, gp)) => gh == host && gp.is_none_or(|p| p == port),
+                // An unparseable grant can never match — fail closed.
+                None => false,
+            }
         });
         if !allowed {
             return Err(HostError::Capability(format!(
@@ -172,19 +177,74 @@ pub struct Grants {
 
 /// Extract `host` and `port` (defaulted by scheme) from an http(s) URL
 /// without a URL-parsing dependency — the check is deliberately narrow.
-fn url_authority(url: &str) -> Option<(&str, u16)> {
+/// The authority ends at the first of `/ \ ? #` — WHATWG parsers treat
+/// `\` as a delimiter too, so `http://evil.com\@granted.com/` must not
+/// read the host past the backslash. Userinfo is stripped before the
+/// host:port split; the host is normalized (lowercase, trailing DNS dot,
+/// IPv6 brackets) so the checked host is the connected host.
+fn url_authority(url: &str) -> Option<(String, u16)> {
     let (scheme, rest) = url.split_once("://")?;
-    let default_port = match scheme {
-        "http" => 80,
-        "https" => 443,
-        _ => return None,
+    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+        return None;
+    }
+    let default_port = if scheme.eq_ignore_ascii_case("https") {
+        443
+    } else {
+        80
     };
-    let authority = rest.split('/').next()?;
-    let authority = authority.split('@').next_back()?;
-    let (host, port) = match authority.rsplit_once(':') {
-        Some((h, p)) => (h, p.parse::<u16>().ok()?),
-        None => (authority, default_port),
+    let authority = rest.split(['/', '\\', '?', '#']).next()?;
+    // Userinfo: take the part after the LAST '@' — but only if what follows
+    // still looks like an authority. 'a@b@c' keeps 'c'.
+    let authority = authority.rsplit('@').next()?;
+    let (host, port) = if let Some(inner) = authority.strip_prefix('[') {
+        // Bracketed IPv6: host ends at ']', optional :port after.
+        let (h, tail) = inner.split_once(']')?;
+        let port = match tail.strip_prefix(':') {
+            Some(p) => p.parse::<u16>().ok()?,
+            None if tail.is_empty() => default_port,
+            _ => return None,
+        };
+        (h.to_string(), port)
+    } else {
+        match authority.rsplit_once(':') {
+            Some((h, p)) => (h.to_string(), p.parse::<u16>().ok()?),
+            None => (authority.to_string(), default_port),
+        }
     };
+    let host = host.to_lowercase();
+    let host = host.strip_suffix('.').unwrap_or(&host).to_string();
+    if host.is_empty() {
+        return None;
+    }
+    Some((host, port))
+}
+
+/// Parse a grant entry into `(host, Option<port>)`. Accepts `host`,
+/// `host:port`, `[v6]`, `[v6]:port`, or a bare multi-colon IPv6 host
+/// (any port). Anything else never matches.
+fn parse_net_grant(entry: &str) -> Option<(String, Option<u16>)> {
+    let entry = entry.trim();
+    if entry.is_empty() {
+        return None;
+    }
+    let (host, port) = if let Some(rest) = entry.strip_prefix('[') {
+        let (h, tail) = rest.split_once(']')?;
+        let port = match tail.strip_prefix(':') {
+            Some(p) => Some(p.parse::<u16>().ok()?),
+            None if tail.is_empty() => None,
+            _ => return None,
+        };
+        (h, port)
+    } else if entry.matches(':').count() > 1 {
+        // Bare IPv6 literal — no port possible.
+        (entry, None)
+    } else if let Some((h, p)) = entry.rsplit_once(':') {
+        (h, Some(p.parse::<u16>().ok()?))
+    } else {
+        (entry, None)
+    };
+    let host = host.to_lowercase();
+    let host = host.strip_suffix('.').unwrap_or(&host).to_string();
     if host.is_empty() {
         return None;
     }
@@ -195,12 +255,54 @@ fn url_authority(url: &str) -> Option<(&str, u16)> {
 mod tests {
     use super::*;
 
+    fn auth(url: &str) -> Option<(String, u16)> {
+        url_authority(url)
+    }
+
     #[test]
     fn authority_parsing() {
-        assert_eq!(url_authority("https://a.b/c"), Some(("a.b", 443)));
-        assert_eq!(url_authority("http://a.b:8080/x"), Some(("a.b", 8080)));
-        assert_eq!(url_authority("http://u:p@a.b/x"), Some(("a.b", 80)));
-        assert_eq!(url_authority("file:///etc/passwd"), None);
+        assert_eq!(auth("https://a.b/c"), Some(("a.b".into(), 443)));
+        assert_eq!(auth("http://a.b:8080/x"), Some(("a.b".into(), 8080)));
+        assert_eq!(auth("http://u:p@a.b/x"), Some(("a.b".into(), 80)));
+        assert_eq!(auth("file:///etc/passwd"), None);
+        assert_eq!(auth("ftp://a.b/x"), None);
+    }
+
+    #[test]
+    fn authority_normalization() {
+        // DNS is case-insensitive; the trailing dot is the same name.
+        assert_eq!(auth("HTTP://A.B/x"), Some(("a.b".into(), 80)));
+        assert_eq!(auth("http://a.b./x"), Some(("a.b".into(), 80)));
+        assert_eq!(auth("http://[::1]:8080/x"), Some(("::1".into(), 8080)));
+    }
+
+    #[test]
+    fn authority_escapes_are_refused_or_checked_correctly() {
+        // The classic smuggle: WHATWG treats '\' as a delimiter, so the
+        // connection really goes to evil.com — our parser must agree.
+        assert_eq!(
+            auth("http://evil.com\\@granted.com/x"),
+            Some(("evil.com".into(), 80))
+        );
+        // '?' ends the authority; the '@granted.com' is in the query, not
+        // the host.
+        assert_eq!(
+            auth("http://evil.com?@granted.com/"),
+            Some(("evil.com".into(), 80))
+        );
+        assert_eq!(
+            auth("http://evil.com#@granted.com/"),
+            Some(("evil.com".into(), 80))
+        );
+        // Empty host / empty port / garbage ports fail closed.
+        assert_eq!(auth("http://@/x"), None);
+        assert_eq!(auth("http://a.b:/x"), None);
+        assert_eq!(auth("http://a.b:99x/x"), None);
+        // Userinfo can't hide the host: last '@' wins.
+        assert_eq!(
+            auth("http://granted.com@evil.com/x"),
+            Some(("evil.com".into(), 80))
+        );
     }
 
     #[test]
@@ -217,5 +319,55 @@ mod tests {
         assert!(caps.may_net("http://127.0.0.1:10/").is_err());
         assert!(caps.may_net("https://example.com/a").is_ok());
         assert!(caps.may_net("https://other.example.com/a").is_err());
+    }
+
+    #[test]
+    fn net_allowlist_uses_the_real_host() {
+        let caps = Capabilities::grant(vec![], vec!["granted.com".into()]);
+        // Every trick that would connect to another host must refuse.
+        for url in [
+            "http://evil.com\\@granted.com/x",
+            "http://evil.com?@granted.com/",
+            "http://granted.com.evil.com/x",
+            "http://granted.com@evil.com/x",
+        ] {
+            assert!(caps.may_net(url).is_err(), "{url} must refuse");
+        }
+        // Equivalent spellings of the granted host still work.
+        for url in [
+            "http://granted.com/x",
+            "http://GRANTED.COM./x",
+            "http://userinfo@granted.com/x",
+        ] {
+            assert!(caps.may_net(url).is_ok(), "{url} must allow");
+        }
+    }
+
+    #[test]
+    fn net_grants_parse_ipv6() {
+        let caps = Capabilities::grant(
+            vec![],
+            vec!["[::1]:8080".into(), "[fe80::1]".into(), "::2".into()],
+        );
+        assert!(caps.may_net("http://[::1]:8080/x").is_ok());
+        assert!(caps.may_net("http://[::1]:9090/x").is_err());
+        assert!(caps.may_net("http://[fe80::1]:1234/x").is_ok());
+        assert!(caps.may_net("http://[::2]:7777/x").is_ok());
+        assert!(caps.may_net("http://[::3]:7777/x").is_err());
+    }
+
+    #[test]
+    fn net_grants_fail_closed_on_garbage() {
+        let caps = Capabilities::grant(
+            vec![],
+            vec![
+                "nonsense:::".into(),
+                ":80".into(),
+                "a.b:notaport".into(),
+                "".into(),
+            ],
+        );
+        assert!(caps.may_net("http://a.b/x").is_err());
+        assert!(caps.may_net("http://nonsense/x").is_err());
     }
 }
