@@ -9,13 +9,19 @@ acceptance test. Nothing is called done without its evidence.
 |---|---|---|---|---|
 | 0.1 workspace | `jsrt` CLI + `jsrt-host` lib, `deno_core =0.413.0`, `rt.*` namespace, error taxonomy, watchdog | engine borrowed, host owned; every ending has a distinct exit code | syntax vs exception vs load vs terminated must never blur | hello.js runs (0), missing (3), syntax (4), throw (5) — verified live |
 
-## M1 — execute
+## M1 — execute (done)
 
 | Step | Outcome | Invariant | Failure case | Acceptance test |
 |---|---|---|---|---|
-| 1.1 run lifecycle | integration suite pinning the taxonomy end to end | every exit class reproducible | uncaught `CapabilityError` → 7; watchdog kill → 6 | `CARGO_BIN_EXE_jsrt` tests assert each code |
-| 1.2 module semantics | real `import` between files works; load errors name the failing specifier | module graph is real, not eval-in-a-trenchcoat | circular import and missing import classified honestly | two-file scripts + a missing-import test |
-| 1.3 op boundary measured | perf harness: cold-start p50/p95 over N runs, op-call cost over 10k calls | numbers recorded with commit + machine, never presented as production claims | a regression is evidence, not a rerun reason | committed `perf/results/*.json` |
+| 1.1 run lifecycle | integration suite pinning the taxonomy end to end | every exit class reproducible | uncaught `CapabilityError` → 7; watchdog kill → 6 | `CARGO_BIN_EXE_jsrt` tests assert each code — 15 tests, `358677b` |
+| 1.2 module semantics | real `import` between files works; load errors name the failing specifier | module graph is real, not eval-in-a-trenchcoat | circular import and missing import classified honestly | 5 lifecycle tests + host-level dep-syntax test, `8294ff8` |
+| 1.3 op boundary measured | perf harness: cold-start p50/p95 over N runs, op-call cost over 10k calls | numbers recorded with commit + machine, never presented as production claims | a regression is evidence, not a rerun reason | `perf/results/m1-3-*-8294ff8.json` |
+
+M1 findings kept honest in the artifact: the watchdog needed a second
+stage (a parked event loop has no JS to interrupt — `terminate_grace`
+escalates to process exit, the in-process stand-in for M4's kill), and
+the timer floor is ~1.2ms (`sleep(1)` lands ~2.3ms) — sub-ms timing is
+not a thing scripts can rely on.
 
 ## M2 — async host
 
