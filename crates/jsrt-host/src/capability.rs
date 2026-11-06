@@ -49,7 +49,10 @@ impl Capabilities {
 
     /// Build a capability set directly (tests, programmatic use).
     pub fn grant(read_paths: Vec<PathBuf>, net_hosts: Vec<String>) -> Self {
-        Self { read_paths, net_hosts }
+        Self {
+            read_paths,
+            net_hosts,
+        }
     }
 
     /// Load a manifest file. Read entries are resolved relative to the
@@ -59,9 +62,8 @@ impl Capabilities {
         let raw = fs::read_to_string(path).map_err(|e| {
             HostError::Host(format!("cannot read manifest {}: {e}", path.display()))
         })?;
-        let manifest: Manifest = serde_json::from_str(&raw).map_err(|e| {
-            HostError::Host(format!("invalid manifest {}: {e}", path.display()))
-        })?;
+        let manifest: Manifest = serde_json::from_str(&raw)
+            .map_err(|e| HostError::Host(format!("invalid manifest {}: {e}", path.display())))?;
         let base = path
             .parent()
             .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
@@ -117,9 +119,8 @@ impl Capabilities {
     /// Check whether a URL's authority is on the net allowlist. Entries of
     /// `host` allow any port; `host:port` requires an exact port match.
     pub fn may_net(&self, url: &str) -> Result<(), HostError> {
-        let (host, port) = url_authority(url).ok_or_else(|| {
-            HostError::Capability(format!("fetch denied: unparseable URL {url}"))
-        })?;
+        let (host, port) = url_authority(url)
+            .ok_or_else(|| HostError::Capability(format!("fetch denied: unparseable URL {url}")))?;
         let allowed = self.net_hosts.iter().any(|entry| {
             entry == host
                 || (!entry.contains(':') && entry == host)
@@ -141,13 +142,19 @@ impl Capabilities {
 
     /// Decompose into the raw grant lists (for callers that merge sources).
     pub fn into_grants(self) -> Grants {
-        Grants { read_paths: self.read_paths, net_hosts: self.net_hosts }
+        Grants {
+            read_paths: self.read_paths,
+            net_hosts: self.net_hosts,
+        }
     }
 
     /// Rebuild from raw grant lists — the inverse of `into_grants`. Callers
     /// are responsible for having canonicalized paths already.
     pub fn from_grants(grants: Grants) -> Self {
-        Self { read_paths: grants.read_paths, net_hosts: grants.net_hosts }
+        Self {
+            read_paths: grants.read_paths,
+            net_hosts: grants.net_hosts,
+        }
     }
 }
 

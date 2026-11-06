@@ -49,7 +49,13 @@ fn exit_code(err: &HostError) -> i32 {
 async fn main() {
     let cli = Cli::parse();
     let result = match cli.command {
-        Command::Run { file, timeout, manifest, read, net } => {
+        Command::Run {
+            file,
+            timeout,
+            manifest,
+            read,
+            net,
+        } => {
             let capabilities = match &manifest {
                 Some(path) => match Capabilities::from_manifest_file(path) {
                     Ok(c) => c,
@@ -64,6 +70,9 @@ async fn main() {
             let options = HostOptions {
                 capabilities,
                 timeout: (timeout > 0).then(|| Duration::from_millis(timeout)),
+                // A parked event loop can't be interrupted — if termination
+                // doesn't unwind in 2s the process exits with the same code.
+                terminate_grace: (timeout > 0).then(|| Duration::from_secs(2)),
             };
             jsrt_host::run_file(&file, &options).await
         }

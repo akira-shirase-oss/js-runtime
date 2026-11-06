@@ -16,9 +16,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use deno_core::error::CoreErrorKind;
-use deno_core::{
-    FsModuleLoader, JsRuntime, ModuleSpecifier, PollEventLoopOptions, RuntimeOptions,
-};
+use deno_core::{FsModuleLoader, JsRuntime, ModuleSpecifier, PollEventLoopOptions, RuntimeOptions};
 
 use crate::capability::Capabilities;
 use crate::error::HostError;
@@ -34,11 +32,23 @@ pub struct HostOptions {
     /// the event loop. `None` means "until it finishes"; the CLI always sets
     /// one unless `--timeout 0` is passed explicitly.
     pub timeout: Option<Duration>,
+    /// If the watchdog fires and the run still hasn't unwound after this
+    /// grace, escalate to `process::exit` with the terminated code. This is
+    /// the in-process stand-in for the supervisor's hard kill: it exists
+    /// because a *parked* event loop (a promise that never resolves) has no
+    /// executing JS for `terminate_execution` to interrupt. CLI-only —
+    /// library embedders keep graceful semantics and handle stalls in their
+    /// own supervisor.
+    pub terminate_grace: Option<Duration>,
 }
 
 impl Default for HostOptions {
     fn default() -> Self {
-        Self { capabilities: Capabilities::deny_all(), timeout: Some(Duration::from_secs(10)) }
+        Self {
+            capabilities: Capabilities::deny_all(),
+            timeout: Some(Duration::from_secs(10)),
+            terminate_grace: None,
+        }
     }
 }
 
@@ -62,21 +72,37 @@ fn build_runtime(options: &HostOptions) -> JsRuntime {
 /// until pending work settles, and classify every way it can end.
 pub async fn run_file(entry: &Path, options: &HostOptions) -> Result<(), HostError> {
     if !entry.is_file() {
-        return Err(HostError::Load(format!("no such file: {}", entry.display())));
+        return Err(HostError::Load(format!(
+            "no such file: {}",
+            entry.display()
+        )));
     }
     let cwd = std::env::current_dir().unwrap_or_else(|_| Path::new(".").to_path_buf());
     let specifier = deno_core::resolve_path(&entry.to_string_lossy(), &cwd)
         .map_err(|e| HostError::Load(format!("cannot resolve {}: {e}", entry.display())))?;
 
     let mut runtime = build_runtime(options);
-    let terminated = spawn_watchdog(&mut runtime, options.timeout);
+    let done = Arc::new(AtomicBool::new(false));
+    let terminated = spawn_watchdog(
+        &mut runtime,
+        options.timeout,
+        options.terminate_grace,
+        Arc::clone(&done),
+    );
 
-    let module_id = runtime
-        .load_main_es_module(&specifier)
-        .await
-        .map_err(|e| classify(&e, &terminated))?;
-    let evaluation = runtime.mod_evaluate(module_id);
-    drive(&mut runtime, evaluation, options.timeout, terminated).await
+    let result = async {
+        let module_id = runtime
+            .load_main_es_module(&specifier)
+            .await
+            .map_err(|e| classify(&e, &terminated))?;
+        let evaluation = runtime.mod_evaluate(module_id);
+        drive(&mut runtime, evaluation, options.timeout, terminated).await
+    }
+    .await;
+    // Whatever the outcome, the run is over — the watchdog must not fire into
+    // a dropped isolate or escalate against a finished process.
+    done.store(true, Ordering::SeqCst);
+    result
 }
 
 /// Run an in-memory module — the test path. Same lifecycle as `run_file`.
@@ -84,27 +110,60 @@ pub async fn run_source(name: &str, source: &str, options: &HostOptions) -> Resu
     let specifier = ModuleSpecifier::parse(&format!("file:///{name}"))
         .map_err(|e| HostError::Load(format!("bad specifier {name}: {e}")))?;
     let mut runtime = build_runtime(options);
-    let terminated = spawn_watchdog(&mut runtime, options.timeout);
-    let module_id = runtime
-        .load_main_es_module_from_code(&specifier, source.to_string())
-        .await
-        .map_err(|e| classify(&e, &terminated))?;
-    let evaluation = runtime.mod_evaluate(module_id);
-    drive(&mut runtime, evaluation, options.timeout, terminated).await
+    let done = Arc::new(AtomicBool::new(false));
+    let terminated = spawn_watchdog(
+        &mut runtime,
+        options.timeout,
+        options.terminate_grace,
+        Arc::clone(&done),
+    );
+    let result = async {
+        let module_id = runtime
+            .load_main_es_module_from_code(&specifier, source.to_string())
+            .await
+            .map_err(|e| classify(&e, &terminated))?;
+        let evaluation = runtime.mod_evaluate(module_id);
+        drive(&mut runtime, evaluation, options.timeout, terminated).await
+    }
+    .await;
+    done.store(true, Ordering::SeqCst);
+    result
 }
 
 /// Spawn the termination watchdog and return the flag it sets when it fires.
 /// `terminate_execution` is the only mechanism that stops JS *while it runs
 /// on this isolate* — a `select!`-style cancel can never see a `while(1){}`.
-fn spawn_watchdog(runtime: &mut JsRuntime, timeout: Option<Duration>) -> Arc<AtomicBool> {
+/// Stage two, when `terminate_grace` is set: a parked event loop has no JS to
+/// interrupt, so if the run still hasn't finished after the grace the watchdog
+/// exits the process itself — same ending the supervisor will enforce with a
+/// signal, minus the process boundary.
+fn spawn_watchdog(
+    runtime: &mut JsRuntime,
+    timeout: Option<Duration>,
+    terminate_grace: Option<Duration>,
+    done: Arc<AtomicBool>,
+) -> Arc<AtomicBool> {
     let fired = Arc::new(AtomicBool::new(false));
     if let Some(deadline) = timeout {
         let handle = runtime.v8_isolate().thread_safe_handle();
         let fired_thread = Arc::clone(&fired);
         std::thread::spawn(move || {
             std::thread::sleep(deadline);
+            if done.load(Ordering::SeqCst) {
+                return;
+            }
             fired_thread.store(true, Ordering::SeqCst);
             handle.terminate_execution();
+            if let Some(grace) = terminate_grace {
+                std::thread::sleep(grace);
+                if !done.load(Ordering::SeqCst) {
+                    eprintln!(
+                        "jsrt: terminated: run did not unwind {}ms after termination",
+                        grace.as_millis()
+                    );
+                    std::process::exit(HostError::Terminated(String::new()).exit_code());
+                }
+            }
         });
     }
     fired
@@ -123,7 +182,9 @@ async fn drive(
     let loop_result = match deadline {
         Some(d) => match tokio::time::timeout(d, runtime.run_event_loop(options)).await {
             Ok(r) => r.map_err(|e| classify(&e, &terminated)),
-            Err(_) => Err(HostError::Terminated("event loop did not settle within deadline".into())),
+            Err(_) => Err(HostError::Terminated(
+                "event loop did not settle within deadline".into(),
+            )),
         },
         None => runtime
             .run_event_loop(options)
@@ -148,9 +209,7 @@ fn classify(err: &deno_core::error::CoreError, terminated: &AtomicBool) -> HostE
         return HostError::Terminated("execution terminated by timeout watchdog".into());
     }
     match err.as_kind() {
-        CoreErrorKind::ExecutionTerminated => {
-            HostError::Terminated("execution terminated".into())
-        }
+        CoreErrorKind::ExecutionTerminated => HostError::Terminated("execution terminated".into()),
         CoreErrorKind::Io(io_err) => HostError::Load(io_err.to_string()),
         CoreErrorKind::Js(js) => {
             let name = js.name.as_deref().unwrap_or("Error");
@@ -164,6 +223,7 @@ fn classify(err: &deno_core::error::CoreError, terminated: &AtomicBool) -> HostE
             match name {
                 "SyntaxError" => HostError::Syntax(detail),
                 "CapabilityError" => HostError::Capability(format!("{name}: {detail}")),
+                "HostError" => HostError::Host(format!("{name}: {detail}")),
                 // `detail` already carries the error's own "Error: msg" form.
                 _ => HostError::Exception(detail),
             }

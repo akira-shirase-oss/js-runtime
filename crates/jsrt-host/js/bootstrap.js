@@ -6,6 +6,19 @@
 // expose an op here that the docs don't describe.
 const ops = Deno.core.ops;
 
+// Error classes for op rejections. The class strings in ops.rs
+// (JsErrorBox::new) mean nothing to V8 until a constructor is registered here
+// -- registerErrorClass is what lets an op rejection become the right kind of
+// object on the JS side, and what lets classify() map it back to an exit code.
+class CapabilityError extends Error {
+	constructor(msg) { super(msg); this.name = "CapabilityError"; }
+}
+class HostError extends Error {
+	constructor(msg) { super(msg); this.name = "HostError"; }
+}
+Deno.core.registerErrorClass("CapabilityError", CapabilityError);
+Deno.core.registerErrorClass("HostError", HostError);
+
 globalThis.rt = {
 	/** Write to stdout with no added newline (deno_core's builtin op_print). */
 	print: (msg) => Deno.core.print(String(msg), false),

@@ -21,9 +21,17 @@ const FETCH_DEADLINE: Duration = Duration::from_secs(10);
 /// Largest response body `rt.fetch` will materialize.
 const FETCH_MAX_BODY: u64 = 4 * 1024 * 1024;
 
+/// Errors the host itself produced (I/O failures, deadlines, internal state)
+/// surface as class `HostError` so an uncaught one classifies to exit 8 —
+/// distinct from a script's own `Error` (exit 5).
+fn host_err(msg: String) -> JsErrorBox {
+    JsErrorBox::new("HostError", msg)
+}
+
 fn deny(err: HostError) -> JsErrorBox {
     match err {
         HostError::Capability(msg) => JsErrorBox::new("CapabilityError", msg),
+        HostError::Host(msg) => host_err(msg),
         other => JsErrorBox::generic(other.to_string()),
     }
 }
@@ -35,7 +43,7 @@ fn capabilities(state: &Rc<RefCell<OpState>>) -> Result<Rc<Capabilities>, JsErro
         .borrow()
         .try_borrow::<Rc<Capabilities>>()
         .cloned()
-        .ok_or_else(|| JsErrorBox::generic("capabilities not installed"))
+        .ok_or_else(|| host_err("capabilities not installed".into()))
 }
 
 fn http_client(state: &Rc<RefCell<OpState>>) -> Result<Rc<reqwest::Client>, JsErrorBox> {
@@ -43,7 +51,7 @@ fn http_client(state: &Rc<RefCell<OpState>>) -> Result<Rc<reqwest::Client>, JsEr
         .borrow()
         .try_borrow::<Rc<reqwest::Client>>()
         .cloned()
-        .ok_or_else(|| JsErrorBox::generic("http client not installed"))
+        .ok_or_else(|| host_err("http client not installed".into()))
 }
 
 /// `rt.hostInfo()` — who's hosting this script.
@@ -57,7 +65,11 @@ struct HostInfo {
 #[op2]
 #[serde]
 fn op_host_info() -> Result<HostInfo, JsErrorBox> {
-    Ok(HostInfo { runtime: "jsrt", version: env!("CARGO_PKG_VERSION"), engine: "v8" })
+    Ok(HostInfo {
+        runtime: "jsrt",
+        version: env!("CARGO_PKG_VERSION"),
+        engine: "v8",
+    })
 }
 
 /// `rt.now()` — wall clock in milliseconds, for script-side measurements
@@ -73,7 +85,9 @@ fn op_now() -> f64 {
 #[op2]
 async fn op_sleep(ms: f64) -> Result<(), JsErrorBox> {
     if !ms.is_finite() || ms < 0.0 {
-        return Err(JsErrorBox::type_error("rt.sleep: ms must be a non-negative number"));
+        return Err(JsErrorBox::type_error(
+            "rt.sleep: ms must be a non-negative number",
+        ));
     }
     tokio::time::sleep(Duration::from_secs_f64(ms / 1000.0)).await;
     Ok(())
@@ -91,7 +105,7 @@ async fn op_read_text(
     let resolved = caps.may_read(std::path::Path::new(&path)).map_err(deny)?;
     tokio::fs::read_to_string(&resolved)
         .await
-        .map_err(|e| JsErrorBox::generic(format!("read {}: {e}", resolved.display())))
+        .map_err(|e| host_err(format!("read {}: {e}", resolved.display())))
 }
 
 /// `rt.fetch(url)` — capability-gated, deadline'd, body-capped fetch.
@@ -118,20 +132,18 @@ async fn op_fetch(
     let started = std::time::Instant::now();
     let mut response = tokio::time::timeout(FETCH_DEADLINE, client.get(&url).send())
         .await
-        .map_err(|_| {
-            JsErrorBox::generic(format!("fetch {url}: deadline {FETCH_DEADLINE:?} exceeded"))
-        })?
-        .map_err(|e| JsErrorBox::generic(format!("fetch {url}: {e}")))?;
+        .map_err(|_| host_err(format!("fetch {url}: deadline {FETCH_DEADLINE:?} exceeded")))?
+        .map_err(|e| host_err(format!("fetch {url}: {e}")))?;
     let status = response.status();
     let mut body = Vec::new();
     while let Some(chunk) = response
         .chunk()
         .await
-        .map_err(|e| JsErrorBox::generic(format!("fetch {url}: body: {e}")))?
+        .map_err(|e| host_err(format!("fetch {url}: body: {e}")))?
     {
         body.extend_from_slice(&chunk);
         if body.len() as u64 > FETCH_MAX_BODY {
-            return Err(JsErrorBox::generic(format!(
+            return Err(host_err(format!(
                 "fetch {url}: body exceeded {FETCH_MAX_BODY} bytes"
             )));
         }

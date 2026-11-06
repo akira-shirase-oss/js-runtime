@@ -1,0 +1,260 @@
+//! The exit-class contract, proven end to end against the real binary.
+//!
+//! Every way a run can end gets a test that produces it honestly — no stubs:
+//! a real `while(1){}` for termination, a real uncaught `CapabilityError` for
+//! capability, a real unreadable manifest for host. If a class can't be
+//! produced, the taxonomy is lying and the test should fail.
+
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
+
+const JSRT: &str = env!("CARGO_BIN_EXE_jsrt");
+
+struct Rig {
+    dir: tempfile::TempDir,
+}
+
+impl Rig {
+    fn new() -> Self {
+        Self {
+            dir: tempfile::tempdir().unwrap_or_else(|e| panic!("tempdir: {e}")),
+        }
+    }
+
+    fn script(&self, name: &str, source: &str) -> PathBuf {
+        let path = self.dir.path().join(name);
+        fs::write(&path, source).unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
+        path
+    }
+
+    fn run(&self, args: &[&str]) -> Output {
+        Command::new(JSRT)
+            .args(args)
+            .current_dir(self.dir.path())
+            .output()
+            .unwrap_or_else(|e| panic!("spawn jsrt: {e}"))
+    }
+
+    fn run_script(&self, script: &Path, extra: &[&str]) -> Output {
+        let mut args = vec!["run"];
+        args.push(
+            script
+                .to_str()
+                .unwrap_or_else(|| panic!("script path utf8")),
+        );
+        args.extend_from_slice(extra);
+        self.run(&args)
+    }
+}
+
+fn code(out: &Output) -> i32 {
+    out.status
+        .code()
+        .unwrap_or_else(|| panic!("jsrt killed by signal"))
+}
+
+fn stderr(out: &Output) -> String {
+    String::from_utf8_lossy(&out.stderr).into_owned()
+}
+
+#[test]
+fn a_clean_run_exits_zero() {
+    let rig = Rig::new();
+    let script = rig.script("ok.js", "rt.print('hi');\nawait rt.sleep(1);\n");
+    let out = rig.run_script(&script, &[]);
+    assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("hi"));
+}
+
+#[test]
+fn a_missing_file_is_a_load_error() {
+    let rig = Rig::new();
+    let out = rig.run(&["run", "nope.js"]);
+    assert_eq!(code(&out), 3);
+    assert!(stderr(&out).contains("load"), "stderr: {}", stderr(&out));
+}
+
+#[test]
+fn a_syntax_error_is_not_an_exception() {
+    let rig = Rig::new();
+    let script = rig.script("bad.js", "const x = ;\n");
+    let out = rig.run_script(&script, &[]);
+    assert_eq!(code(&out), 4);
+    assert!(stderr(&out).contains("syntax"), "stderr: {}", stderr(&out));
+}
+
+#[test]
+fn an_uncaught_throw_is_an_exception() {
+    let rig = Rig::new();
+    let script = rig.script("throw.js", "throw new Error('boom');\n");
+    let out = rig.run_script(&script, &[]);
+    assert_eq!(code(&out), 5);
+    assert!(
+        stderr(&out).contains("exception"),
+        "stderr: {}",
+        stderr(&out)
+    );
+}
+
+#[test]
+fn a_rejected_promise_is_an_exception_too() {
+    let rig = Rig::new();
+    let script = rig.script(
+        "reject.js",
+        "await Promise.reject(new Error('async boom'));\n",
+    );
+    let out = rig.run_script(&script, &[]);
+    assert_eq!(code(&out), 5, "stderr: {}", stderr(&out));
+}
+
+#[test]
+fn a_cpu_bound_loop_dies_terminated() {
+    let rig = Rig::new();
+    let script = rig.script("spin.js", "while (true) {}\n");
+    let out = rig.run_script(&script, &["--timeout", "400"]);
+    assert_eq!(code(&out), 6, "stderr: {}", stderr(&out));
+    assert!(
+        stderr(&out).contains("terminated"),
+        "stderr: {}",
+        stderr(&out)
+    );
+}
+
+#[test]
+fn a_stalled_promise_dies_terminated() {
+    let rig = Rig::new();
+    let script = rig.script("stall.js", "await new Promise(() => {});\n");
+    let out = rig.run_script(&script, &["--timeout", "400"]);
+    assert_eq!(code(&out), 6, "stderr: {}", stderr(&out));
+}
+
+#[test]
+fn an_uncaught_capability_refusal_exits_seven() {
+    let rig = Rig::new();
+    // deny-all manifest: every gated op refuses.
+    let script = rig.script("read.js", "await rt.readText('/etc/passwd');\n");
+    let out = rig.run_script(&script, &[]);
+    assert_eq!(code(&out), 7, "stderr: {}", stderr(&out));
+    assert!(
+        stderr(&out).contains("capability"),
+        "stderr: {}",
+        stderr(&out)
+    );
+}
+
+#[test]
+fn a_caught_capability_refusal_is_fine() {
+    let rig = Rig::new();
+    let script = rig.script(
+        "catch.js",
+        "try { await rt.readText('/etc/passwd'); } catch (e) { rt.print(e.name + ': ' + e.message); }\n",
+    );
+    let out = rig.run_script(&script, &[]);
+    assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("CapabilityError"),
+        "stdout: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
+#[test]
+fn a_broken_manifest_is_a_host_error() {
+    let rig = Rig::new();
+    let script = rig.script("ok.js", "rt.print('hi');\n");
+    let out = rig.run_script(&script, &["--manifest", "missing.manifest.json"]);
+    assert_eq!(code(&out), 8, "stderr: {}", stderr(&out));
+    assert!(stderr(&out).contains("host"), "stderr: {}", stderr(&out));
+}
+
+#[test]
+fn clap_usage_errors_exit_two() {
+    let rig = Rig::new();
+    let out = rig.run(&["run", "--timeout", "notanumber", "x.js"]);
+    assert_eq!(code(&out), 2);
+}
+
+#[test]
+fn a_manifest_read_grant_works() {
+    let rig = Rig::new();
+    let data = rig.dir.path().join("data");
+    fs::create_dir(&data).unwrap_or_else(|e| panic!("mkdir: {e}"));
+    fs::write(data.join("note.txt"), "inside the fence").unwrap_or_else(|e| panic!("write: {e}"));
+    let manifest = rig.script("m.manifest.json", "{ \"read\": [\"data\"] }\n");
+    let script = rig.script("read.js", "rt.print(await rt.readText('data/note.txt'));\n");
+    let out = rig.run_script(
+        &script,
+        &[
+            "--manifest",
+            manifest.to_str().unwrap_or_else(|| panic!("utf8")),
+        ],
+    );
+    assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("inside the fence"));
+}
+
+#[test]
+fn a_read_outside_the_grant_still_refuses() {
+    let rig = Rig::new();
+    let data = rig.dir.path().join("data");
+    fs::create_dir(&data).unwrap_or_else(|e| panic!("mkdir: {e}"));
+    fs::write(rig.dir.path().join("secret.txt"), "outside")
+        .unwrap_or_else(|e| panic!("write: {e}"));
+    let manifest = rig.script("m.manifest.json", "{ \"read\": [\"data\"] }\n");
+    // `..` escape attempt must also refuse — canonicalization eats it.
+    let script = rig.script("read.js", "await rt.readText('data/../secret.txt');\n");
+    let out = rig.run_script(
+        &script,
+        &[
+            "--manifest",
+            manifest.to_str().unwrap_or_else(|| panic!("utf8")),
+        ],
+    );
+    assert_eq!(code(&out), 7, "stderr: {}", stderr(&out));
+}
+
+#[test]
+fn a_host_side_failure_exits_eight() {
+    let rig = Rig::new();
+    let data = rig.dir.path().join("data");
+    fs::create_dir(&data).unwrap_or_else(|e| panic!("mkdir: {e}"));
+    let manifest = rig.script("m.manifest.json", "{ \"read\": [\"data\"] }\n");
+    // `data` is granted and canonicalizes, but reading a directory fails at
+    // the host — a HostError (8), not a refusal (7) or a script error (5).
+    let script = rig.script("read.js", "await rt.readText('data');\n");
+    let out = rig.run_script(
+        &script,
+        &[
+            "--manifest",
+            manifest.to_str().unwrap_or_else(|| panic!("utf8")),
+        ],
+    );
+    assert_eq!(code(&out), 8, "stderr: {}", stderr(&out));
+    assert!(
+        stderr(&out).contains("HostError"),
+        "stderr: {}",
+        stderr(&out)
+    );
+}
+
+#[test]
+fn cli_flags_extend_never_weaken() {
+    let rig = Rig::new();
+    let data = rig.dir.path().join("data");
+    fs::create_dir(&data).unwrap_or_else(|e| panic!("mkdir: {e}"));
+    fs::write(data.join("note.txt"), "via flag").unwrap_or_else(|e| panic!("write: {e}"));
+    // Manifest grants nothing; --read adds the dir.
+    let manifest = rig.script("m.manifest.json", "{}\n");
+    let script = rig.script("read.js", "rt.print(await rt.readText('data/note.txt'));\n");
+    let out = rig.run_script(
+        &script,
+        &[
+            "--manifest",
+            manifest.to_str().unwrap_or_else(|| panic!("utf8")),
+            "--read",
+            data.to_str().unwrap_or_else(|| panic!("utf8")),
+        ],
+    );
+    assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
+}
