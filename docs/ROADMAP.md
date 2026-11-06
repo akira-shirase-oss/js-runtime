@@ -50,7 +50,7 @@ not a thing scripts can rely on.
 
 | Step | Outcome | Invariant | Failure case | Acceptance test |
 |---|---|---|---|---|
-| 5.1 `rt.kv` | embedded KV (SQLite) — get/put/delete/list, per-script namespace | KV ops are ops — capability line + evidence | quota + contention honest | API + tests |
+| 5.1 `rt.kv` (done) | embedded KV via rusqlite+bundled SQLite — get/put/delete/list behind a `"kv"` manifest line (`{path, max_bytes}`) or `--kv`/`--kv-max-mb`; the declared file **is** the namespace — two manifests on one path share a store, deliberately (persistence across runs is the point). Lazily-opened connection per run in OpState; sync ops (local-file SQLite is microseconds — an honest block beats a fake async); quota = db file's own size enforced at write with a page of slack; `list(prefix)` is an exact-prefix substr scan, not LIKE | KV ops are ops — capability line + evidence; no grant → no state cell → `CapabilityError` (7) | quota breach → `CapabilityError` naming file bytes/projection/grant | 6 e2e tests: refusal, roundtrip, cross-run persistence, quota, exact-prefix list, CLI grant — `47e01b1` |
 | 5.2 `rt.media` | streaming upload abstraction; Bunny.net edge + local-disk backend, content-addressed names | upload streams — never a whole-file buffer; retry evidence per attempt | mid-upload failure → `uncertain`, never `uploaded` | live drill vs Bunny sandbox or local backend |
 
 ## M6 — operate a real app
