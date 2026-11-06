@@ -89,6 +89,10 @@ enum Command {
         /// Append the JSON run report to this file instead of stdout.
         #[arg(long)]
         report: Option<PathBuf>,
+        /// Byte cap for the report file before it rotates to `<name>.1`
+        /// with a dropped-record meta-line (default 512 KiB).
+        #[arg(long, default_value_t = 512)]
+        report_max_kb: u64,
     },
 }
 
@@ -116,6 +120,7 @@ async fn main() {
             wall_ms,
             kill_grace_ms,
             report,
+            report_max_kb,
         } => {
             let plan = supervise::SupervisePlan {
                 worker_args: run.to_argv(),
@@ -124,6 +129,7 @@ async fn main() {
                 wall: (wall_ms > 0).then(|| Duration::from_millis(wall_ms)),
                 kill_grace: Duration::from_millis(kill_grace_ms),
                 report_path: report,
+                report_max_bytes: report_max_kb * 1024,
             };
             match supervise::supervise(&plan) {
                 Ok(code) => std::process::exit(code),

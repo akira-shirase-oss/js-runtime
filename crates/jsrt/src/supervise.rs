@@ -55,6 +55,8 @@ pub struct SupervisePlan {
     pub kill_grace: Duration,
     /// Where the JSON run report goes — a file, or stdout.
     pub report_path: Option<PathBuf>,
+    /// Byte cap for the report file before it rotates.
+    pub report_max_bytes: u64,
 }
 
 /// Execute the supervision plan. Returns the process exit code jsrt
@@ -190,7 +192,7 @@ pub fn supervise(plan: &SupervisePlan) -> Result<i32, HostError> {
         "poll_interval_ms": POLL_INTERVAL.as_millis(),
     });
 
-    emit(&report, plan.report_path.as_deref())?;
+    emit(&report, plan.report_path.as_deref(), plan.report_max_bytes)?;
     Ok(exit_code)
 }
 
@@ -327,11 +329,15 @@ fn resident_bytes(_pid: libc::pid_t) -> Option<u64> {
     None
 }
 
-fn emit(report: &serde_json::Value, path: Option<&std::path::Path>) -> Result<(), HostError> {
+fn emit(
+    report: &serde_json::Value,
+    path: Option<&std::path::Path>,
+    max_bytes: u64,
+) -> Result<(), HostError> {
     let line = serde_json::to_string(report)
         .map_err(|e| HostError::Host(format!("report serialize: {e}")))?;
     match path {
-        Some(p) => append_record(p, &line),
+        Some(p) => append_bounded(p, &line, max_bytes),
         None => {
             let stdout = std::io::stdout();
             let mut lock = stdout.lock();
@@ -340,10 +346,52 @@ fn emit(report: &serde_json::Value, path: Option<&std::path::Path>) -> Result<()
     }
 }
 
-/// Append one JSONL record. This is the seed M4.3 grows into full
-/// rotation: for now the file is unbounded and the record itself is the
-/// structured diagnostic the roadmap asks for.
-fn append_record(path: &std::path::Path, line: &str) -> Result<(), HostError> {
+/// Append one JSONL record under a byte cap. When the next record would
+/// overflow, the file rotates to `<name>.1` and the fresh file opens with
+/// a meta-record saying how many records the rotation displaced — a
+/// flooded log limits itself and *says so*, which is the whole point of
+/// bounded diagnostics. One generation is kept; a single record larger
+/// than the cap is written whole to a fresh file — boundedness never eats
+/// a run's only evidence.
+fn append_bounded(path: &std::path::Path, line: &str, max_bytes: u64) -> Result<(), HostError> {
+    let current_len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    if current_len > 0 && current_len + line.len() as u64 + 1 > max_bytes {
+        rotate(path).map_err(|e| HostError::Host(format!("report rotate: {e}")))?;
+    }
+    append_line(path, line)
+}
+
+/// Rename `path` to `<name>.1` and open a fresh file whose first record is
+/// the rotation itself — carrying the count of records displaced.
+fn rotate(path: &std::path::Path) -> std::io::Result<u64> {
+    let dropped = count_records(path);
+    let rotated = path.with_file_name(format!(
+        "{}.1",
+        path.file_name()
+            .map(|n| n.to_string_lossy())
+            .unwrap_or_default()
+    ));
+    std::fs::rename(path, &rotated)?;
+    let meta = json!({
+        "type": "rotation",
+        "dropped_records": dropped,
+        "rotated_at_ms": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0),
+    });
+    let line = serde_json::to_string(&meta).map_err(|e| std::io::Error::other(e.to_string()))?;
+    append_line(path, &line).map_err(|e| std::io::Error::other(e.to_string()))?;
+    Ok(dropped)
+}
+
+fn count_records(path: &std::path::Path) -> u64 {
+    std::fs::read_to_string(path)
+        .map(|c| c.lines().filter(|l| !l.trim().is_empty()).count() as u64)
+        .unwrap_or(0)
+}
+
+fn append_line(path: &std::path::Path, line: &str) -> Result<(), HostError> {
     use std::fs::OpenOptions;
     let mut f = OpenOptions::new()
         .create(true)

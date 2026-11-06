@@ -186,3 +186,35 @@ fn a_report_file_collects_jsonl_records() {
         serde_json::from_str(content.trim()).unwrap_or_else(|e| panic!("log parse: {e}"));
     assert_eq!(r["outcome"], "clean");
 }
+
+#[test]
+fn a_flooded_log_rotates_and_counts_its_drops() {
+    let rig = Rig::new();
+    let script = rig.script("ok.js", "rt.print('x\\n');\n");
+    let log = rig.dir.path().join("runs.jsonl");
+    let log_s = log.to_str().unwrap_or_else(|| panic!("utf8")).to_string();
+    // A 1 KiB cap with ~600-byte run records rotates every other write.
+    for _ in 0..8 {
+        let out = rig.supervise(&script, &["--report", &log_s, "--report-max-kb", "1"]);
+        assert_eq!(
+            code(&out),
+            0,
+            "stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    // The rotated generation exists — the log stayed bounded.
+    let rotated = rig.dir.path().join("runs.jsonl.1");
+    assert!(rotated.exists(), "no rotation happened");
+    let live = fs::read_to_string(&log).unwrap_or_else(|e| panic!("read log: {e}"));
+    // The first record of the current generation is the rotation meta —
+    // and it must say how many records it displaced.
+    let first: Value =
+        serde_json::from_str(live.lines().next().unwrap_or_else(|| panic!("empty log")))
+            .unwrap_or_else(|e| panic!("parse: {e}"));
+    assert_eq!(first["type"], "rotation", "{first}");
+    assert!(
+        first["dropped_records"].as_u64().unwrap_or(0) > 0,
+        "dropped count not visible: {first}"
+    );
+}
