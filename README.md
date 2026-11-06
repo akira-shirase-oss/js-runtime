@@ -10,6 +10,12 @@ compatibility and not a new JavaScript engine.
 jsrt run script.js --timeout 5000 --manifest jsrt.manifest.json
 ```
 
+**Status: the M0–M7 roadmap is complete.** Deny-by-default capabilities, the
+supervisor, the stdlib wave (`rt.kv`, `rt.media`, `rt.serve`) and the
+million-scale evidence (1M op calls, 1M requests through `rt.serve`, 1,000 cold
+starts, a one-hour soak) are all built, with committed results under
+`perf/results/`.
+
 ## What scripts see
 
 Exactly one namespace — `rt.*`. No ambient `Deno`, no ungated global:
@@ -22,6 +28,11 @@ Exactly one namespace — `rt.*`. No ambient `Deno`, no ungated global:
 | `rt.sleep(ms)` | async timer | deadline (run timeout) |
 | `rt.readText(path)` | read a text file | declared `read` paths only |
 | `rt.fetch(url)` | HTTP GET → `{status, statusText, body, bytes, durationMs}` | declared `net` destinations, 10 s deadline, 4 MiB body cap |
+| `rt.setTimeout` `setInterval` `clearTimeout` `clearInterval` | Node-style timers, id-tracked; `unrefTimer`/`refTimer` release the loop | deadline (run timeout) |
+| `rt.pendingTimers()` | how many timers this script still owns | none |
+| `rt.kv.get/put/delete/list` | embedded SQLite store; `list` is an exact-prefix scan | declared `kv` file + `max_bytes` quota |
+| `rt.media.put/stat` | streamed content-addressed uploads (sha256 names) | declared `media` root; the source still needs a `read` grant |
+| `rt.serve(opts, handler)` | HTTP listener, pull-model dispatch; a handler crash is a 500, not a dead host | declared `serve` host/port — loopback IP literals only — plus `max_body` |
 
 `console.log` also works (deno_core's minimal console). Anything not listed
 does not exist for the script — that is the point.
@@ -29,15 +40,23 @@ does not exist for the script — that is the point.
 ## The manifest (`jsrt.manifest.json`)
 
 ```json
-{ "read": ["./data"], "net": ["api.example.com", "127.0.0.1:3000"] }
+{
+  "read": ["./data"],
+  "net": ["api.example.com", "127.0.0.1:3000"],
+  "kv":    { "path": "data/app.kv", "max_bytes": 8388608 },
+  "media": { "backend": "local", "root": "media/", "max_bytes": 268435456 },
+  "serve": { "host": "127.0.0.1", "port": 9400, "max_body": 8388608 }
+}
 ```
 
 - Deny by default: no manifest, no filesystem and no network — the script can
   compute and print, nothing else.
 - Paths are canonicalized before checking (symlinks and `..` cannot escape a
   declared directory); `host` alone allows any port, `host:port` is exact.
-- `--read`/`--net` CLI flags *extend* the manifest — additive only, never
-  weakening.
+- `serve` binds loopback IP literals only — `"localhost"` and public addresses
+  are refused at manifest parse.
+- `--read`/`--net`/`--kv`/`--serve` CLI flags *extend* the manifest — additive
+  only, never weakening.
 - Refusals throw a `CapabilityError` in JS — scripts can catch and match on
   `e.name`.
 
@@ -64,17 +83,21 @@ script — the executor thread is blocked inside the poll. The watchdog is a
 separate thread that calls V8's `IsolateHandle::terminate_execution()` on the
 deadline, which interrupts running JS *and* a stalled event loop. A tokio
 backstop covers the fully-idle case. **What this does not cover:** memory
-bombs — a runaway allocation needs a process boundary (the supervisor
-milestone, M4), and we don't pretend an in-process flag replaces it.
+bombs — a runaway allocation needs a process boundary, which is what
+`jsrt supervise` is for (`RLIMIT_CPU` seconds, RSS polling, SIGTERM→SIGKILL,
+bounded JSONL run reports), and we don't pretend an in-process flag replaces
+it.
 
 ## Layout
 
 ```
-crates/jsrt        the CLI: args → HostOptions → exit code
+crates/jsrt        the CLI: args → HostOptions → exit code (`run`, `supervise`)
 crates/jsrt-host   the host: JsRuntime, ops, capabilities, watchdog, taxonomy
   js/bootstrap.js  the rt.* namespace — the API contract, kept tiny on purpose
+crates/jsrt-load   the HTTP load driver behind the perf evidence
+examples/webhook   a real app on rt.serve + rt.kv, run under `jsrt supervise`
 scripts/           example scripts
-perf/              measurement harness (cold start, op boundary, load)
+perf/              measurement harness (cold start, op boundary, load, soak)
 docs/              ROADMAP and module notes
 ```
 
