@@ -11,6 +11,7 @@ pub mod error;
 pub mod module_loader;
 pub mod ops;
 pub mod runtime;
+pub mod serve;
 
 pub use capability::Capabilities;
 pub use error::HostError;

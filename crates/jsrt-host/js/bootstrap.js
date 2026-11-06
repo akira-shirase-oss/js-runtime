@@ -104,4 +104,49 @@ globalThis.rt = {
 		/** {name, bytes} for a stored name, else null. */
 		stat: (name) => ops.op_media_stat(String(name)),
 	},
+	/**
+	 * HTTP listener, gated by the manifest's "serve" line. Returns a server
+	 * handle immediately; the dispatch loop runs inside, pulling requests
+	 * from the wire and pushing script answers back. A handler throw is a
+	 * 500 on that request and the loop lives -- the host was never inside
+	 * the handler, so the host can't go down with it.
+	 *
+	 * server.done resolves when the listener closes; server.close() ends it.
+	 */
+	serve: (opts, handler) => {
+		const rid = ops.op_serve_listen(opts.host ?? "127.0.0.1", opts.port);
+		const done = (async () => {
+			try {
+				for (;;) {
+					const req = await ops.op_serve_next(rid);
+					if (req === null) return;
+					let res;
+					try {
+						res = await handler(req);
+					} catch (e) {
+						res = { status: 500, body: "handler error" };
+					}
+					try {
+						ops.op_serve_respond(
+							rid,
+							req.id,
+							res.status ?? 200,
+							res.headers ? Object.entries(res.headers) : [],
+							String(res.body ?? ""),
+						);
+					} catch (e2) {
+						// Client gone or listener closing -- nothing to save.
+					}
+				}
+			} finally {
+				try { ops.op_serve_close(rid); } catch (e) {}
+			}
+		})();
+		return {
+			done,
+			close: () => {
+				try { ops.op_serve_close(rid); } catch (e) {}
+			},
+		};
+	},
 };

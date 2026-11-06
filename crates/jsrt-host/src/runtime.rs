@@ -106,7 +106,7 @@ fn build_runtime(options: &HostOptions, entry_dir: Option<&Path>) -> JsRuntime {
     let loader_capabilities = Capabilities::from_grants(grants);
     let runtime = JsRuntime::new(RuntimeOptions {
         module_loader: Some(crate::module_loader::gated_loader(&loader_capabilities)),
-        extensions: vec![jsrt_core::init()],
+        extensions: vec![jsrt_core::init(), crate::serve::jsrt_serve::init()],
         ..Default::default()
     });
     let state = runtime.op_state();
@@ -127,6 +127,9 @@ fn build_runtime(options: &HostOptions, entry_dir: Option<&Path>) -> JsRuntime {
             ))));
         }
         if let Ok(grant) = options.capabilities.may_media() {
+            state.put(Rc::new(grant));
+        }
+        if let Ok(grant) = options.capabilities.may_serve() {
             state.put(Rc::new(grant));
         }
     }

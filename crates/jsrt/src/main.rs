@@ -51,6 +51,10 @@ struct RunArgs {
     /// Per-upload media cap in MiB when granting via --media-root (default 256).
     #[arg(long, default_value_t = 256)]
     media_max_mb: u64,
+    /// HTTP listener address, host:port (loopback IP literal only) —
+    /// joins with the manifest's "serve" grant.
+    #[arg(long)]
+    serve: Option<String>,
     /// Per-fetch deadline in milliseconds (0 = the built-in 10s bound).
     #[arg(long, default_value_t = 0)]
     fetch_timeout: u64,
@@ -79,6 +83,9 @@ impl RunArgs {
             v.extend(["--media-root".into(), root.to_string_lossy().into_owned()]);
         }
         v.extend(["--media-max-mb".into(), self.media_max_mb.to_string()]);
+        if let Some(serve) = &self.serve {
+            v.extend(["--serve".into(), serve.clone()]);
+        }
         v.extend(["--fetch-timeout".into(), self.fetch_timeout.to_string()]);
         v
     }
@@ -170,12 +177,15 @@ async fn execute(run: RunArgs) -> Result<(), HostError> {
     };
     let capabilities = merge_cli_grants(
         capabilities,
-        run.read,
-        run.net,
-        run.kv,
-        run.kv_max_mb,
-        run.media_root,
-        run.media_max_mb,
+        CliGrants {
+            read: run.read,
+            net: run.net,
+            kv: run.kv,
+            kv_max_mb: run.kv_max_mb,
+            media_root: run.media_root,
+            media_max_mb: run.media_max_mb,
+            serve: run.serve,
+        },
     )?;
     let options = HostOptions {
         capabilities,
@@ -188,29 +198,36 @@ async fn execute(run: RunArgs) -> Result<(), HostError> {
     jsrt_host::run_file(&run.file, &options).await
 }
 
-/// `--read`/`--net` flags extend the manifest — grants are additive, never
-/// subtractive, so CLI flags can only widen a manifest, not weaken it.
-fn merge_cli_grants(
-    caps: Capabilities,
+/// The CLI's grant flags, grouped — additive only, they can widen a
+/// manifest, never weaken it.
+struct CliGrants {
     read: Vec<PathBuf>,
     net: Vec<String>,
     kv: Option<PathBuf>,
     kv_max_mb: u64,
     media_root: Option<PathBuf>,
     media_max_mb: u64,
-) -> Result<Capabilities, HostError> {
-    if read.is_empty() && net.is_empty() && kv.is_none() && media_root.is_none() {
+    serve: Option<String>,
+}
+
+fn merge_cli_grants(caps: Capabilities, flags: CliGrants) -> Result<Capabilities, HostError> {
+    if flags.read.is_empty()
+        && flags.net.is_empty()
+        && flags.kv.is_none()
+        && flags.media_root.is_none()
+        && flags.serve.is_none()
+    {
         return Ok(caps);
     }
     let mut merged = caps.into_grants();
-    for dir in &read {
+    for dir in &flags.read {
         let resolved = std::fs::canonicalize(dir).map_err(|e| {
             HostError::Host(format!("--read {} does not resolve: {e}", dir.display()))
         })?;
         merged.read_paths.push(resolved);
     }
-    merged.net_hosts.extend(net);
-    if let Some(path) = kv {
+    merged.net_hosts.extend(flags.net);
+    if let Some(path) = flags.kv {
         // Only extend, never weaken: a manifest "kv" line keeps its own
         // quota over the flag's default.
         if merged.kv.is_none() {
@@ -229,11 +246,11 @@ fn merge_cli_grants(
             })?;
             merged.kv = Some(jsrt_host::capability::KvGrant {
                 path: canonical.join(file_name),
-                max_bytes: kv_max_mb * 1024 * 1024,
+                max_bytes: flags.kv_max_mb * 1024 * 1024,
             });
         }
     }
-    if let Some(root) = media_root {
+    if let Some(root) = flags.media_root {
         if merged.media.is_none() {
             let canonical = std::fs::canonicalize(&root).map_err(|e| {
                 HostError::Host(format!(
@@ -249,7 +266,23 @@ fn merge_cli_grants(
             }
             merged.media = Some(jsrt_host::capability::MediaGrant {
                 root: canonical,
-                max_bytes: media_max_mb * 1024 * 1024,
+                max_bytes: flags.media_max_mb * 1024 * 1024,
+            });
+        }
+    }
+    if let Some(addr) = flags.serve {
+        if merged.serve.is_none() {
+            let sock: std::net::SocketAddr = addr.parse().map_err(|_| {
+                HostError::Host(format!("--serve {addr} is not a host:port IP literal"))
+            })?;
+            if !sock.ip().is_loopback() {
+                return Err(HostError::Host(format!(
+                    "--serve {addr} is not loopback — v1 binds loopback only"
+                )));
+            }
+            merged.serve = Some(jsrt_host::capability::ServeGrant {
+                addr: sock,
+                max_body: 8 * 1024 * 1024,
             });
         }
     }

@@ -24,6 +24,8 @@ const MAX_READ_BYTES: u64 = 4 * 1024 * 1024;
 const DEFAULT_KV_MAX_BYTES: u64 = 64 * 1024 * 1024;
 /// The default per-upload media cap.
 const DEFAULT_MEDIA_MAX_BYTES: u64 = 256 * 1024 * 1024;
+/// The default per-request body cap for rt.serve.
+const DEFAULT_SERVE_MAX_BODY: u64 = 8 * 1024 * 1024;
 
 /// A declared embedded-KV store: the file the script may open and the
 /// quota it must stay under. The `path`'s parent is canonicalized at
@@ -42,6 +44,15 @@ pub struct MediaGrant {
     pub max_bytes: u64,
 }
 
+/// A declared HTTP listener: the address the script may bind and the
+/// per-request body cap. v1 binds loopback only — a script that wants to
+/// be a public service earns that when the threat model is written.
+#[derive(Debug, Clone)]
+pub struct ServeGrant {
+    pub addr: std::net::SocketAddr,
+    pub max_body: u64,
+}
+
 /// What a script may reach. Every field is an allowlist; empty means denied.
 #[derive(Debug, Clone, Default)]
 pub struct Capabilities {
@@ -53,6 +64,8 @@ pub struct Capabilities {
     kv: Option<KvGrant>,
     /// The media store, if declared.
     media: Option<MediaGrant>,
+    /// The HTTP listener, if declared.
+    serve: Option<ServeGrant>,
 }
 
 /// The manifest file format (`jsrt.manifest.json`).
@@ -72,6 +85,10 @@ struct Manifest {
     /// "max_bytes": 268435456}}.
     #[serde(default)]
     media: Option<ManifestMedia>,
+    /// The serve grant: {"serve": {"host": "127.0.0.1", "port": 8080,
+    /// "max_body": 8388608}}.
+    #[serde(default)]
+    serve: Option<ManifestServe>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -91,6 +108,16 @@ struct ManifestMedia {
     max_bytes: Option<u64>,
 }
 
+#[derive(Debug, Deserialize)]
+struct ManifestServe {
+    /// Must parse as an IP literal and be loopback — v1 does not bind
+    /// public addresses, and "localhost" DNS games don't get a say.
+    host: String,
+    port: u16,
+    #[serde(default)]
+    max_body: Option<u64>,
+}
+
 impl Capabilities {
     /// Nothing allowed — the correct starting point.
     pub fn deny_all() -> Self {
@@ -104,6 +131,7 @@ impl Capabilities {
             net_hosts,
             kv: None,
             media: None,
+            serve: None,
         }
     }
 
@@ -118,6 +146,7 @@ impl Capabilities {
             net_hosts,
             kv,
             media: None,
+            serve: None,
         }
     }
 
@@ -201,6 +230,24 @@ impl Capabilities {
                 max_bytes: media.max_bytes.unwrap_or(DEFAULT_MEDIA_MAX_BYTES),
             });
         }
+        if let Some(serve) = manifest.serve {
+            let ip: std::net::IpAddr = serve.host.parse().map_err(|_| {
+                HostError::Host(format!(
+                    "manifest serve host '{}' is not an IP literal",
+                    serve.host
+                ))
+            })?;
+            if !ip.is_loopback() {
+                return Err(HostError::Host(format!(
+                    "manifest serve host '{}' is not loopback — v1 binds loopback only",
+                    serve.host
+                )));
+            }
+            caps.serve = Some(ServeGrant {
+                addr: std::net::SocketAddr::new(ip, serve.port),
+                max_body: serve.max_body.unwrap_or(DEFAULT_SERVE_MAX_BODY),
+            });
+        }
         Ok(caps)
     }
 
@@ -216,6 +263,13 @@ impl Capabilities {
     pub fn may_media(&self) -> Result<MediaGrant, HostError> {
         self.media.clone().ok_or_else(|| {
             HostError::Capability("media denied: no store declared in the manifest".into())
+        })
+    }
+
+    /// The serve grant, if declared.
+    pub fn may_serve(&self) -> Result<ServeGrant, HostError> {
+        self.serve.clone().ok_or_else(|| {
+            HostError::Capability("serve denied: no listener declared in the manifest".into())
         })
     }
 
@@ -286,6 +340,7 @@ impl Capabilities {
             && self.net_hosts.is_empty()
             && self.kv.is_none()
             && self.media.is_none()
+            && self.serve.is_none()
     }
 
     /// Decompose into the raw grant lists (for callers that merge sources).
@@ -295,6 +350,7 @@ impl Capabilities {
             net_hosts: self.net_hosts,
             kv: self.kv,
             media: self.media,
+            serve: self.serve,
         }
     }
 
@@ -306,6 +362,7 @@ impl Capabilities {
             net_hosts: grants.net_hosts,
             kv: grants.kv,
             media: grants.media,
+            serve: grants.serve,
         }
     }
 }
@@ -317,6 +374,7 @@ pub struct Grants {
     pub net_hosts: Vec<String>,
     pub kv: Option<KvGrant>,
     pub media: Option<MediaGrant>,
+    pub serve: Option<ServeGrant>,
 }
 
 /// Extract `host` and `port` (defaulted by scheme) from an http(s) URL

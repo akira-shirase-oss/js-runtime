@@ -18,7 +18,10 @@ the portfolio may depend on it until it is proven.**
 4. **Bounded everything.** Deadlines on fetch, a body cap, a run timeout,
    a read cap. New capability → its bound, documented.
 5. **Evidence over claims.** `perf/` numbers carry machine + commit. Laptop
-   numbers are development observations, never public benchmarks.
+   numbers are development observations, never public benchmarks. Load runs
+   are aggressive per the workspace rule: million-scale where a traffic unit
+   exists (HTTP requests through `rt.serve`, op calls, supervised runs),
+   results committed with machine + commit, misses kept not rerun.
 6. **`JsRuntime` is `!Send`** — current-thread executor everywhere (CLI and
    tests). CPU-bound termination goes through `terminate_execution` on a
    watchdog thread; a tokio timeout alone cannot preempt running JS.
