@@ -42,8 +42,8 @@ not a thing scripts can rely on.
 
 | Step | Outcome | Invariant | Failure case | Acceptance test |
 |---|---|---|---|---|
-| 4.1 worker processes | isolate per process, supervised; memory + CPU budgets enforced by the OS | the supervisor never dies with its worker | infinite loop → killed inside budget + grace | supervision drill |
-| 4.2 memory boundary | near-heap-limit → controlled death, classified `terminated` | a memory bomb is an OS problem, not an in-process flag | allocation bomb dies bounded, supervisor reports it | bomb test with evidence |
+| 4.1 worker processes (done) | `jsrt supervise` spawns `jsrt run` in a child; CPU seconds by `RLIMIT_CPU` in pre_exec (child can't decline), RSS by `proc_pid_rusage` polling (25ms bound, not brick wall — documented), wall backstop, SIGTERM→SIGKILL; `wait4` returns status + peak rusage; JSON report: run_id, outcome, exit_code, signal, peak_rss, cpu_ms, limits. `RLIMIT_AS` rejected — V8's pointer cage makes it unbootable | the supervisor never dies with its worker — it only waits and reports | infinite loop → SIGXCPU at 1s classified `cpu-budget`, exit 6 | 6 e2e tests, `77f4c16` |
+| 4.2 memory boundary (done — same evidence) | allocation bomb over `--max-rss-mb 200` → SIGTERM at ~231MB peak (poll-interval overshoot), `killed_by: rss-budget`, exit 6 | a memory bomb is an OS problem, not an in-process flag | the bomb was bounded, not the supervisor | bomb test in the same suite, `77f4c16` |
 | 4.3 structured diagnostics | per-run JSON log records — run ID, timestamps, outcome class, resource use — with byte limits, rotation, and a visible dropped-record count | a flooded log limits itself predictably and says so; diagnostics are never confused with a workflow journal | disk pressure / log storm → bounded output, supervisor preserved, failure exposed not hidden | flood test: records dropped+counted, host survives |
 
 ## M5 — stdlib wave 1
