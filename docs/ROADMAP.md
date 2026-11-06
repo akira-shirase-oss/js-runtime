@@ -57,7 +57,7 @@ not a thing scripts can rely on.
 
 | Step | Outcome | Invariant | Failure case | Acceptance test |
 |---|---|---|---|---|
-| 6.1 `rt.serve` | HTTP listener op — the webhook app's foundation | a serve handler is capability-gated like everything else | crash in a handler can't take the host down | serve + request tests |
+| 6.1 `rt.serve` (done) | HTTP listener behind a `"serve"` manifest line (`{host, port, max_body}`, loopback IP literals only) or `--serve` — pull-model dispatch: hyper owns the wire (keep-alive, parsing, backpressure), the script's own event loop drives `await op_serve_next → handler → op_serve_respond`. Bounds: 16KiB head buffer, `max_body` → 413 pre-dispatch, 64-deep dispatch queue then TCP backpressure. `deno_core::unsync::spawn` for listener tasks (tokio `spawn_local` panics — deno_core's executor is not a LocalSet) | a serve handler is capability-gated like everything else — no grant, no listener | a crashing handler is a JS exception in the host-owned loop → 500 on that request, host lives — proven: /boom → 500, next request → 201 | 6 e2e tests over raw TCP (refusals, dispatch, crash survival, pre-dispatch 413, flag path, non-loopback parse refusal) — `1b8271f` |
 | 6.2 the webhook app | deployed, updated, broken, inspected, rolled back — on jsrt itself | the guide's ship gate, verbatim | each drill step is committed evidence | deploy drill log |
 
 ## M7 — load and ship
