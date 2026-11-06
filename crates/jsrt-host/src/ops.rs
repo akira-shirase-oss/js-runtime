@@ -16,10 +16,28 @@ use serde::Serialize;
 use crate::capability::Capabilities;
 use crate::error::HostError;
 
-/// The fetch deadline — a script may not hold a network op open longer.
-const FETCH_DEADLINE: Duration = Duration::from_secs(10);
+/// The default fetch deadline — a script may not hold a network op open
+/// longer than this. `HostOptions::fetch_deadline` tightens it for drills.
+pub const FETCH_DEADLINE: Duration = Duration::from_secs(10);
 /// Largest response body `rt.fetch` will materialize.
-const FETCH_MAX_BODY: u64 = 4 * 1024 * 1024;
+pub const FETCH_MAX_BODY: u64 = 4 * 1024 * 1024;
+
+/// Operation budgets a run carries in `OpState` — the knobs a host may tune
+/// without touching the capability law itself.
+#[derive(Debug, Clone)]
+pub struct OpBudgets {
+    pub fetch_deadline: Duration,
+    pub fetch_max_body: u64,
+}
+
+impl Default for OpBudgets {
+    fn default() -> Self {
+        Self {
+            fetch_deadline: FETCH_DEADLINE,
+            fetch_max_body: FETCH_MAX_BODY,
+        }
+    }
+}
 
 /// Errors the host itself produced (I/O failures, deadlines, internal state)
 /// surface as class `HostError` so an uncaught one classifies to exit 8 —
@@ -52,6 +70,14 @@ fn http_client(state: &Rc<RefCell<OpState>>) -> Result<Rc<reqwest::Client>, JsEr
         .try_borrow::<Rc<reqwest::Client>>()
         .cloned()
         .ok_or_else(|| host_err("http client not installed".into()))
+}
+
+fn budgets(state: &Rc<RefCell<OpState>>) -> OpBudgets {
+    state
+        .borrow()
+        .try_borrow::<Rc<OpBudgets>>()
+        .map(|b| (**b).clone())
+        .unwrap_or_default()
 }
 
 /// `rt.hostInfo()` — who's hosting this script.
@@ -128,11 +154,14 @@ async fn op_fetch(
 ) -> Result<FetchResult, JsErrorBox> {
     let caps = capabilities(&state)?;
     let client = http_client(&state)?;
+    let budgets = budgets(&state);
     caps.may_net(&url).map_err(deny)?;
+    let deadline = budgets.fetch_deadline;
+    let max_body = budgets.fetch_max_body;
     let started = std::time::Instant::now();
-    let mut response = tokio::time::timeout(FETCH_DEADLINE, client.get(&url).send())
+    let mut response = tokio::time::timeout(deadline, client.get(&url).send())
         .await
-        .map_err(|_| host_err(format!("fetch {url}: deadline {FETCH_DEADLINE:?} exceeded")))?
+        .map_err(|_| host_err(format!("fetch {url}: deadline {deadline:?} exceeded")))?
         .map_err(|e| host_err(format!("fetch {url}: {e}")))?;
     let status = response.status();
     let mut body = Vec::new();
@@ -142,9 +171,9 @@ async fn op_fetch(
         .map_err(|e| host_err(format!("fetch {url}: body: {e}")))?
     {
         body.extend_from_slice(&chunk);
-        if body.len() as u64 > FETCH_MAX_BODY {
+        if body.len() as u64 > max_body {
             return Err(host_err(format!(
-                "fetch {url}: body exceeded {FETCH_MAX_BODY} bytes"
+                "fetch {url}: body exceeded {max_body} bytes"
             )));
         }
     }

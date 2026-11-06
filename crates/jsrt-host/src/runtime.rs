@@ -41,6 +41,9 @@ pub struct HostOptions {
     /// library embedders keep graceful semantics and handle stalls in their
     /// own supervisor.
     pub terminate_grace: Option<Duration>,
+    /// Per-fetch deadline. `None` uses the built-in 10s bound — a script may
+    /// never hold a network op open longer than this.
+    pub fetch_deadline: Option<Duration>,
 }
 
 impl Default for HostOptions {
@@ -49,6 +52,7 @@ impl Default for HostOptions {
             capabilities: Capabilities::deny_all(),
             timeout: Some(Duration::from_secs(10)),
             terminate_grace: None,
+            fetch_deadline: None,
         }
     }
 }
@@ -65,6 +69,11 @@ fn build_runtime(options: &HostOptions) -> JsRuntime {
         let mut state = state.borrow_mut();
         state.put(Rc::new(options.capabilities.clone()));
         state.put(Rc::new(reqwest::Client::new()));
+        let budgets = crate::ops::OpBudgets {
+            fetch_deadline: options.fetch_deadline.unwrap_or(crate::ops::FETCH_DEADLINE),
+            ..Default::default()
+        };
+        state.put(Rc::new(budgets));
     }
     runtime
 }

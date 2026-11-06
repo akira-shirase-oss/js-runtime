@@ -36,6 +36,9 @@ enum Command {
         /// Extra net destinations, host or host:port (joined with the manifest's).
         #[arg(long)]
         net: Vec<String>,
+        /// Per-fetch deadline in milliseconds (0 = the built-in 10s bound).
+        #[arg(long, default_value_t = 0)]
+        fetch_timeout: u64,
     },
 }
 
@@ -55,6 +58,7 @@ async fn main() {
             manifest,
             read,
             net,
+            fetch_timeout,
         } => {
             let capabilities = match &manifest {
                 Some(path) => match Capabilities::from_manifest_file(path) {
@@ -73,6 +77,7 @@ async fn main() {
                 // A parked event loop can't be interrupted — if termination
                 // doesn't unwind in 2s the process exits with the same code.
                 terminate_grace: (timeout > 0).then(|| Duration::from_secs(2)),
+                fetch_deadline: (fetch_timeout > 0).then(|| Duration::from_millis(fetch_timeout)),
             };
             jsrt_host::run_file(&file, &options).await
         }

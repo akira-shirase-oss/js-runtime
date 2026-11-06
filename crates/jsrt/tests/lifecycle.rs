@@ -421,3 +421,143 @@ fn cli_flags_extend_never_weaken() {
     );
     assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
 }
+
+// ---- M2.2: bounded fetch, against a real TCP stub ---------------------------
+
+use std::io::{Read as _, Write as _};
+use std::net::TcpListener;
+
+/// A one-connection-at-a-time HTTP stub. `serve` decides the response; the
+/// listener lives until the test ends (daemon thread).
+struct Stub {
+    port: u16,
+}
+
+impl Stub {
+    fn start(serve: impl Fn(&mut std::net::TcpStream) + Send + 'static) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap_or_else(|e| panic!("bind: {e}"));
+        let port = listener
+            .local_addr()
+            .unwrap_or_else(|e| panic!("addr: {e}"))
+            .port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                match stream {
+                    Ok(mut s) => serve(&mut s),
+                    Err(_) => return,
+                }
+            }
+        });
+        Self { port }
+    }
+
+    fn url(&self, path: &str) -> String {
+        format!("http://127.0.0.1:{}{path}", self.port)
+    }
+}
+
+/// Read the request headers, then write a fixed `status`+`body` response.
+fn respond(status: &str, body: &[u8], delay_ms: u64) -> impl Fn(&mut std::net::TcpStream) {
+    let status = status.to_string();
+    let body = body.to_vec();
+    move |s| {
+        let mut buf = [0u8; 2048];
+        let _ = s.read(&mut buf);
+        if delay_ms > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+        }
+        let head = format!(
+            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        let _ = s.write_all(head.as_bytes());
+        let _ = s.write_all(&body);
+    }
+}
+
+fn fetch_script(rig: &Rig, url: &str) -> PathBuf {
+    rig.script(
+        "f.js",
+        &format!(
+            "const r = await rt.fetch('{url}');\nrt.print('status=' + r.status + ' body=' + r.body + '\\n');\n"
+        ),
+    )
+}
+
+#[test]
+fn a_declared_fetch_returns_the_response() {
+    let rig = Rig::new();
+    let stub = Stub::start(respond("200 OK", b"hello fetch", 0));
+    let url = stub.url("/ok");
+    let script = fetch_script(&rig, &url);
+    let out = rig.run_script(&script, &["--net", &format!("127.0.0.1:{}", stub.port)]);
+    assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("status=200 body=hello fetch"));
+}
+
+#[test]
+fn an_undeclared_fetch_destination_exits_seven() {
+    let rig = Rig::new();
+    let stub = Stub::start(respond("200 OK", b"x", 0));
+    let url = stub.url("/ok");
+    let script = fetch_script(&rig, &url);
+    // Same port, but nothing granted — deny by default.
+    let out = rig.run_script(&script, &[]);
+    assert_eq!(code(&out), 7, "stderr: {}", stderr(&out));
+}
+
+#[test]
+fn a_slow_endpoint_dies_at_the_deadline() {
+    let rig = Rig::new();
+    let stub = Stub::start(respond("200 OK", b"too slow", 3000));
+    let url = stub.url("/slow");
+    let script = fetch_script(&rig, &url);
+    let out = rig.run_script(
+        &script,
+        &[
+            "--net",
+            &format!("127.0.0.1:{}", stub.port),
+            "--fetch-timeout",
+            "300",
+            "--timeout",
+            "15000",
+        ],
+    );
+    assert_eq!(code(&out), 8, "stderr: {}", stderr(&out));
+    assert!(
+        stderr(&out).contains("deadline"),
+        "stderr: {}",
+        stderr(&out)
+    );
+}
+
+#[test]
+fn a_five_hundred_is_a_result_not_a_crash() {
+    let rig = Rig::new();
+    let stub = Stub::start(respond("500 Internal Server Error", b"oops", 0));
+    let url = stub.url("/err");
+    // Fetch semantics: transport succeeded — the status is data for the
+    // script, not an exception for the host.
+    let script = rig.script(
+        "f.js",
+        &format!("const r = await rt.fetch('{url}');\nrt.print('status=' + r.status + '\\n');\n"),
+    );
+    let out = rig.run_script(&script, &["--net", &format!("127.0.0.1:{}", stub.port)]);
+    assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("status=500"));
+}
+
+#[test]
+fn an_oversized_body_is_cut_off() {
+    let rig = Rig::new();
+    let stub = Stub::start(respond("200 OK", &vec![b'x'; 5 * 1024 * 1024], 0));
+    let url = stub.url("/big");
+    let script = fetch_script(&rig, &url);
+    let out = rig.run_script(&script, &["--net", &format!("127.0.0.1:{}", stub.port)]);
+    assert_eq!(code(&out), 8, "stderr: {}", stderr(&out));
+    assert!(
+        stderr(&out).contains("exceeded"),
+        "stderr: {}",
+        stderr(&out)
+    );
+}
