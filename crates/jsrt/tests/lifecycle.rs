@@ -307,6 +307,101 @@ fn a_circular_import_pair_evaluates() {
 }
 
 #[test]
+fn a_pending_timeout_holds_the_loop_then_fires() {
+    let rig = Rig::new();
+    let script = rig.script(
+        "t.js",
+        "rt.setTimeout(() => rt.print('fired\\n'), 30);\nrt.print('end\\n');\n",
+    );
+    let out = rig.run_script(&script, &[]);
+    assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // 'end' prints first, 'fired' second — the loop stayed alive for it.
+    let end = stdout
+        .find("end")
+        .unwrap_or_else(|| panic!("stdout: {stdout}"));
+    let fired = stdout
+        .find("fired")
+        .unwrap_or_else(|| panic!("stdout: {stdout}"));
+    assert!(end < fired, "stdout: {stdout}");
+}
+
+#[test]
+fn a_cleared_timeout_never_fires() {
+    let rig = Rig::new();
+    let script = rig.script(
+        "t.js",
+        "const id = rt.setTimeout(() => rt.print('never\\n'), 30);\nrt.clearTimeout(id);\n",
+    );
+    let out = rig.run_script(&script, &[]);
+    assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("never"));
+}
+
+#[test]
+fn an_interval_repeats_until_cleared() {
+    let rig = Rig::new();
+    let script = rig.script(
+        "t.js",
+        "let n = 0;\nconst id = rt.setInterval(() => { if (++n === 3) { rt.clearInterval(id); rt.print('done ' + n + '\\n'); } }, 5);\n",
+    );
+    let out = rig.run_script(&script, &[]);
+    assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("done 3"));
+}
+
+#[test]
+fn an_unrefed_timer_does_not_hold_the_loop() {
+    let rig = Rig::new();
+    // 60s timer, unref'd: exits now. If unref were broken the run would park
+    // and the 400ms watchdog (with 2s grace) would hand back exit 6.
+    let script = rig.script(
+        "t.js",
+        "const id = rt.setTimeout(() => rt.print('never\\n'), 60000);\nrt.unrefTimer(id);\nrt.print('out\\n');\n",
+    );
+    let out = rig.run_script(&script, &["--timeout", "400"]);
+    assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("out"));
+}
+
+#[test]
+fn a_pending_refed_timer_dies_with_the_watchdog() {
+    let rig = Rig::new();
+    let script = rig.script(
+        "t.js",
+        "rt.setTimeout(() => rt.print('never\\n'), 60000);\n",
+    );
+    let out = rig.run_script(&script, &["--timeout", "400"]);
+    assert_eq!(code(&out), 6, "stderr: {}", stderr(&out));
+}
+
+#[test]
+fn a_throwing_timer_callback_is_an_exception() {
+    let rig = Rig::new();
+    let script = rig.script(
+        "t.js",
+        "rt.setTimeout(() => { throw new Error('cb boom'); }, 5);\n",
+    );
+    let out = rig.run_script(&script, &[]);
+    assert_eq!(code(&out), 5, "stderr: {}", stderr(&out));
+    assert!(stderr(&out).contains("cb boom"), "stderr: {}", stderr(&out));
+}
+
+#[test]
+fn there_are_no_bare_timer_globals() {
+    let rig = Rig::new();
+    // Everything a script can do lives under rt.* — no ambient setTimeout.
+    let script = rig.script("t.js", "setTimeout(() => {}, 1);\n");
+    let out = rig.run_script(&script, &[]);
+    assert_eq!(code(&out), 5, "stderr: {}", stderr(&out));
+    assert!(
+        stderr(&out).contains("setTimeout is not defined"),
+        "stderr: {}",
+        stderr(&out)
+    );
+}
+
+#[test]
 fn cli_flags_extend_never_weaken() {
     let rig = Rig::new();
     let data = rig.dir.path().join("data");
