@@ -26,6 +26,7 @@ use std::io::Write;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use serde_json::json;
@@ -41,6 +42,16 @@ const POLL_INTERVAL: Duration = Duration::from_millis(25);
 const KILLED_BY_CPU: &str = "cpu-budget";
 const KILLED_BY_RSS: &str = "rss-budget";
 const KILLED_BY_WALL: &str = "wall-clock";
+
+/// Set by the signal handler when the operator (or a process manager)
+/// wants the supervised run down. The supervisor forwards it to the
+/// worker — a supervisor that can't be stopped isn't supervision.
+static OPERATOR_TERM: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn on_operator_term(_sig: libc::c_int) {
+    // Atomic store is async-signal-safe — the handler only raises a flag.
+    OPERATOR_TERM.store(true, Ordering::SeqCst);
+}
 
 pub struct SupervisePlan {
     /// Arguments to pass to `jsrt run` verbatim (already serialized).
@@ -63,6 +74,37 @@ pub struct SupervisePlan {
 /// should use — the worker's class, or `terminated` (6) when a budget
 /// did the killing.
 pub fn supervise(plan: &SupervisePlan) -> Result<i32, HostError> {
+    // A supervisor that can't be stopped isn't supervision: SIGTERM/SIGINT
+    // to the supervisor forwards to the worker through the same
+    // SIGTERM→SIGKILL path the budgets use, recorded as operator-sigterm.
+    // The handler is armed *before* the worker exists — a TERM that lands
+    // while the worker is still spawning sets the flag and forwards the
+    // moment the poll loop starts. The only uncovered window left is the
+    // process's own startup, which no design removes.
+    OPERATOR_TERM.store(false, Ordering::SeqCst);
+    unsafe {
+        if libc::signal(
+            libc::SIGTERM,
+            on_operator_term as *const () as libc::sighandler_t,
+        ) == libc::SIG_ERR
+        {
+            return Err(HostError::Host(format!(
+                "supervise: signal(SIGTERM): {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        if libc::signal(
+            libc::SIGINT,
+            on_operator_term as *const () as libc::sighandler_t,
+        ) == libc::SIG_ERR
+        {
+            return Err(HostError::Host(format!(
+                "supervise: signal(SIGINT): {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+    }
+
     let started = Instant::now();
     let run_id = format!(
         "{}x{}",
@@ -108,6 +150,10 @@ pub fn supervise(plan: &SupervisePlan) -> Result<i32, HostError> {
     // pid is only safe to use while we hold the handle.
     let _child_guard = child;
 
+    // Operator-facing lifecycle line: the supervisor is armed and the
+    // worker exists — the point at which SIGTERM/SIGINT forward cleanly.
+    eprintln!("jsrt: supervise: worker {pid} running, signals forwarded");
+
     let mut peak_rss: u64 = 0;
     let mut killed_by: Option<&'static str> = None;
     // Two-stage kill, same shape as the in-process watchdog one level down:
@@ -143,6 +189,14 @@ pub fn supervise(plan: &SupervisePlan) -> Result<i32, HostError> {
                 unsafe { libc::kill(pid, libc::SIGTERM) };
                 sigterm_at = Some(Instant::now());
             }
+        }
+
+        // The operator asked the supervisor to stop — forward through the
+        // same path the budgets take.
+        if OPERATOR_TERM.load(Ordering::SeqCst) && sigterm_at.is_none() {
+            killed_by = Some("operator-sigterm");
+            unsafe { libc::kill(pid, libc::SIGTERM) };
+            sigterm_at = Some(Instant::now());
         }
 
         // Grace expired and the worker still breathes — escalate.

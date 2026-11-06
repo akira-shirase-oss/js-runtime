@@ -45,7 +45,7 @@ impl Rig {
 fn code(out: &Output) -> i32 {
     out.status
         .code()
-        .unwrap_or_else(|| panic!("killed by signal"))
+        .unwrap_or_else(|| panic!("killed by signal — status: {:?}", out.status))
 }
 
 /// The last stdout line is the JSON run report (the worker's own prints
@@ -216,5 +216,94 @@ fn a_flooded_log_rotates_and_counts_its_drops() {
     assert!(
         first["dropped_records"].as_u64().unwrap_or(0) > 0,
         "dropped count not visible: {first}"
+    );
+}
+
+#[test]
+fn an_operator_sigterm_reaches_the_worker() {
+    // The drill found this hole: kill the supervisor, the worker used to
+    // stay alive holding its port. Now SIGTERM forwards through the same
+    // TERM->KILL path the budgets use.
+    let rig = Rig::new();
+    let script = rig.script("stall.js", "await new Promise(() => {});\n");
+    let mut child = Command::new(JSRT)
+        .args([
+            "supervise",
+            script.to_str().unwrap_or_else(|| panic!("utf8")),
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|e| panic!("spawn supervise: {e}"));
+
+    // Signal on readiness, not a timer: the supervisor prints its armed
+    // line once the worker exists and the handlers are installed. Killing
+    // on a fixed sleep is a race — a slow exec can put the signal inside
+    // the supervisor's own startup window, which is exactly what this
+    // test exists to keep out of production.
+    let stderr = child
+        .stderr
+        .take()
+        .unwrap_or_else(|| panic!("no stderr pipe"));
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        let reader = std::io::BufReader::new(stderr);
+        for line in reader.lines() {
+            let line = match line {
+                Ok(l) => l,
+                Err(_) => break,
+            };
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let mut worker_pid = None;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while worker_pid.is_none() {
+        let left = deadline
+            .checked_duration_since(std::time::Instant::now())
+            .unwrap_or_else(|| panic!("supervisor never armed: no readiness line in 15s"));
+        let line = rx
+            .recv_timeout(left)
+            .unwrap_or_else(|e| panic!("supervisor stderr closed before arming: {e}"));
+        if let Some(rest) = line.strip_prefix("jsrt: supervise: worker ") {
+            worker_pid = rest
+                .split_whitespace()
+                .next()
+                .and_then(|s| s.parse::<i32>().ok());
+        }
+    }
+    let worker_pid = worker_pid.unwrap_or_else(|| panic!("no pid in readiness line"));
+
+    Command::new("kill")
+        .args(["-TERM", &child.id().to_string()])
+        .output()
+        .unwrap_or_else(|e| panic!("kill: {e}"));
+    let out = child
+        .wait_with_output()
+        .unwrap_or_else(|e| panic!("wait: {e}"));
+    assert_eq!(
+        code(&out),
+        6,
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let r = report(&out);
+    assert_eq!(r["outcome"], "terminated", "{r}");
+    assert_eq!(r["killed_by"], "operator-sigterm", "{r}");
+    assert_eq!(r["signal"], 15, "{r}");
+
+    // The actual hole: the worker must be gone, not just reported dead —
+    // a live worker is what held the port in the drill.
+    let status = Command::new("kill")
+        .args(["-0", &worker_pid.to_string()])
+        .output()
+        .unwrap_or_else(|e| panic!("kill -0: {e}"))
+        .status;
+    assert!(
+        !status.success(),
+        "worker {worker_pid} survived the supervisor's shutdown"
     );
 }

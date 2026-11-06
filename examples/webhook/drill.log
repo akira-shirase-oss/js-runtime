@@ -1,0 +1,21 @@
+=== DEPLOY v1 — jsrt supervise, manifest grant, health check
+    health: {"ok":true,"v":1}
+    post d1: stored hook/github/d1
+    post d1 again (dedup): duplicate
+    post d2: stored hook/github/d2
+    list /hooks/github: ["hook/github/d1","hook/github/d2"]
+=== UPDATE v2 — swap current.js, respawn, verify new route + data survived
+    health after update: {"ok":true,"v":2}
+    list survived update: ["hook/github/d1","hook/github/d2"]
+=== BREAK — handler throws on every route; health must still be answerable by the wire
+    health under broken build: 500
+    post under broken build: 500
+=== INSPECT — the report knows it ran, the wire knows it served 500s
+    report records so far: 2
+      {"run_id":"1793982978677x85845","outcome":"terminated","exit_code":6,"worker_pid":85851,"wall_ms":226,"cpu_ms":35,"peak_rss_bytes":29999104,"limits":{"max_rss_bytes":null,"max_cpu_secs":null,"wall_ms":30000},"killed_by":"operator-sigterm","signal":15,"poll_interval_ms":25}
+      {"run_id":"1793982978915x85872","outcome":"terminated","exit_code":6,"worker_pid":85875,"wall_ms":197,"cpu_ms":11,"peak_rss_bytes":29753344,"limits":{"max_rss_bytes":null,"max_cpu_secs":null,"wall_ms":30000},"killed_by":"operator-sigterm","signal":15,"poll_interval_ms":25}
+=== ROLLBACK — restore v1 file, respawn, verify health + prior data
+    health after rollback: {"ok":true,"v":1}
+    data after rollback: ["hook/github/d1","hook/github/d2"]
+    final report records: 4
+=== DRILL COMPLETE
