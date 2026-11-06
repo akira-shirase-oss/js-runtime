@@ -42,6 +42,13 @@ the portfolio may depend on it until it is proven.**
   `#[serde]` on the fn + a named `Serialize` struct (not `serde_json::Value`);
   state arrives as `state: Rc<RefCell<OpState>>`.
 - Test flavor: `#[tokio::test(flavor = "current_thread")]`.
+- Load evidence: `crates/jsrt-load` is the HTTP driver (keep-alive workers,
+  JSON report; `--method/--header/--body` supported). `perf/load.py` runs
+  the cold/op/serve scenarios, `perf/soak.py` the soak; artifacts land in
+  `perf/results/` — never delete a bad run.
+- `jsrt supervise` lifecycle: signals forward to the worker; the stderr
+  line `worker N running, signals forwarded` is the readiness marker —
+  tests kill on it, never on a sleep.
 
 ## Verification gate (run before every commit)
 
