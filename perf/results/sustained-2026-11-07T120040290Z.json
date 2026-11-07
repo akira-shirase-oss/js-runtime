@@ -1,0 +1,32 @@
+{
+  "date": "2026-11-07T12:00:40.290Z",
+  "machine": "apple-m2-pro-12c",
+  "kv": {
+    "ops": 1000000,
+    "seconds": 178.9,
+    "exit": 0,
+    "stdout": "keys 1000",
+    "ok": true
+  },
+  "media": {
+    "puts": 20000,
+    "stats": 20,
+    "seconds": 0,
+    "exit": 8,
+    "stdout": "",
+    "ok": false
+  },
+  "refusal": {
+    "spawns": 2000,
+    "refused": 2000,
+    "other_exits": {},
+    "seconds": 17.7,
+    "ok": true
+  },
+  "supervise": {
+    "runs": 100,
+    "reported": 100,
+    "seconds": 3.5,
+    "ok": true
+  }
+}
