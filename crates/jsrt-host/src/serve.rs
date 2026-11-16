@@ -111,6 +111,11 @@ pub struct ServeResource {
     pending: Mutex<HashMap<u64, PendingResponse>>,
     next_id: AtomicU64,
     accept_task: Mutex<Option<tokio::task::AbortHandle>>,
+    /// Set once by `close`. The pending `op_serve_next` watches it, so the
+    /// script's loop ends even while connections (each holding a sender
+    /// of the dispatch queue) stay open; dispatch checks it so a request
+    /// finishing after close is answered 503 instead of queued forever.
+    closed: tokio::sync::watch::Sender<bool>,
 }
 
 impl Resource for ServeResource {
@@ -129,6 +134,7 @@ impl Resource for ServeResource {
         if let Ok(mut pending) = self.pending.lock() {
             pending.clear();
         }
+        self.closed.send_replace(true);
     }
 }
 
@@ -241,6 +247,7 @@ fn op_serve_listen(
                 .map_or(1, |first| first.0),
         ),
         accept_task: Mutex::new(None),
+        closed: tokio::sync::watch::Sender::new(false),
     });
 
     // At least one full-size body must fit, and tokio caps a semaphore.
@@ -542,9 +549,9 @@ async fn dispatch(
     };
     drop(bytes);
     // The queue being full means the script is busy: backpressure is this
-    // await. The sender travels with the message; if the receiver is gone,
-    // the script's event loop is done and so is this connection.
-    if tx.send((msg, rtx)).await.is_err() {
+    // await. The sender travels with the message; if the listener closed
+    // or the receiver is gone, nobody will take the request.
+    if *res.closed.borrow() || tx.send((msg, rtx)).await.is_err() {
         return Ok(plain(503, "listener closing"));
     }
     match rrx.await {
@@ -572,14 +579,18 @@ async fn op_serve_next(
     state: Rc<RefCell<OpState>>,
     rid: ResourceId,
 ) -> Result<serde_json::Value, JsErrorBox> {
-    let res = state
-        .borrow()
-        .resource_table
-        .get::<ServeResource>(rid)
-        .map_err(|e| host_err(format!("serve next: {e}")))?;
+    // A listener closed before this call (close() inside the handler) is
+    // the same as one that closes while waiting: no more requests.
+    let Ok(res) = state.borrow().resource_table.get::<ServeResource>(rid) else {
+        return Ok(serde_json::Value::Null);
+    };
+    let mut closed = res.closed.subscribe();
     let msg = {
         let mut rx = res.rx.lock().await;
-        rx.recv().await
+        tokio::select! {
+            msg = rx.recv() => msg,
+            _ = closed.wait_for(|c| *c) => None,
+        }
     };
     match msg {
         Some((req, sender)) => {

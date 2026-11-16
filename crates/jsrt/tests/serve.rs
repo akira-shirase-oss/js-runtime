@@ -128,6 +128,13 @@ const READY: &str = "jsrt-test: listening";
 struct ServeChild(Option<Child>);
 
 impl ServeChild {
+    /// Whether the server process has exited (without reaping its output).
+    fn try_wait_exited(&mut self) -> bool {
+        self.0
+            .as_mut()
+            .is_some_and(|c| matches!(c.try_wait(), Ok(Some(_))))
+    }
+
     fn wait_with_output(mut self) -> std::io::Result<Output> {
         match self.0.take() {
             Some(child) => child.wait_with_output(),
@@ -1169,4 +1176,37 @@ fn the_suppressed_line_count_survives_the_worker_dying() {
         err.contains("5 more such lines suppressed"),
         "stderr: {err}"
     );
+}
+
+#[test]
+fn close_ends_the_server_while_a_keep_alive_client_stays_connected() {
+    let rig = Rig::new();
+    let port = Rig::free_port();
+    let mut child = route_app(&rig, port, "", "");
+    // One answered request on a keep-alive connection the client keeps.
+    let mut kept = connect(port);
+    kept.set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap_or_else(|e| panic!("timeout: {e}"));
+    kept.write_all(b"GET /one HTTP/1.1\r\nHost: x\r\n\r\n")
+        .unwrap_or_else(|e| panic!("write: {e}"));
+    assert_eq!(read_response(&mut kept).map(|r| r.0), Some(200));
+    // server.close() must end the script's serve loop (server.done) even
+    // though this connection is still open.
+    let started = Instant::now();
+    quit(port);
+    let exited = loop {
+        if child.try_wait_exited() {
+            break true;
+        }
+        if started.elapsed() > Duration::from_secs(5) {
+            break false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert!(exited, "the server was still running 5 s after close()");
+    drop(kept);
+    let out = child
+        .wait_with_output()
+        .unwrap_or_else(|e| panic!("wait: {e}"));
+    assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
 }
