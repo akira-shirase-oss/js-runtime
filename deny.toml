@@ -1,0 +1,9 @@
+# cargo-deny configuration. Only the advisories check is configured so far:
+#   cargo deny check advisories
+# Licenses, bans and sources are not set up yet, so a bare `cargo deny check`
+# will report them; that is unfinished work, not a passing gate.
+
+[advisories]
+ignore = [
+    { id = "RUSTSEC-2024-0436", reason = "paste 1.0.15 is unmaintained (archived), not reported vulnerable. It reaches jsrt only through v8 150.4.0 via the pinned deno_core =0.413.0, and no maintained replacement exists upstream. Re-check on the next deno_core upgrade." },
+]
