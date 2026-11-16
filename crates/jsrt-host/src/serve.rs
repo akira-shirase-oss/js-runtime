@@ -12,6 +12,16 @@
 //! script ever sees the request), in-flight requests capped by the
 //! dispatch channel (64) — past that, TCP backpressure is the honest
 //! answer, not an unbounded queue.
+//!
+//! Loopback-only is not a DoS bound — anything on the box can connect — so
+//! the grant also carries: `max_connections` (an owned semaphore permit is
+//! taken *before* `accept`, so connections past the cap wait in the
+//! kernel backlog rather than as tasks here), `header_timeout` (hyper's
+//! header-read timer, which also runs while a keep-alive connection sits
+//! idle waiting for its next head), and `body_timeout` (408 for a body
+//! that stalls). A request takes its dispatch-queue slot before its body
+//! is buffered, so at most `DISPATCH_QUEUE` bodies are ever held waiting
+//! for the script.
 
 use std::borrow::Cow;
 use std::cell::RefCell;
@@ -19,7 +29,8 @@ use std::collections::HashMap;
 use std::convert::Infallible;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use deno_core::{op2, OpState, Resource, ResourceId};
 use deno_error::JsErrorBox;
@@ -27,9 +38,9 @@ use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::{Bytes, Incoming};
 use hyper::service::service_fn;
 use hyper::{Request, Response};
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioIo, TokioTimer};
 use serde::Serialize;
-use tokio::sync::{mpsc, oneshot, Mutex as TokioMutex};
+use tokio::sync::{mpsc, oneshot, Mutex as TokioMutex, Semaphore};
 
 use crate::capability::ServeGrant;
 
@@ -140,28 +151,43 @@ fn op_serve_listen(
         accept_task: Mutex::new(None),
     });
 
-    let max_body = grant.max_body;
+    let limits = WireLimits {
+        max_body: grant.max_body,
+        body_timeout: grant.body_timeout,
+    };
+    let header_timeout = grant.header_timeout;
+    let slots = Arc::new(Semaphore::new(grant.max_connections));
     let task_resource = resource.clone();
     let task = deno_core::unsync::spawn(async move {
         loop {
+            // A slot first, then accept: past the cap, connections queue in
+            // the kernel backlog, not as tasks and buffers in this process.
+            let Ok(slot) = Arc::clone(&slots).acquire_owned().await else {
+                return;
+            };
             match listener.accept().await {
                 Ok((stream, _)) => {
                     let tx = tx.clone();
                     let res = task_resource.clone();
                     deno_core::unsync::spawn(async move {
+                        // Held for the connection's whole life.
+                        let _slot = slot;
                         let svc = service_fn(move |req: Request<Incoming>| {
-                            dispatch(req, tx.clone(), res.clone(), max_body)
+                            dispatch(req, tx.clone(), res.clone(), limits)
                         });
                         let _ = hyper::server::conn::http1::Builder::new()
                             .max_buf_size(HEAD_BUF_MAX)
+                            .timer(TokioTimer::new())
+                            .header_read_timeout(header_timeout)
                             .serve_connection(TokioIo::new(stream), svc)
                             .await;
                     });
                 }
                 Err(_) => {
+                    drop(slot);
                     // EMFILE bursts would spin — a beat of backoff keeps an
                     // fd-exhausted box from becoming a CPU problem too.
-                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    tokio::time::sleep(Duration::from_millis(10)).await;
                 }
             }
         }
@@ -174,14 +200,21 @@ fn op_serve_listen(
     Ok(rid)
 }
 
-/// Wire-side handler: collect the bounded body, hand the request to the
-/// dispatch queue, await the script's response. Every failure mode maps
+/// Per-request bounds the wire side enforces before the script is involved.
+#[derive(Clone, Copy)]
+struct WireLimits {
+    max_body: u64,
+    body_timeout: Duration,
+}
+
+/// Wire-side handler: take a dispatch slot, collect the bounded body, hand
+/// the request to the script, await its response. Every failure mode maps
 /// to a real HTTP answer — the wire never sees a Rust panic.
 async fn dispatch(
     req: Request<Incoming>,
     tx: mpsc::Sender<(ServeReq, PendingResponse)>,
     res: Rc<ServeResource>,
-    max_body: u64,
+    limits: WireLimits,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
     fn plain(status: u16, msg: &'static str) -> Response<Full<Bytes>> {
         Response::builder()
@@ -205,10 +238,35 @@ async fn dispatch(
         .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
         .collect();
 
-    let collected = Limited::new(body, max_body as usize).collect().await;
+    // A declared length over the cap is refused before anything is read.
+    let declared = parts
+        .headers
+        .get(http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok());
+    if declared.is_some_and(|n| n > limits.max_body) {
+        return Ok(plain(413, "request body too large"));
+    }
+
+    // The queue slot comes before the body: a busy script stops further
+    // bodies from being read at all, instead of each connection buffering
+    // up to max_body while it waits. If the receiver is gone, the
+    // script's event loop is done and so is this connection.
+    let Ok(slot) = tx.reserve().await else {
+        return Ok(plain(503, "listener closing"));
+    };
+    let collected = tokio::time::timeout(
+        limits.body_timeout,
+        Limited::new(body, limits.max_body as usize).collect(),
+    )
+    .await;
     let bytes = match collected {
-        Ok(c) => c.to_bytes(),
-        Err(_) => return Ok(plain(413, "request body too large")),
+        Ok(Ok(c)) => c.to_bytes(),
+        Ok(Err(e)) if e.is::<http_body_util::LengthLimitError>() => {
+            return Ok(plain(413, "request body too large"));
+        }
+        Ok(Err(_)) => return Ok(plain(400, "request body unreadable")),
+        Err(_) => return Ok(plain(408, "request body timeout")),
     };
 
     let id = res.next_id.fetch_add(1, Ordering::Relaxed);
@@ -220,13 +278,8 @@ async fn dispatch(
         headers,
         body: String::from_utf8_lossy(&bytes).into_owned(),
     };
-    // The queue being full means the script is busy — backpressure lives
-    // here, in the send() await, not in an unbounded Vec. The sender
-    // travels with the message; if the receiver is gone, the script's
-    // event loop is done and so is this connection.
-    if tx.send((msg, rtx)).await.is_err() {
-        return Ok(plain(503, "listener closing"));
-    }
+    // The sender travels with the message.
+    slot.send((msg, rtx));
     match rrx.await {
         Ok(response) => Ok(response),
         // The resource closed (or the script's isolate died) while this

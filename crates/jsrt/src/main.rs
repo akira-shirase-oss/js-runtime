@@ -280,10 +280,10 @@ fn merge_cli_grants(caps: Capabilities, flags: CliGrants) -> Result<Capabilities
                     "--serve {addr} is not loopback — v1 binds loopback only"
                 )));
             }
-            merged.serve = Some(jsrt_host::capability::ServeGrant {
-                addr: sock,
-                max_body: 8 * 1024 * 1024,
-            });
+            merged.serve = Some(jsrt_host::capability::ServeGrant::new(
+                sock,
+                8 * 1024 * 1024,
+            ));
         }
     }
     Ok(Capabilities::from_grants(merged))
