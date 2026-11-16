@@ -121,6 +121,11 @@ enum Command {
         /// with a dropped-record meta-line (default 512 KiB).
         #[arg(long, default_value_t = 512)]
         report_max_kb: u64,
+        /// Bytes of worker stdout, and separately stderr, passed through
+        /// per run, in KiB (default 8192). The rest is read and dropped,
+        /// and the report counts it.
+        #[arg(long, default_value_t = 8192)]
+        max_output_kb: u64,
     },
 }
 
@@ -149,6 +154,7 @@ async fn main() {
             kill_grace_ms,
             report,
             report_max_kb,
+            max_output_kb,
         } => {
             let plan = supervise::SupervisePlan {
                 worker_args: run.to_argv(),
@@ -158,6 +164,7 @@ async fn main() {
                 kill_grace: Duration::from_millis(kill_grace_ms),
                 report_path: report,
                 report_max_bytes: report_max_kb * 1024,
+                max_output_bytes: max_output_kb.saturating_mul(1024),
             };
             match supervise::supervise(&plan) {
                 Ok(code) => std::process::exit(code),

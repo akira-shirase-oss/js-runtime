@@ -99,7 +99,8 @@ deadline, which interrupts running JS *and* a stalled event loop. A tokio
 backstop covers the fully-idle case. **What this does not cover:** memory
 bombs — a runaway allocation needs a process boundary, which is what
 `jsrt supervise` is for (`RLIMIT_CPU` seconds, RSS polling, SIGTERM→SIGKILL,
-bounded JSONL run reports), and we don't pretend an in-process flag replaces
+bounded JSONL run reports, worker stdout and stderr each capped per run by
+`--max-output-kb` — default 8 MiB — with passed and dropped bytes in the report), and we don't pretend an in-process flag replaces
 it.
 
 ## Layout
