@@ -94,6 +94,10 @@ pub struct Capabilities {
     read_paths: Vec<PathBuf>,
     /// `host` or `host:port` destinations the script may fetch.
     net_hosts: Vec<String>,
+    /// Destinations whose *name* may also resolve to loopback, private or
+    /// link-local addresses — the explicit opt-in (`"private": true`,
+    /// `--net-private`). They are fetchable like `net_hosts`.
+    net_private: Vec<String>,
     /// The embedded KV store, if declared.
     kv: Option<KvGrant>,
     /// The media store, if declared.
@@ -109,9 +113,10 @@ struct Manifest {
     /// read beneath. Symlinks are resolved before checking.
     #[serde(default)]
     read: Vec<PathBuf>,
-    /// `host` or `host:port` entries. `host` alone allows any port.
+    /// `host` or `host:port` entries. `host` alone allows any port. An
+    /// entry may also be `{"host": "db:5432", "private": true}`.
     #[serde(default)]
-    net: Vec<String>,
+    net: Vec<ManifestNet>,
     /// The KV grant: {"kv": {"path": "app.kv", "max_bytes": 67108864}}.
     #[serde(default)]
     kv: Option<ManifestKv>,
@@ -123,6 +128,24 @@ struct Manifest {
     /// "max_body": 8388608}}.
     #[serde(default)]
     serve: Option<ManifestServe>,
+}
+
+/// One `net` entry: a bare `host[:port]` string, or an object that can
+/// opt the name into private resolution. Unknown keys in the object are an
+/// error — a misspelt opt-in must not turn into a silent public grant.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum ManifestNet {
+    Plain(String),
+    Detailed(ManifestNetDetailed),
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManifestNetDetailed {
+    host: String,
+    #[serde(default)]
+    private: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -171,6 +194,7 @@ impl Capabilities {
         Self {
             read_paths,
             net_hosts,
+            net_private: Vec::new(),
             kv: None,
             media: None,
             serve: None,
@@ -186,6 +210,7 @@ impl Capabilities {
         Self {
             read_paths,
             net_hosts,
+            net_private: Vec::new(),
             kv,
             media: None,
             serve: None,
@@ -217,7 +242,19 @@ impl Capabilities {
             })?;
             caps.read_paths.push(resolved);
         }
-        caps.net_hosts = manifest.net;
+        for entry in manifest.net {
+            match entry {
+                ManifestNet::Plain(host) => caps.net_hosts.push(host),
+                ManifestNet::Detailed(ManifestNetDetailed {
+                    host,
+                    private: false,
+                }) => caps.net_hosts.push(host),
+                ManifestNet::Detailed(ManifestNetDetailed {
+                    host,
+                    private: true,
+                }) => caps.net_private.push(host),
+            }
+        }
         if let Some(kv) = manifest.kv {
             let joined = base.join(&kv.path);
             // The db file itself may not exist yet — its parent must. The
@@ -398,7 +435,7 @@ impl Capabilities {
                 crate::net::redact_url(url)
             ))
         })?;
-        let allowed = self.net_hosts.iter().any(|entry| {
+        let allowed = self.net_hosts.iter().chain(&self.net_private).any(|entry| {
             match parse_net_grant(entry) {
                 Some((gh, gp)) => gh == host && gp.is_none_or(|p| p == port),
                 // An unparseable grant can never match — fail closed.
@@ -413,11 +450,24 @@ impl Capabilities {
         Ok(())
     }
 
+    /// Whether a resolved *name* may connect to non-public addresses: only
+    /// when an opted-in grant names that host (any of its ports — the
+    /// resolver never sees the port; `may_net` still checks it).
+    pub fn may_resolve_private(&self, host: &str) -> bool {
+        let host = host.to_lowercase();
+        let host = host.strip_suffix('.').unwrap_or(&host);
+        self.net_private
+            .iter()
+            .filter_map(|entry| parse_net_grant(entry))
+            .any(|(granted, _)| granted == host)
+    }
+
     /// True when no capabilities were granted — used by ops that want to give
     /// a clearer error than a bare refusal.
     pub fn is_empty(&self) -> bool {
         self.read_paths.is_empty()
             && self.net_hosts.is_empty()
+            && self.net_private.is_empty()
             && self.kv.is_none()
             && self.media.is_none()
             && self.serve.is_none()
@@ -428,6 +478,7 @@ impl Capabilities {
         Grants {
             read_paths: self.read_paths,
             net_hosts: self.net_hosts,
+            net_private: self.net_private,
             kv: self.kv,
             media: self.media,
             serve: self.serve,
@@ -440,6 +491,7 @@ impl Capabilities {
         Self {
             read_paths: grants.read_paths,
             net_hosts: grants.net_hosts,
+            net_private: grants.net_private,
             kv: grants.kv,
             media: grants.media,
             serve: grants.serve,
@@ -452,6 +504,7 @@ impl Capabilities {
 pub struct Grants {
     pub read_paths: Vec<PathBuf>,
     pub net_hosts: Vec<String>,
+    pub net_private: Vec<String>,
     pub kv: Option<KvGrant>,
     pub media: Option<MediaGrant>,
     pub serve: Option<ServeGrant>,
@@ -636,6 +689,22 @@ mod tests {
         assert!(caps.may_net("http://[fe80::1]:1234/x").is_ok());
         assert!(caps.may_net("http://[::2]:7777/x").is_ok());
         assert!(caps.may_net("http://[::3]:7777/x").is_err());
+    }
+
+    #[test]
+    fn only_opted_in_names_may_resolve_privately() {
+        let caps = Capabilities::from_grants(Grants {
+            net_hosts: vec!["public.example:443".into()],
+            net_private: vec!["DB.internal.:5432".into()],
+            ..Default::default()
+        });
+        assert!(caps.may_resolve_private("db.internal"));
+        assert!(caps.may_resolve_private("db.internal."));
+        assert!(!caps.may_resolve_private("public.example"));
+        assert!(!caps.may_resolve_private("other.internal"));
+        // An opted-in grant is still a grant like any other.
+        assert!(caps.may_net("http://db.internal:5432/").is_ok());
+        assert!(caps.may_net("http://db.internal:5433/").is_err());
     }
 
     #[test]

@@ -7,7 +7,10 @@
 //! manifest never named. So the client is built with:
 //! - a redirect policy that re-runs `may_net` on every hop (and keeps the
 //!   ten-hop bound), refusing with the destination it would have reached;
-//! - no proxy: the connection goes to the host that was checked;
+//! - no proxy, deliberately: `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` are
+//!   ignored, because a proxy connects (and resolves names) on the
+//!   script's behalf to destinations this host never checked. There is no
+//!   proxy setting yet; on a proxy-only network fetch cannot leave;
 //! - a resolver that admits only public addresses for a granted *name*.
 //!   `may_net` matches the name's string; DNS decides where it connects,
 //!   and a granted name that resolves (or is rebound) to loopback, a
@@ -16,7 +19,10 @@
 //!   the addresses it admits are the only ones the connector sees, so
 //!   there is no window between check and connect. An IP-literal grant
 //!   (`10.0.0.5:8080`, `127.0.0.1:3000`) is the operator naming the
-//!   address itself and never goes through DNS.
+//!   address itself and never goes through DNS; a name the operator knows
+//!   is private (`localhost`, a Docker service, an internal HTTPS host
+//!   whose certificate names it) is opted in explicitly with
+//!   `{"host": ..., "private": true}` or `--net-private`.
 
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -47,6 +53,7 @@ pub struct ClientUnavailable(pub String);
 
 /// The client every fetch in this run uses.
 pub fn client(caps: &Capabilities) -> Result<reqwest::Client, reqwest::Error> {
+    let resolver_caps = caps.clone();
     let caps = caps.clone();
     let policy = reqwest::redirect::Policy::custom(move |attempt| {
         if attempt.previous().len() > MAX_REDIRECTS {
@@ -60,21 +67,31 @@ pub fn client(caps: &Capabilities) -> Result<reqwest::Client, reqwest::Error> {
     reqwest::Client::builder()
         .redirect(policy)
         .no_proxy()
-        .dns_resolver(Arc::new(PublicOnlyResolver))
+        .dns_resolver(Arc::new(GrantedResolver {
+            caps: resolver_caps,
+        }))
         .build()
 }
 
-/// System DNS, filtered to public addresses — see the module docs.
-struct PublicOnlyResolver;
+/// System DNS, filtered to public addresses unless the grant for that
+/// name opted into private resolution — see the module docs.
+struct GrantedResolver {
+    caps: Capabilities,
+}
 
-impl reqwest::dns::Resolve for PublicOnlyResolver {
+impl reqwest::dns::Resolve for GrantedResolver {
     fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
         let host = name.as_str().to_string();
+        let private_ok = self.caps.may_resolve_private(&host);
         Box::pin(async move {
             // Port 0: the connector sets the URL's port on what we return.
             let found: Vec<SocketAddr> =
                 tokio::net::lookup_host((host.as_str(), 0)).await?.collect();
-            let admitted = admit(&host, found)?;
+            let admitted = if private_ok {
+                found
+            } else {
+                admit(&host, found)?
+            };
             Ok(Box::new(admitted.into_iter()) as reqwest::dns::Addrs)
         })
     }
@@ -88,7 +105,8 @@ pub fn admit(host: &str, found: Vec<SocketAddr>) -> Result<Vec<SocketAddr>, NetD
         let list: Vec<String> = private.iter().map(|a| a.ip().to_string()).collect();
         return Err(NetDenied(format!(
             "fetch denied: {host} resolves to [{}], not a public address — a name grant \
-             reaches public hosts only; grant the address itself (ip:port) for a private one",
+             reaches public hosts only; opt this name in with {{\"host\": ..., \"private\": true}} \
+             or --net-private, or grant the address itself (ip:port)",
             list.join(", ")
         )));
     }
