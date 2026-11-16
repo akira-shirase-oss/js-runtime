@@ -22,7 +22,7 @@
 //! footprint*, which is the only honest bound a V8 host can offer without
 //! kernel accounting.
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -68,6 +68,43 @@ pub struct SupervisePlan {
     pub report_path: Option<PathBuf>,
     /// Byte cap for the report file before it rotates.
     pub report_max_bytes: u64,
+    /// Bytes of worker stdout, and separately stderr, passed through.
+    pub max_output_bytes: u64,
+}
+
+/// What one worker stream did: bytes passed through, bytes dropped.
+#[derive(Debug, Default, Clone, Copy)]
+struct Forwarded {
+    written: u64,
+    dropped: u64,
+}
+
+/// Copy `from` to `to` until EOF, passing at most `cap` bytes and counting
+/// the rest. It keeps reading past the cap — a worker blocked on a full
+/// pipe would stall instead of being limited — so the bound is on what
+/// reaches the operator, not on what the worker may try to write.
+fn forward(mut from: impl Read, mut to: impl Write, cap: u64) -> Forwarded {
+    let mut done = Forwarded::default();
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = match from.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        };
+        let room = usize::try_from(cap.saturating_sub(done.written)).unwrap_or(usize::MAX);
+        let keep = n.min(room);
+        if keep > 0 {
+            if to.write_all(&buf[..keep]).and_then(|()| to.flush()).is_ok() {
+                done.written += keep as u64;
+            } else {
+                done.dropped += keep as u64;
+            }
+        }
+        done.dropped += (n - keep) as u64;
+    }
+    done
 }
 
 /// Execute the supervision plan. Returns the process exit code jsrt
@@ -121,7 +158,9 @@ pub fn supervise(plan: &SupervisePlan) -> Result<i32, HostError> {
     let mut cmd = Command::new(&exe);
     cmd.arg("run").args(&plan.worker_args);
     cmd.stdin(Stdio::null());
-    cmd.stdout(Stdio::inherit()).stderr(Stdio::inherit());
+    // Piped, not inherited: a flooding worker is limited here, per stream,
+    // before its output reaches the operator's terminal, log or disk.
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
     // rlimits land post-fork pre-exec: the budget is set by the parent on
     // the child, so the child cannot decline it. Only CPU is rlimit-able —
@@ -141,10 +180,21 @@ pub fn supervise(plan: &SupervisePlan) -> Result<i32, HostError> {
         }
     }
 
-    let child = cmd
+    let mut child = cmd
         .spawn()
         .map_err(|e| HostError::Host(format!("supervise: spawn {}: {e}", exe.display())))?;
     let pid = child.id() as libc::pid_t;
+    // The forwarders end at EOF, which comes when the worker exits (scripts
+    // cannot start processes that would inherit the pipes).
+    let cap = plan.max_output_bytes;
+    let out_forwarder = child
+        .stdout
+        .take()
+        .map(|out| std::thread::spawn(move || forward(out, std::io::stdout(), cap)));
+    let err_forwarder = child
+        .stderr
+        .take()
+        .map(|err| std::thread::spawn(move || forward(err, std::io::stderr(), cap)));
     // The handle stays alive purely so the child stays ours until reaped —
     // dropping it would orphan nothing (Child::drop doesn't reap), but the
     // pid is only safe to use while we hold the handle.
@@ -228,6 +278,23 @@ pub fn supervise(plan: &SupervisePlan) -> Result<i32, HostError> {
 
     let (outcome, exit_code, effective_killed_by) = classify_death(status, killed_by);
 
+    // The worker is gone, so its pipes are at EOF: collect what each
+    // stream passed and dropped before the report — the report stays the
+    // last line on stdout.
+    let collect = |handle: Option<std::thread::JoinHandle<Forwarded>>| {
+        handle.and_then(|h| h.join().ok()).unwrap_or_default()
+    };
+    let stdout_fwd = collect(out_forwarder);
+    let stderr_fwd = collect(err_forwarder);
+    for (name, fwd) in [("stdout", stdout_fwd), ("stderr", stderr_fwd)] {
+        if fwd.dropped > 0 {
+            eprintln!(
+                "\njsrt: supervise: worker {name} reached the {cap}-byte cap; {} bytes dropped",
+                fwd.dropped
+            );
+        }
+    }
+
     let report = json!({
         "run_id": run_id,
         "outcome": outcome.label,
@@ -244,6 +311,13 @@ pub fn supervise(plan: &SupervisePlan) -> Result<i32, HostError> {
         "killed_by": effective_killed_by,
         "signal": outcome.signal,
         "poll_interval_ms": POLL_INTERVAL.as_millis(),
+        "output": {
+            "max_bytes_per_stream": cap,
+            "stdout_bytes": stdout_fwd.written,
+            "stdout_dropped_bytes": stdout_fwd.dropped,
+            "stderr_bytes": stderr_fwd.written,
+            "stderr_dropped_bytes": stderr_fwd.dropped,
+        },
     });
 
     emit(&report, plan.report_path.as_deref(), plan.report_max_bytes)?;

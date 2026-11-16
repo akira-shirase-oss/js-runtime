@@ -307,3 +307,52 @@ fn an_operator_sigterm_reaches_the_worker() {
         "worker {worker_pid} survived the supervisor's shutdown"
     );
 }
+
+#[test]
+fn a_flooding_worker_is_capped_per_stream_and_the_drop_is_counted() {
+    let rig = Rig::new();
+    // 200 KiB to stdout, then an uncaught error whose message is 200 KiB —
+    // the host's own stderr line — against a 16 KiB cap per stream.
+    let script = rig.script(
+        "flood.js",
+        "const line = 'x'.repeat(1023) + '\\n';\n\
+         for (let i = 0; i < 200; i++) rt.print(line);\n\
+         throw new Error('y'.repeat(200 * 1024));\n",
+    );
+    let out = rig.supervise(&script, &["--max-output-kb", "16"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        code(&out),
+        5,
+        "stderr tail: {}",
+        &stderr[stderr.len().saturating_sub(400)..]
+    );
+    let r = report(&out);
+    let cap: u64 = 16 * 1024;
+    assert_eq!(r["output"]["max_bytes_per_stream"], cap, "{r}");
+    assert_eq!(r["output"]["stdout_bytes"], cap, "{r}");
+    assert_eq!(r["output"]["stdout_dropped_bytes"], 200 * 1024 - cap, "{r}");
+    assert_eq!(r["output"]["stderr_bytes"], cap, "{r}");
+    let stderr_dropped = r["output"]["stderr_dropped_bytes"].as_u64().unwrap_or(0);
+    assert!(stderr_dropped >= 200 * 1024 - cap, "{r}");
+    // What reached the operator is bounded: the capped worker output plus
+    // the supervisor's own lines (readiness, drop notices, the report).
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let worker_stdout: u64 = stdout
+        .lines()
+        .filter(|l| !l.starts_with('{'))
+        .map(|l| l.len() as u64 + 1)
+        .sum();
+    assert!(worker_stdout <= cap + 1, "{worker_stdout} bytes");
+    assert!(
+        stderr.contains("worker stdout reached the 16384-byte cap")
+            && stderr.contains("worker stderr reached the 16384-byte cap"),
+        "stderr tail: {}",
+        &stderr[stderr.len().saturating_sub(400)..]
+    );
+    assert!(
+        (stderr.len() as u64) < cap + 2048,
+        "{} stderr bytes",
+        stderr.len()
+    );
+}

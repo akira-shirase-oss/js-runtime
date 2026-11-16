@@ -95,17 +95,17 @@ impl Default for HostOptions {
 
 /// Build a runtime wired with our ops and the given capabilities.
 ///
-/// `entry_dir` is the program's own directory — an implicit read path for
-/// the *module loader only*. The operator chose this program, so its local
-/// module graph is program-space; ops still see only the manifest's grants.
+/// `entry_dir` is the program's own directory — an implicit source of
+/// *JavaScript modules only* for the loader. The operator chose this
+/// program, so its local module graph is program-space; text/bytes/JSON
+/// imports and every op still see only the manifest's grants.
 fn build_runtime(options: &HostOptions, entry_dir: Option<&Path>) -> JsRuntime {
-    let mut grants = options.capabilities.clone().into_grants();
-    if let Some(dir) = entry_dir.and_then(|d| d.canonicalize().ok()) {
-        grants.read_paths.push(dir);
-    }
-    let loader_capabilities = Capabilities::from_grants(grants);
+    let entry_dir = entry_dir.and_then(|d| d.canonicalize().ok());
     let runtime = JsRuntime::new(RuntimeOptions {
-        module_loader: Some(crate::module_loader::gated_loader(&loader_capabilities)),
+        module_loader: Some(crate::module_loader::gated_loader(
+            &options.capabilities,
+            entry_dir,
+        )),
         extensions: vec![jsrt_core::init(), crate::serve::jsrt_serve::init()],
         ..Default::default()
     });
@@ -113,7 +113,12 @@ fn build_runtime(options: &HostOptions, entry_dir: Option<&Path>) -> JsRuntime {
     {
         let mut state = state.borrow_mut();
         state.put(Rc::new(options.capabilities.clone()));
-        state.put(Rc::new(reqwest::Client::new()));
+        // The fetch client re-checks the manifest on every redirect hop and
+        // never routes through an environment proxy — see net.rs.
+        match crate::net::client(&options.capabilities) {
+            Ok(client) => state.put(Rc::new(client)),
+            Err(e) => state.put(Rc::new(crate::net::ClientUnavailable(e.to_string()))),
+        }
         let budgets = crate::ops::OpBudgets {
             fetch_deadline: options.fetch_deadline.unwrap_or(crate::ops::FETCH_DEADLINE),
             ..Default::default()
@@ -385,6 +390,84 @@ mod tests {
         assert!(
             matches!(classified, super::HostError::Syntax(_)),
             "expected Syntax, got {classified:?}"
+        );
+    }
+
+    /// Request ids are u64 on the wire side and JS numbers in the script.
+    /// The respond op used to take a u32, so from request 2^32 on every
+    /// answer went to the wrong id and the client waited for nothing.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_request_id_past_u32_still_gets_its_answer() {
+        use std::io::{Read, Write};
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .and_then(|l| l.local_addr())
+            .unwrap_or_else(|e| panic!("free port: {e}"))
+            .port();
+        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+        let capabilities = crate::Capabilities::from_grants(crate::capability::Grants {
+            serve: Some(crate::capability::ServeGrant::new(addr, 1024)),
+            ..Default::default()
+        });
+        let options = super::HostOptions {
+            capabilities,
+            ..Default::default()
+        };
+        let mut runtime = super::build_runtime(&options, None);
+        let first = (1u64 << 32) + 5;
+        runtime
+            .op_state()
+            .borrow_mut()
+            .put(crate::serve::FirstRequestId(first));
+
+        let client = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let mut stream = loop {
+                match std::net::TcpStream::connect(addr) {
+                    Ok(s) => break s,
+                    Err(e) if std::time::Instant::now() < deadline => {
+                        let _ = e;
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                    }
+                    Err(e) => panic!("listener never came up: {e}"),
+                }
+            };
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap_or_else(|e| panic!("timeout: {e}"));
+            stream
+                .write_all(b"GET /id HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+                .unwrap_or_else(|e| panic!("write: {e}"));
+            let mut response = String::new();
+            let _ = stream.read_to_string(&mut response);
+            response
+        });
+
+        let source = format!(
+            "const s = rt.serve({{host: '127.0.0.1', port: {port}}}, async (req) => {{\n\
+               rt.setTimeout(() => s.close(), 50);\n\
+               return {{status: 200, body: String(req.id)}};\n\
+             }});\n"
+        );
+        let specifier =
+            ModuleSpecifier::parse("file:///ids.js").unwrap_or_else(|e| panic!("specifier: {e}"));
+        let module = runtime
+            .load_main_es_module_from_code(&specifier, source)
+            .await
+            .unwrap_or_else(|e| panic!("load: {e}"));
+        let evaluation = runtime.mod_evaluate(module);
+        runtime
+            .run_event_loop(Default::default())
+            .await
+            .unwrap_or_else(|e| panic!("event loop: {e}"));
+        evaluation.await.unwrap_or_else(|e| panic!("evaluate: {e}"));
+        let response = client.join().unwrap_or_else(|_| panic!("client panicked"));
+        assert!(
+            response.starts_with("HTTP/1.1 200"),
+            "response: {response:?}"
+        );
+        assert!(
+            response.ends_with(&first.to_string()),
+            "the script saw id {first} exactly: {response:?}"
         );
     }
 

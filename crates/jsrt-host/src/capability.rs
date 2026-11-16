@@ -26,6 +26,14 @@ const DEFAULT_KV_MAX_BYTES: u64 = 64 * 1024 * 1024;
 const DEFAULT_MEDIA_MAX_BYTES: u64 = 256 * 1024 * 1024;
 /// The default per-request body cap for rt.serve.
 const DEFAULT_SERVE_MAX_BODY: u64 = 8 * 1024 * 1024;
+/// Default concurrent connections per listener; past it, new connections
+/// wait in the kernel's accept backlog.
+pub const DEFAULT_SERVE_MAX_CONNECTIONS: usize = 256;
+/// Default time a connection may take to send a request head — and how
+/// long it may sit idle between keep-alive requests.
+pub const DEFAULT_SERVE_HEADER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Default time a request may take to deliver its body.
+pub const DEFAULT_SERVE_BODY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// A declared embedded-KV store: the file the script may open and the
 /// quota it must stay under. The `path`'s parent is canonicalized at
@@ -51,6 +59,25 @@ pub struct MediaGrant {
 pub struct ServeGrant {
     pub addr: std::net::SocketAddr,
     pub max_body: u64,
+    /// Connections served at once; the rest wait to be accepted.
+    pub max_connections: usize,
+    /// Deadline for a request head, which also bounds keep-alive idling.
+    pub header_timeout: std::time::Duration,
+    /// Deadline for a request body once its head has arrived.
+    pub body_timeout: std::time::Duration,
+}
+
+impl ServeGrant {
+    /// A grant for `addr` with the default connection and time bounds.
+    pub fn new(addr: std::net::SocketAddr, max_body: u64) -> Self {
+        Self {
+            addr,
+            max_body,
+            max_connections: DEFAULT_SERVE_MAX_CONNECTIONS,
+            header_timeout: DEFAULT_SERVE_HEADER_TIMEOUT,
+            body_timeout: DEFAULT_SERVE_BODY_TIMEOUT,
+        }
+    }
 }
 
 /// What a script may reach. Every field is an allowlist; empty means denied.
@@ -116,6 +143,12 @@ struct ManifestServe {
     port: u16,
     #[serde(default)]
     max_body: Option<u64>,
+    #[serde(default)]
+    max_connections: Option<usize>,
+    #[serde(default)]
+    header_timeout_ms: Option<u64>,
+    #[serde(default)]
+    body_timeout_ms: Option<u64>,
 }
 
 impl Capabilities {
@@ -243,10 +276,32 @@ impl Capabilities {
                     serve.host
                 )));
             }
-            caps.serve = Some(ServeGrant {
-                addr: std::net::SocketAddr::new(ip, serve.port),
-                max_body: serve.max_body.unwrap_or(DEFAULT_SERVE_MAX_BODY),
-            });
+            let mut grant = ServeGrant::new(
+                std::net::SocketAddr::new(ip, serve.port),
+                serve.max_body.unwrap_or(DEFAULT_SERVE_MAX_BODY),
+            );
+            // Zero would disable a bound, not set one — refuse it.
+            let positive = |name: &str, v: u64| {
+                if v == 0 {
+                    Err(HostError::Host(format!(
+                        "manifest serve {name} must be greater than zero"
+                    )))
+                } else {
+                    Ok(v)
+                }
+            };
+            if let Some(n) = serve.max_connections {
+                grant.max_connections = positive("max_connections", n as u64)? as usize;
+            }
+            if let Some(ms) = serve.header_timeout_ms {
+                grant.header_timeout =
+                    std::time::Duration::from_millis(positive("header_timeout_ms", ms)?);
+            }
+            if let Some(ms) = serve.body_timeout_ms {
+                grant.body_timeout =
+                    std::time::Duration::from_millis(positive("body_timeout_ms", ms)?);
+            }
+            caps.serve = Some(grant);
         }
         Ok(caps)
     }
@@ -292,14 +347,22 @@ impl Capabilities {
                 path.display()
             ))
         })?;
-        if !self.is_read_allowed(&resolved) {
+        self.may_read_resolved(&resolved)?;
+        Ok(resolved)
+    }
+
+    /// `may_read`'s allowlist and size cap on an already-canonical path —
+    /// the module loader's door for text/bytes/JSON imports, which must not
+    /// be wider than `readText`'s.
+    pub fn may_read_resolved(&self, resolved: &Path) -> Result<(), HostError> {
+        if !self.is_read_allowed(resolved) {
             return Err(HostError::Capability(format!(
                 "read denied: {} is outside every declared read path",
                 resolved.display()
             )));
         }
         if resolved.is_file() {
-            let len = fs::metadata(&resolved).map_or(0, |m| m.len());
+            let len = fs::metadata(resolved).map_or(0, |m| m.len());
             if len > MAX_READ_BYTES {
                 return Err(HostError::Capability(format!(
                     "read denied: {} is {len} bytes (limit {MAX_READ_BYTES})",
@@ -307,7 +370,7 @@ impl Capabilities {
                 )));
             }
         }
-        Ok(resolved)
+        Ok(())
     }
 
     /// Check whether a URL's authority is on the net allowlist. Entries of
@@ -316,8 +379,12 @@ impl Capabilities {
     /// before comparison — the checked host is the one the client connects
     /// to, not the one that merely appears in the string.
     pub fn may_net(&self, url: &str) -> Result<(), HostError> {
-        let (host, port) = url_authority(url)
-            .ok_or_else(|| HostError::Capability(format!("fetch denied: unparseable URL {url}")))?;
+        let (host, port) = url_authority(url).ok_or_else(|| {
+            HostError::Capability(format!(
+                "fetch denied: unparseable URL {}",
+                crate::net::redact_url(url)
+            ))
+        })?;
         let allowed = self.net_hosts.iter().any(|entry| {
             match parse_net_grant(entry) {
                 Some((gh, gp)) => gh == host && gp.is_none_or(|p| p == port),

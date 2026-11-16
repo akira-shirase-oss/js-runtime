@@ -19,6 +19,10 @@ starts, a one-hour soak) are all built, with committed results under
 ## What scripts see
 
 Exactly one namespace — `rt.*`. No ambient `Deno`, no ungated global:
+deno_core installs `globalThis.Deno.core` (the raw ops table, including
+`op_panic`) and `globalThis.__bootstrap` for extension code; the bootstrap
+captures what it needs and deletes both before any script runs, and scripts
+cannot import `ext:` modules. A test proves `op_panic` is unreachable.
 
 | API | What it does | Gate |
 |---|---|---|
@@ -27,12 +31,12 @@ Exactly one namespace — `rt.*`. No ambient `Deno`, no ungated global:
 | `rt.now()` | wall-clock ms for measurements | none |
 | `rt.sleep(ms)` | async timer | deadline (run timeout) |
 | `rt.readText(path)` | read a text file | declared `read` paths only |
-| `rt.fetch(url)` | HTTP GET → `{status, statusText, body, bytes, durationMs}` | declared `net` destinations, 10 s deadline, 4 MiB body cap |
+| `rt.fetch(url)` | HTTP GET → `{status, statusText, body, bytes, durationMs}` | declared `net` destinations — re-checked on every redirect hop (at most 10), never through an environment proxy — one 10 s deadline over the whole exchange (connect, redirects, headers, every body chunk), 4 MiB body cap |
 | `rt.setTimeout` `setInterval` `clearTimeout` `clearInterval` | Node-style timers, id-tracked; `unrefTimer`/`refTimer` release the loop | deadline (run timeout) |
 | `rt.pendingTimers()` | how many timers this script still owns | none |
 | `rt.kv.get/put/delete/list` | embedded SQLite store; `list` is an exact-prefix scan | declared `kv` file + `max_bytes` quota |
 | `rt.media.put/stat` | streamed content-addressed uploads (sha256 names) | declared `media` root; the source still needs a `read` grant |
-| `rt.serve(opts, handler)` | HTTP listener, pull-model dispatch; a handler crash is a 500, not a dead host | declared `serve` host/port — loopback IP literals only — plus `max_body` |
+| `rt.serve(opts, handler)` | HTTP listener, pull-model dispatch; a handler that throws, returns no object, or returns an invalid status (outside 200-599) or header is a 500 plus a stderr line — not a dead host, an empty 200 or a hung client | declared `serve` host/port — loopback IP literals only — plus `max_body`, `max_connections` (default 256; the rest wait in the accept backlog), `header_timeout_ms` (default 10 s, also bounds keep-alive idling) and `body_timeout_ms` (default 30 s, then 408) |
 
 `console.log` also works (deno_core's minimal console). Anything not listed
 does not exist for the script — that is the point.
@@ -51,8 +55,18 @@ does not exist for the script — that is the point.
 
 - Deny by default: no manifest, no filesystem and no network — the script can
   compute and print, nothing else.
+- Imports: the entry's own directory is program space for `.js`/`.mjs`
+  modules only. Text, bytes and JSON imports (`with { type: ... }`) and any
+  other file imported as a module need a declared `read` path and stay under
+  `rt.readText`'s 4 MiB cap — running `jsrt run ~/x.js` does not make `~`
+  readable.
 - Paths are canonicalized before checking (symlinks and `..` cannot escape a
   declared directory); `host` alone allows any port, `host:port` is exact.
+- A *name* grant (`api.example.com`, `localhost`) connects to public
+  addresses only: a DNS answer in loopback, private, link-local (cloud
+  metadata), CGNAT or other non-routable ranges is refused with a
+  `CapabilityError`. To reach a private host, grant its IP literal
+  (`10.0.0.5:8080`, `127.0.0.1:3000`) — that never goes through DNS.
 - `serve` binds loopback IP literals only — `"localhost"` and public addresses
   are refused at manifest parse.
 - `--read`/`--net`/`--kv`/`--serve` CLI flags *extend* the manifest — additive
@@ -85,7 +99,8 @@ deadline, which interrupts running JS *and* a stalled event loop. A tokio
 backstop covers the fully-idle case. **What this does not cover:** memory
 bombs — a runaway allocation needs a process boundary, which is what
 `jsrt supervise` is for (`RLIMIT_CPU` seconds, RSS polling, SIGTERM→SIGKILL,
-bounded JSONL run reports), and we don't pretend an in-process flag replaces
+bounded JSONL run reports, worker stdout and stderr each capped per run by
+`--max-output-kb` — default 8 MiB — with passed and dropped bytes in the report), and we don't pretend an in-process flag replaces
 it.
 
 ## Layout
@@ -112,3 +127,7 @@ docs/              ROADMAP and module notes
 
 Build: `export PATH="$(brew --prefix rustup)/bin:$PATH"; cargo build` —
 the first build downloads ~95 MB of prebuilt V8.
+
+## License
+
+MIT — see [LICENSE](LICENSE).

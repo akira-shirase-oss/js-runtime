@@ -65,11 +65,16 @@ fn capabilities(state: &Rc<RefCell<OpState>>) -> Result<Rc<Capabilities>, JsErro
 }
 
 fn http_client(state: &Rc<RefCell<OpState>>) -> Result<Rc<reqwest::Client>, JsErrorBox> {
-    state
-        .borrow()
-        .try_borrow::<Rc<reqwest::Client>>()
-        .cloned()
-        .ok_or_else(|| host_err("http client not installed".into()))
+    let state = state.borrow();
+    if let Some(client) = state.try_borrow::<Rc<reqwest::Client>>() {
+        return Ok(client.clone());
+    }
+    Err(host_err(
+        match state.try_borrow::<Rc<crate::net::ClientUnavailable>>() {
+            Some(why) => format!("http client unavailable: {}", why.0),
+            None => "http client not installed".into(),
+        },
+    ))
 }
 
 fn budgets(state: &Rc<RefCell<OpState>>) -> OpBudgets {
@@ -115,7 +120,11 @@ async fn op_sleep(ms: f64) -> Result<(), JsErrorBox> {
             "rt.sleep: ms must be a non-negative number",
         ));
     }
-    tokio::time::sleep(Duration::from_secs_f64(ms / 1000.0)).await;
+    // `from_secs_f64` panics past Duration's range (rt.sleep(1e30)), and a
+    // panic inside an op aborts the host. A sleep that long is "longer than
+    // any run": saturate, tokio clamps it further, the run timeout ends it.
+    let duration = Duration::try_from_secs_f64(ms / 1000.0).unwrap_or(Duration::MAX);
+    tokio::time::sleep(duration).await;
     Ok(())
 }
 
@@ -156,27 +165,44 @@ async fn op_fetch(
     let client = http_client(&state)?;
     let budgets = budgets(&state);
     caps.may_net(&url).map_err(deny)?;
+    // Every message below names the destination without its userinfo or
+    // query string — the places credentials and tokens ride in a URL.
+    let shown = crate::net::redact_url(&url);
     let deadline = budgets.fetch_deadline;
     let max_body = budgets.fetch_max_body;
     let started = std::time::Instant::now();
-    let mut response = tokio::time::timeout(deadline, client.get(&url).send())
+    // One deadline over the whole exchange — connect, redirects, headers
+    // and every body chunk. A deadline on send() alone let a server that
+    // drips a byte at a time hold the op for as long as it liked.
+    let exchange =
+        async {
+            let mut response = client
+                .get(&url)
+                .send()
+                .await
+                // A redirect hop outside the grant comes back from inside the
+                // client as our own refusal — it stays a CapabilityError.
+                .map_err(|e| match crate::net::refusal(&e) {
+                    Some(why) => JsErrorBox::new("CapabilityError", why),
+                    None => host_err(format!("fetch {shown}: {}", crate::net::describe(e))),
+                })?;
+            let status = response.status();
+            let mut body = Vec::new();
+            while let Some(chunk) = response.chunk().await.map_err(|e| {
+                host_err(format!("fetch {shown}: body: {}", crate::net::describe(e)))
+            })? {
+                body.extend_from_slice(&chunk);
+                if body.len() as u64 > max_body {
+                    return Err(host_err(format!(
+                        "fetch {shown}: body exceeded {max_body} bytes"
+                    )));
+                }
+            }
+            Ok((status, body))
+        };
+    let (status, body) = tokio::time::timeout(deadline, exchange)
         .await
-        .map_err(|_| host_err(format!("fetch {url}: deadline {deadline:?} exceeded")))?
-        .map_err(|e| host_err(format!("fetch {url}: {e}")))?;
-    let status = response.status();
-    let mut body = Vec::new();
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .map_err(|e| host_err(format!("fetch {url}: body: {e}")))?
-    {
-        body.extend_from_slice(&chunk);
-        if body.len() as u64 > max_body {
-            return Err(host_err(format!(
-                "fetch {url}: body exceeded {max_body} bytes"
-            )));
-        }
-    }
+        .map_err(|_| host_err(format!("fetch {shown}: deadline {deadline:?} exceeded")))??;
     Ok(FetchResult {
         status: status.as_u16(),
         status_text: status.canonical_reason().unwrap_or("").to_string(),
@@ -511,7 +537,6 @@ deno_core::extension!(
         op_sleep,
         op_read_text,
         op_fetch,
-        op_noop,
         op_kv_get,
         op_kv_put,
         op_kv_delete,
@@ -522,12 +547,6 @@ deno_core::extension!(
     esm_entry_point = "ext:jsrt_core/bootstrap.js",
     esm = [dir "js", "bootstrap.js"],
 );
-
-/// A no-op used by the perf harness to measure raw op-boundary overhead —
-/// wired into the extension but absent from `bootstrap.js`, so scripts see it
-/// only via `Deno.core.ops.op_noop` when explicitly told to.
-#[op2(fast)]
-fn op_noop() {}
 
 #[cfg(test)]
 mod tests {

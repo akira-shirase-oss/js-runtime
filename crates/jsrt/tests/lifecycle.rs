@@ -128,6 +128,27 @@ fn a_cpu_bound_loop_dies_terminated() {
 }
 
 #[test]
+fn an_unrepresentable_sleep_is_bounded_by_the_watchdog_not_a_host_panic() {
+    let rig = Rig::new();
+    // 1e30 ms overflows Duration; the sleep must just be "longer than this
+    // run" -- the watchdog ends it as terminated (6), the host never panics.
+    let script = rig.script("sleep.js", "rt.print('start\\n');\nawait rt.sleep(1e30);\n");
+    let out = rig.run_script(&script, &["--timeout", "400"]);
+    assert_eq!(
+        out.status.code(),
+        Some(6),
+        "status {:?}, stderr: {}",
+        out.status,
+        stderr(&out)
+    );
+    assert!(
+        !stderr(&out).contains("panicked"),
+        "stderr: {}",
+        stderr(&out)
+    );
+}
+
+#[test]
 fn a_stalled_promise_dies_terminated() {
     let rig = Rig::new();
     let script = rig.script("stall.js", "await new Promise(() => {});\n");
@@ -407,6 +428,78 @@ fn there_are_no_bare_timer_globals() {
     );
 }
 
+// ---- Sandbox: a script sees rt.* and none of the engine's plumbing ----------
+//
+// deno_core installs `globalThis.Deno.core.ops` (every builtin op, including
+// `op_panic`, raw resource reads/writes and `op_close`) and
+// `globalThis.__bootstrap` for extension code. The bootstrap captures what it
+// needs and removes both before any script runs.
+
+#[test]
+fn there_is_no_ambient_deno_namespace() {
+    let rig = Rig::new();
+    let script = rig.script(
+        "probe.js",
+        "const leaked = Object.getOwnPropertyNames(globalThis).filter((n) => /deno|bootstrap/i.test(n));\n\
+         rt.print([typeof Deno, typeof globalThis.__bootstrap, 'Deno' in globalThis, '__bootstrap' in globalThis, leaked.length].join(',') + '\\n');\n",
+    );
+    let out = rig.run_script(&script, &[]);
+    assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "undefined,undefined,false,false,0\n"
+    );
+}
+
+#[test]
+fn a_script_cannot_reach_builtin_ops_to_panic_the_host() {
+    let rig = Rig::new();
+    // `op_panic` is a deno_core builtin that panics the host process. If any
+    // path to the raw ops table survives, this run dies instead of printing.
+    let script = rig.script(
+        "panic.js",
+        "const reaches = [\n\
+           () => Deno.core.ops.op_panic('from script'),\n\
+           () => globalThis.__bootstrap.core.ops.op_panic('from script'),\n\
+         ];\n\
+         for (const reach of reaches) {\n\
+           try { reach(); rt.print('reached\\n'); } catch (e) { rt.print('blocked:' + e.name + '\\n'); }\n\
+         }\n",
+    );
+    let out = rig.run_script(&script, &[]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the host must survive: status {:?}, stderr: {}",
+        out.status,
+        stderr(&out)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "blocked:ReferenceError\nblocked:TypeError\n"
+    );
+}
+
+#[test]
+fn a_script_cannot_import_the_ops_through_ext_modules() {
+    let rig = Rig::new();
+    // The other way to the ops table: the `ext:` modules extension code
+    // imports. deno_core refuses them for non-extension referrers.
+    let script = rig.script(
+        "ext.js",
+        "for (const spec of ['ext:core/ops', 'ext:core/mod.js']) {\n\
+           try { await import(spec); rt.print('imported ' + spec + '\\n'); }\n\
+           catch (e) { rt.print('refused ' + spec + '\\n'); }\n\
+         }\n",
+    );
+    let out = rig.run_script(&script, &[]);
+    assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "refused ext:core/ops\nrefused ext:core/mod.js\n"
+    );
+}
+
 #[test]
 fn cli_flags_extend_never_weaken() {
     let rig = Rig::new();
@@ -538,6 +631,49 @@ fn a_slow_endpoint_dies_at_the_deadline() {
 }
 
 #[test]
+fn a_trickling_body_dies_at_the_same_deadline() {
+    let rig = Rig::new();
+    // Headers arrive at once, then one body byte every 100 ms for 2 s: each
+    // read makes progress, so only a deadline over the whole exchange --
+    // not just send() -- can end it.
+    let stub = Stub::start(|s| {
+        let mut buf = [0u8; 2048];
+        let _ = s.read(&mut buf);
+        let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 20\r\nConnection: close\r\n\r\n");
+        for _ in 0..20 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            if s.write_all(b"x").is_err() {
+                return;
+            }
+        }
+    });
+    let script = fetch_script(&rig, &stub.url("/drip"));
+    let started = std::time::Instant::now();
+    let out = rig.run_script(
+        &script,
+        &[
+            "--net",
+            &format!("127.0.0.1:{}", stub.port),
+            "--fetch-timeout",
+            "300",
+            "--timeout",
+            "15000",
+        ],
+    );
+    let elapsed = started.elapsed();
+    assert_eq!(code(&out), 8, "stderr: {}", stderr(&out));
+    assert!(
+        stderr(&out).contains("deadline"),
+        "stderr: {}",
+        stderr(&out)
+    );
+    assert!(
+        elapsed < std::time::Duration::from_millis(1800),
+        "the fetch must end near its 300 ms deadline, not when the body finishes; took {elapsed:?}"
+    );
+}
+
+#[test]
 fn an_authority_smuggle_is_refused_not_connecting_elsewhere() {
     let rig = Rig::new();
     let stub = Stub::start(respond("200 OK", b"x", 0));
@@ -595,6 +731,172 @@ fn an_oversized_body_is_cut_off() {
         stderr(&out).contains("exceeded"),
         "stderr: {}",
         stderr(&out)
+    );
+}
+
+/// Read the request, answer `302 Found` pointing at `location`.
+fn redirect_to(location: String) -> impl Fn(&mut std::net::TcpStream) {
+    move |s| {
+        let mut buf = [0u8; 2048];
+        let _ = s.read(&mut buf);
+        let head = format!(
+            "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+        let _ = s.write_all(head.as_bytes());
+    }
+}
+
+#[test]
+fn a_redirect_to_an_undeclared_destination_is_refused() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    let rig = Rig::new();
+    // `inner` stands for an internal service the script was never granted.
+    let reached = Arc::new(AtomicUsize::new(0));
+    let reached_in_stub = Arc::clone(&reached);
+    let inner = Stub::start(move |s| {
+        reached_in_stub.fetch_add(1, Ordering::SeqCst);
+        respond("200 OK", b"internal secret", 0)(s);
+    });
+    // The granted host answers with a redirect to the ungranted one.
+    let granted = Stub::start(redirect_to(inner.url("/admin")));
+    let script = fetch_script(&rig, &granted.url("/start"));
+    let out = rig.run_script(&script, &["--net", &format!("127.0.0.1:{}", granted.port)]);
+    assert_eq!(code(&out), 7, "stderr: {}", stderr(&out));
+    assert!(
+        stderr(&out).contains(&format!("127.0.0.1:{}", inner.port)),
+        "the refusal names the real destination; stderr: {}",
+        stderr(&out)
+    );
+    assert!(
+        !String::from_utf8_lossy(&out.stdout).contains("internal secret"),
+        "stdout: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert_eq!(
+        reached.load(Ordering::SeqCst),
+        0,
+        "the ungranted host must never see a connection"
+    );
+}
+
+#[test]
+fn a_granted_name_that_resolves_to_a_private_address_is_refused() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    let rig = Rig::new();
+    let reached = Arc::new(AtomicUsize::new(0));
+    let reached_in_stub = Arc::clone(&reached);
+    let stub = Stub::start(move |s| {
+        reached_in_stub.fetch_add(1, Ordering::SeqCst);
+        respond("200 OK", b"loopback service", 0)(s);
+    });
+    // A name grant is checked by its string; what it resolves to decides
+    // where the connection goes. `localhost` stands for any granted name
+    // whose DNS answer is (or is rebound to) loopback, a private range or
+    // a metadata address.
+    let script = fetch_script(&rig, &format!("http://localhost:{}/", stub.port));
+    let out = rig.run_script(&script, &["--net", &format!("localhost:{}", stub.port)]);
+    assert_eq!(code(&out), 7, "stderr: {}", stderr(&out));
+    assert!(
+        stderr(&out).contains("not a public address"),
+        "stderr: {}",
+        stderr(&out)
+    );
+    assert_eq!(reached.load(Ordering::SeqCst), 0, "no connection was made");
+}
+
+#[test]
+fn a_redirect_loop_inside_the_grant_is_bounded() {
+    let rig = Rig::new();
+    // The stub's port is only known after bind, so the loop target is
+    // relative — every hop lands back on the same granted listener.
+    let looping = Stub::start(redirect_to("/again".to_string()));
+    let script = fetch_script(&rig, &looping.url("/start"));
+    let out = rig.run_script(&script, &["--net", &format!("127.0.0.1:{}", looping.port)]);
+    assert_eq!(code(&out), 8, "stderr: {}", stderr(&out));
+    assert!(
+        stderr(&out).contains("redirects"),
+        "stderr: {}",
+        stderr(&out)
+    );
+}
+
+#[test]
+fn fetch_errors_do_not_echo_credentials_or_query_strings() {
+    let rig = Rig::new();
+    // A port with nothing listening: the transport error path.
+    let dead = TcpListener::bind("127.0.0.1:0")
+        .unwrap_or_else(|e| panic!("bind: {e}"))
+        .local_addr()
+        .unwrap_or_else(|e| panic!("addr: {e}"))
+        .port();
+    let slow = Stub::start(respond("200 OK", b"late", 3000));
+    let big = Stub::start(respond("200 OK", &vec![b'x'; 5 * 1024 * 1024], 0));
+    let secret = |port: u16| format!("http://alice:hunter2@127.0.0.1:{port}/x?token=SEKRET");
+    let script = rig.script(
+        "f.js",
+        &format!(
+            "for (const url of ['{}', '{}', '{}', 'http://alice:hunter2@:99x/?token=SEKRET']) {{\n\
+               try {{ await rt.fetch(url); rt.print('fetched\\n'); }}\n\
+               catch (e) {{ rt.print(e.name + ': ' + e.message + '\\n'); }}\n\
+             }}\n\
+             await rt.fetch('{}');\n",
+            secret(dead),
+            secret(slow.port),
+            secret(big.port),
+            secret(dead),
+        ),
+    );
+    let out = rig.run_script(
+        &script,
+        &[
+            "--net",
+            &format!("127.0.0.1:{dead}"),
+            "--net",
+            &format!("127.0.0.1:{}", slow.port),
+            "--net",
+            &format!("127.0.0.1:{}", big.port),
+            "--fetch-timeout",
+            "300",
+        ],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let err = stderr(&out);
+    assert_eq!(code(&out), 8, "stdout: {stdout}\nstderr: {err}");
+    assert_eq!(stdout.lines().count(), 4, "stdout: {stdout}");
+    for leaked in ["hunter2", "alice", "SEKRET"] {
+        assert!(!stdout.contains(leaked), "{leaked} in stdout: {stdout}");
+        assert!(!err.contains(leaked), "{leaked} in stderr: {err}");
+    }
+    // The operator still learns where the failure was.
+    assert!(
+        stdout.contains(&format!("127.0.0.1:{}", slow.port)),
+        "stdout: {stdout}"
+    );
+    assert!(err.contains(&format!("127.0.0.1:{dead}")), "stderr: {err}");
+}
+
+#[test]
+fn a_redirect_inside_the_grant_is_still_followed() {
+    let rig = Rig::new();
+    let target = Stub::start(respond("200 OK", b"landed", 0));
+    let hop = Stub::start(redirect_to(target.url("/final")));
+    let script = fetch_script(&rig, &hop.url("/start"));
+    let out = rig.run_script(
+        &script,
+        &[
+            "--net",
+            &format!("127.0.0.1:{}", hop.port),
+            "--net",
+            &format!("127.0.0.1:{}", target.port),
+        ],
+    );
+    assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("status=200 body=landed"),
+        "stdout: {}",
+        String::from_utf8_lossy(&out.stdout)
     );
 }
 
@@ -819,6 +1121,138 @@ fn a_manifest_granted_dir_is_also_importable() {
     );
     assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
     assert!(String::from_utf8_lossy(&out.stdout).contains("mod|note"));
+}
+
+// ---- The entry directory is program space for JavaScript only --------------
+//
+// Running `jsrt run ~/x.js` must not turn `~` into a read grant. JS modules
+// beside the entry still import freely; text, bytes and JSON imports -- and
+// any non-.js/.mjs file imported as a module -- need a declared read path and
+// stay under readText's size cap.
+
+#[test]
+fn a_text_import_beside_the_entry_needs_a_read_grant() {
+    let (rig, app) = app_rig();
+    fs::write(app.join("secret.txt"), "TOP-SECRET-TOKEN").unwrap_or_else(|e| panic!("write: {e}"));
+    let script = rig.script_at(
+        &app.join("main.js"),
+        "import s from './secret.txt' with { type: 'text' };\nrt.print(s);\n",
+    );
+    let out = rig.run_script(&script, &[]);
+    assert_eq!(code(&out), 7, "stderr: {}", stderr(&out));
+    assert!(
+        !String::from_utf8_lossy(&out.stdout).contains("TOP-SECRET"),
+        "stdout: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        stderr(&out).contains("secret.txt"),
+        "stderr: {}",
+        stderr(&out)
+    );
+}
+
+#[test]
+fn a_json_import_beside_the_entry_needs_a_read_grant() {
+    let (rig, app) = app_rig();
+    fs::write(app.join("creds.json"), "{\"token\": \"TOP-SECRET-TOKEN\"}")
+        .unwrap_or_else(|e| panic!("write: {e}"));
+    let script = rig.script_at(
+        &app.join("main.js"),
+        "import c from './creds.json' with { type: 'json' };\nrt.print(c.token);\n",
+    );
+    let out = rig.run_script(&script, &[]);
+    assert_eq!(code(&out), 7, "stderr: {}", stderr(&out));
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("TOP-SECRET"));
+}
+
+#[test]
+fn a_dynamic_bytes_import_beside_the_entry_is_refused() {
+    let (rig, app) = app_rig();
+    fs::write(app.join("key.bin"), "TOP-SECRET-TOKEN").unwrap_or_else(|e| panic!("write: {e}"));
+    let script = rig.script_at(
+        &app.join("main.js"),
+        "try {\n\
+           const m = await import('./key.bin', { with: { type: 'bytes' } });\n\
+           rt.print('read ' + m.default.length + '\\n');\n\
+         } catch (e) { rt.print('refused: ' + e.message + '\\n'); }\n",
+    );
+    let out = rig.run_script(&script, &[]);
+    assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("refused: import denied"),
+        "stdout: {stdout}"
+    );
+}
+
+#[test]
+fn a_non_js_file_imported_as_a_module_needs_a_read_grant() {
+    let (rig, app) = app_rig();
+    // Parsed as JavaScript, a secret file would fail to compile -- and the
+    // SyntaxError would quote its first token back to the script.
+    fs::write(
+        app.join("credentials"),
+        "[default]\naws_secret = TOP-SECRET-TOKEN\n",
+    )
+    .unwrap_or_else(|e| panic!("write: {e}"));
+    let script = rig.script_at(
+        &app.join("main.js"),
+        "try { await import('./credentials'); } catch (e) { rt.print(e.name + ': ' + e.message + '\\n'); }\n",
+    );
+    let out = rig.run_script(&script, &[]);
+    assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("import denied"), "stdout: {stdout}");
+    assert!(!stdout.contains("SyntaxError"), "stdout: {stdout}");
+}
+
+#[test]
+fn a_declared_read_path_opens_text_and_json_imports() {
+    let (rig, app) = app_rig();
+    let data = rig.dir.path().join("data");
+    fs::create_dir(&data).unwrap_or_else(|e| panic!("mkdir data: {e}"));
+    fs::write(data.join("note.txt"), "granted text").unwrap_or_else(|e| panic!("write: {e}"));
+    fs::write(data.join("cfg.json"), "{\"v\": 3}").unwrap_or_else(|e| panic!("write: {e}"));
+    let manifest = rig.script("m.manifest.json", "{ \"read\": [\"data\"] }\n");
+    let script = rig.script_at(
+        &app.join("main.js"),
+        "import t from '../data/note.txt' with { type: 'text' };\n\
+         import c from '../data/cfg.json' with { type: 'json' };\n\
+         rt.print(t + '|' + c.v + '\\n');\n",
+    );
+    let out = rig.run_script(
+        &script,
+        &[
+            "--manifest",
+            manifest.to_str().unwrap_or_else(|| panic!("utf8")),
+        ],
+    );
+    assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "granted text|3\n");
+}
+
+#[test]
+fn a_text_import_over_the_read_cap_is_refused() {
+    let (rig, app) = app_rig();
+    let data = rig.dir.path().join("data");
+    fs::create_dir(&data).unwrap_or_else(|e| panic!("mkdir data: {e}"));
+    fs::write(data.join("big.txt"), vec![b'x'; 5 * 1024 * 1024])
+        .unwrap_or_else(|e| panic!("write: {e}"));
+    let manifest = rig.script("m.manifest.json", "{ \"read\": [\"data\"] }\n");
+    let script = rig.script_at(
+        &app.join("main.js"),
+        "import t from '../data/big.txt' with { type: 'text' };\nrt.print(t.length);\n",
+    );
+    let out = rig.run_script(
+        &script,
+        &[
+            "--manifest",
+            manifest.to_str().unwrap_or_else(|| panic!("utf8")),
+        ],
+    );
+    assert_eq!(code(&out), 7, "stderr: {}", stderr(&out));
+    assert!(stderr(&out).contains("limit"), "stderr: {}", stderr(&out));
 }
 
 // ---- rt.kv — the embedded store -------------------------------------------

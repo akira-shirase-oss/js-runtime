@@ -51,9 +51,12 @@ impl Rig {
         let mut args = vec!["run"];
         args.push(script.to_str().unwrap_or_else(|| panic!("utf8")));
         args.extend_from_slice(extra);
+        // stderr is piped so tests can read what the host told the
+        // operator (it is small: a few lines at most).
         Command::new(JSRT)
             .args(&args)
             .current_dir(self.dir.path())
+            .stderr(std::process::Stdio::piped())
             .spawn()
             .unwrap_or_else(|e| panic!("spawn jsrt: {e}"))
     }
@@ -343,6 +346,232 @@ fn a_non_loopback_serve_grant_fails_at_manifest_parse() {
     assert!(
         stderr(&out).contains("not loopback"),
         "stderr: {}",
+        stderr(&out)
+    );
+}
+
+// ---- Bounds a client cannot talk its way past ------------------------------
+//
+// Loopback-only is not a DoS bound: anything on the box can connect. Each
+// listener caps its connections, closes a connection that is idle or slow
+// to send its head, and answers 408 to a body that stalls.
+
+/// A serve app that answers every request and closes itself after `ms`.
+fn bounded_app(rig: &Rig, port: u16, serve_extra: &str, close_ms: u64) -> Child {
+    let manifest = rig.script(
+        "m.manifest.json",
+        &format!("{{ \"serve\": {{\"host\": \"127.0.0.1\", \"port\": {port}{serve_extra}}} }}\n"),
+    );
+    let script = rig.script(
+        "app.js",
+        &format!(
+            "const s = rt.serve({{host: '127.0.0.1', port: {port}}}, async (r) => ({{status: 200, body: 'ok ' + r.path}}));\n\
+             rt.setTimeout(() => s.close(), {close_ms});\n"
+        ),
+    );
+    rig.spawn_serve(
+        &script,
+        &[
+            "--manifest",
+            manifest.to_str().unwrap_or_else(|| panic!("utf8")),
+            "--timeout",
+            "0",
+        ],
+    )
+}
+
+/// Read until the server closes; how long that took. Panics if the read
+/// timeout passes first — the server kept the connection.
+fn time_until_closed(stream: &mut TcpStream, started: Instant) -> Duration {
+    stream
+        .set_read_timeout(Some(Duration::from_secs(4)))
+        .unwrap_or_else(|e| panic!("timeout: {e}"));
+    let mut buf = [0u8; 1024];
+    loop {
+        match stream.read(&mut buf) {
+            Ok(0) => return started.elapsed(),
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => return started.elapsed(),
+            Err(e) => panic!(
+                "server kept the connection open ({e}) after {:?}",
+                started.elapsed()
+            ),
+        }
+    }
+}
+
+/// Read one response off a keep-alive stream: status and body.
+fn read_response(stream: &mut TcpStream) -> Option<(u16, String)> {
+    let mut raw = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        match stream.read(&mut buf) {
+            Ok(0) => return None,
+            Ok(n) => raw.extend_from_slice(&buf[..n]),
+            Err(_) => return None,
+        }
+        let text = String::from_utf8_lossy(&raw).into_owned();
+        if let Some(end) = text.find("\r\n\r\n") {
+            let len = text[..end]
+                .lines()
+                .find_map(|l| {
+                    l.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .and_then(|v| v.trim().parse::<usize>().ok())
+                })
+                .unwrap_or(0);
+            if text.len() >= end + 4 + len {
+                let status = text.split_whitespace().nth(1)?.parse().ok()?;
+                return Some((status, text[end + 4..end + 4 + len].to_string()));
+            }
+        }
+    }
+}
+
+#[test]
+fn an_idle_or_slow_head_connection_is_closed_at_the_header_timeout() {
+    let rig = Rig::new();
+    let port = Rig::free_port();
+    let child = bounded_app(&rig, port, ", \"header_timeout_ms\": 300", 4000);
+    // Idle: connected, sends nothing.
+    let mut idle = connect(port);
+    let started = Instant::now();
+    // Slowloris: a head that never finishes.
+    let mut slow = connect(port);
+    slow.write_all(format!("GET / HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n").as_bytes())
+        .unwrap_or_else(|e| panic!("write: {e}"));
+    for (name, stream) in [("idle", &mut idle), ("slow head", &mut slow)] {
+        let took = time_until_closed(stream, started);
+        assert!(took < Duration::from_secs(3), "{name} held for {took:?}");
+    }
+    let out = child
+        .wait_with_output()
+        .unwrap_or_else(|e| panic!("wait: {e}"));
+    assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
+}
+
+#[test]
+fn a_body_that_stalls_is_answered_408_at_the_body_timeout() {
+    let rig = Rig::new();
+    let port = Rig::free_port();
+    let child = bounded_app(&rig, port, ", \"body_timeout_ms\": 300", 4000);
+    let started = Instant::now();
+    let (status, _head, _body) = http(
+        port,
+        &format!(
+            "POST /slow HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Length: 10\r\nConnection: close\r\n\r\nab"
+        ),
+    );
+    assert_eq!(status, 408, "a stalled body must be answered, not held");
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "{:?}",
+        started.elapsed()
+    );
+    let out = child
+        .wait_with_output()
+        .unwrap_or_else(|e| panic!("wait: {e}"));
+    assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
+}
+
+#[test]
+fn connections_past_the_cap_wait_for_a_free_slot() {
+    let rig = Rig::new();
+    let port = Rig::free_port();
+    let child = bounded_app(&rig, port, ", \"max_connections\": 2", 5000);
+    let request = |path: &str| format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n");
+    // Two keep-alive connections, each proven accepted by a full answer,
+    // then left open: they hold both slots.
+    let mut held = Vec::new();
+    for path in ["/one", "/two"] {
+        let mut s = connect(port);
+        s.set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap_or_else(|e| panic!("timeout: {e}"));
+        s.write_all(request(path).as_bytes())
+            .unwrap_or_else(|e| panic!("write: {e}"));
+        assert_eq!(read_response(&mut s).map(|r| r.0), Some(200), "{path}");
+        held.push(s);
+    }
+    // A third connects (the kernel backlog takes it) but is not served.
+    let mut third = connect(port);
+    third
+        .write_all(request("/three").as_bytes())
+        .unwrap_or_else(|e| panic!("write: {e}"));
+    third
+        .set_read_timeout(Some(Duration::from_millis(700)))
+        .unwrap_or_else(|e| panic!("timeout: {e}"));
+    assert_eq!(read_response(&mut third), None, "served past the cap");
+    // Free one slot; the waiting connection is served.
+    drop(held.remove(0));
+    third
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap_or_else(|e| panic!("timeout: {e}"));
+    let answer = read_response(&mut third);
+    assert_eq!(answer.as_ref().map(|r| r.0), Some(200), "{answer:?}");
+    drop(held);
+    drop(third);
+    let out = child
+        .wait_with_output()
+        .unwrap_or_else(|e| panic!("wait: {e}"));
+    assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
+}
+
+// ---- Every request gets a real answer ---------------------------------------
+
+#[test]
+fn a_malformed_handler_answer_is_a_500_and_the_listener_lives() {
+    let rig = Rig::new();
+    let port = Rig::free_port();
+    let manifest = rig.script(
+        "m.manifest.json",
+        &format!("{{ \"serve\": {{\"host\": \"127.0.0.1\", \"port\": {port}}} }}\n"),
+    );
+    let script = rig.script(
+        "app.js",
+        &"const server = rt.serve({host: '127.0.0.1', port: PORT}, async (req) => {\n\
+            switch (req.path) {\n\
+              case '/none': return undefined;\n\
+              case '/bad-header': return {status: 200, headers: {'bad header': 'x'}, body: 'nope'};\n\
+              case '/bad-status': return {status: 70000, body: 'nope'};\n\
+              case '/number-header': return {headers: {'x-n': 5}, body: 'five'};\n\
+              default: return {status: 201, body: 'alive'};\n\
+            }\n\
+          });\n\
+          rt.setTimeout(() => server.close(), 3000);\n"
+            .replace("PORT", &port.to_string()),
+    );
+    let child = rig.spawn_serve(
+        &script,
+        &[
+            "--manifest",
+            manifest.to_str().unwrap_or_else(|| panic!("utf8")),
+        ],
+    );
+    let get = |path: &str| {
+        http(
+            port,
+            &format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"),
+        )
+    };
+    // No answer object, an invalid header name, an out-of-range status:
+    // each is a 500 -- never an empty 200, never a hung client.
+    for path in ["/none", "/bad-header", "/bad-status"] {
+        let (status, _head, body) = get(path);
+        assert_eq!(status, 500, "{path}: body {body:?}");
+    }
+    // A non-string header value is coerced, not a dropped request.
+    let (status, _head, body) = get("/number-header");
+    assert_eq!((status, body.as_str()), (200, "five"));
+    // And the listener is still serving.
+    let (status, _head, body) = get("/alive");
+    assert_eq!((status, body.as_str()), (201, "alive"));
+    let out = child
+        .wait_with_output()
+        .unwrap_or_else(|e| panic!("wait: {e}"));
+    assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
+    assert!(
+        stderr(&out).contains("answered 500"),
+        "the operator is told why: {}",
         stderr(&out)
     );
 }
