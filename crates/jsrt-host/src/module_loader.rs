@@ -4,25 +4,37 @@
 //! ops check `may_read`, but imports bypassed it entirely. This loader is the
 //! same `FsModuleLoader` with the manifest's read paths enforced at both
 //! doors: `resolve` (where the specifier is decided) and `load` (where the
-//! bytes come through).
+//! bytes come through, and where the requested module type is known).
+//!
+//! Two fences, because an import is either code or data:
+//! - a **JavaScript module** (no import attribute, a `.js`/`.mjs` file) may
+//!   come from the entry's own directory — the operator chose that program,
+//!   so its local module graph is program space — or from a declared read
+//!   path;
+//! - a **data import** (`with { type: "text" | "bytes" | "json" }`, or any
+//!   other file imported as a module) is a file read like `rt.readText`:
+//!   declared read paths only, under the same size cap. Without this,
+//!   `jsrt run ~/x.js` would make every file under `~` importable as text.
 //!
 //! The split that keeps the taxonomy honest:
 //! - the **entry** module is the operator's choice — it resolves and loads
-//!   unconditionally (`maybe_referrer: None` marks the root load);
-//! - a **dependency** that canonicalizes *outside* declared read paths is a
-//!   capability refusal — `CapabilityError`, exit 7;
+//!   unconditionally (a static load with no referrer is the root load);
+//! - a **dependency** outside its fence is a capability refusal —
+//!   `CapabilityError`, exit 7;
 //! - a dependency that doesn't resolve at all is still a *load* failure (3) —
 //!   refusing to load a file that isn't there is the loader's job, not ours.
 
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use deno_core::{
     FsModuleLoader, ModuleLoadOptions, ModuleLoadReferrer, ModuleLoadResponse, ModuleLoader,
-    ModuleResolveResponse, ModuleSpecifier, ResolutionKind,
+    ModuleResolveResponse, ModuleSpecifier, RequestedModuleType, ResolutionKind,
 };
 use deno_error::JsErrorBox;
 
 use crate::capability::Capabilities;
+use crate::error::HostError;
 
 /// Host vocabulary the classifier recognizes: dynamic-import rejections lose
 /// their error class at the V8 boundary (deno_core flattens them to
@@ -33,45 +45,86 @@ pub const IMPORT_DENIED_PREFIX: &str = "import denied:";
 /// `FsModuleLoader` + the read-path manifest, enforced on every import.
 pub struct JsrtModuleLoader {
     inner: FsModuleLoader,
-    capabilities: Capabilities,
+    /// The manifest plus the entry's directory — where JS modules may live.
+    program: Capabilities,
+    /// The manifest alone — where data imports may come from.
+    data: Capabilities,
 }
 
 impl JsrtModuleLoader {
-    pub fn new(capabilities: Capabilities) -> Self {
+    pub fn new(manifest: Capabilities, entry_dir: Option<PathBuf>) -> Self {
+        let mut grants = manifest.clone().into_grants();
+        grants.read_paths.extend(entry_dir);
         Self {
             inner: FsModuleLoader,
-            capabilities,
+            program: Capabilities::from_grants(grants),
+            data: manifest,
         }
     }
 }
 
-/// Refuse a file specifier that resolves outside declared read paths.
-/// Non-file schemes and unresolvable paths pass through — the inner loader
-/// produces their own (load-class) errors.
-fn gate(specifier: &ModuleSpecifier, capabilities: &Capabilities) -> Result<(), JsErrorBox> {
+fn denied(msg: String) -> JsErrorBox {
+    JsErrorBox::new("CapabilityError", format!("{IMPORT_DENIED_PREFIX} {msg}"))
+}
+
+/// The canonical file path behind a `file:` specifier, or `None` when the
+/// gate should leave it to the inner loader: other schemes, and paths that
+/// don't resolve (missing is a Load (3), not a refusal we invented).
+fn resolved_file(specifier: &ModuleSpecifier) -> Option<PathBuf> {
     if specifier.scheme() != "file" {
-        return Ok(());
+        return None;
     }
-    let path = match specifier.to_file_path() {
-        Ok(p) => p,
-        Err(()) => return Ok(()),
-    };
-    // Missing/unresolvable: leave it to the loader — that's a Load (3),
-    // not a refusal we invented.
-    let resolved = match std::fs::canonicalize(&path) {
-        Ok(r) => r,
-        Err(_) => return Ok(()),
-    };
-    if capabilities.is_read_allowed(&resolved) {
-        Ok(())
-    } else {
-        Err(JsErrorBox::new(
-            "CapabilityError",
-            format!(
-                "{IMPORT_DENIED_PREFIX} {} is outside every declared read path",
+    let path = specifier.to_file_path().ok()?;
+    std::fs::canonicalize(path).ok()
+}
+
+/// A JavaScript module by both signals: no import attribute asked for
+/// another type, and the real file (after symlinks) is `.js`/`.mjs`.
+fn is_js_module(resolved: &Path, requested: &RequestedModuleType) -> bool {
+    matches!(requested, RequestedModuleType::None)
+        && resolved
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("js") || e.eq_ignore_ascii_case("mjs"))
+}
+
+impl JsrtModuleLoader {
+    /// The resolve-time check: the type is not known yet, so only the wider
+    /// program fence applies; `load` narrows it.
+    fn gate_resolve(&self, specifier: &ModuleSpecifier) -> Result<(), JsErrorBox> {
+        let Some(resolved) = resolved_file(specifier) else {
+            return Ok(());
+        };
+        if self.program.is_read_allowed(&resolved) {
+            Ok(())
+        } else {
+            Err(denied(format!(
+                "{} is outside every declared read path",
                 resolved.display()
-            ),
-        ))
+            )))
+        }
+    }
+
+    /// The load-time check, with the requested module type in hand.
+    fn gate_load(
+        &self,
+        specifier: &ModuleSpecifier,
+        requested: &RequestedModuleType,
+    ) -> Result<(), JsErrorBox> {
+        let Some(resolved) = resolved_file(specifier) else {
+            return Ok(());
+        };
+        if is_js_module(&resolved, requested) {
+            return self.gate_resolve(specifier);
+        }
+        match self.data.may_read_resolved(&resolved) {
+            Ok(()) => Ok(()),
+            Err(HostError::Capability(msg)) => Err(denied(format!(
+                "{msg} (the entry directory admits .js/.mjs modules only; text, bytes, \
+                 JSON and other files need a declared read path)"
+            ))),
+            Err(other) => Err(denied(other.to_string())),
+        }
     }
 }
 
@@ -86,7 +139,7 @@ impl ModuleLoader for JsrtModuleLoader {
         // Only the operator's entry is ungated; every import a *script*
         // makes (static or dynamic) must stay inside the fence.
         if !matches!(kind, ResolutionKind::MainModule) {
-            gate(&resolved, &self.capabilities)?;
+            self.gate_resolve(&resolved)?;
         }
         Ok(resolved)
     }
@@ -97,11 +150,13 @@ impl ModuleLoader for JsrtModuleLoader {
         maybe_referrer: Option<&ModuleLoadReferrer>,
         options: ModuleLoadOptions,
     ) -> ModuleLoadResponse {
-        // The root arrives with no referrer; dependencies always carry one.
-        // Re-checking at load() closes the door a resolved specifier could
-        // have been smuggled through.
-        if maybe_referrer.is_some() {
-            if let Err(e) = gate(module_specifier, &self.capabilities) {
+        // The root of a static load arrives with no referrer. So does the
+        // root of a *dynamic* import (deno_core passes None there too), which
+        // is why `is_dynamic_import` is part of the test: a script's
+        // `import()` is never the entry.
+        let is_entry = maybe_referrer.is_none() && !options.is_dynamic_import;
+        if !is_entry {
+            if let Err(e) = self.gate_load(module_specifier, &options.requested_module_type) {
                 return ModuleLoadResponse::Sync(Err(e));
             }
         }
@@ -109,7 +164,8 @@ impl ModuleLoader for JsrtModuleLoader {
     }
 }
 
-/// The loader handed to `JsRuntime` — the manifest is baked in at build.
-pub fn gated_loader(capabilities: &Capabilities) -> Rc<dyn ModuleLoader> {
-    Rc::new(JsrtModuleLoader::new(capabilities.clone()))
+/// The loader handed to `JsRuntime` — the manifest and the entry directory
+/// are baked in at build.
+pub fn gated_loader(manifest: &Capabilities, entry_dir: Option<PathBuf>) -> Rc<dyn ModuleLoader> {
+    Rc::new(JsrtModuleLoader::new(manifest.clone(), entry_dir))
 }

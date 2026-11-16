@@ -292,14 +292,22 @@ impl Capabilities {
                 path.display()
             ))
         })?;
-        if !self.is_read_allowed(&resolved) {
+        self.may_read_resolved(&resolved)?;
+        Ok(resolved)
+    }
+
+    /// `may_read`'s allowlist and size cap on an already-canonical path —
+    /// the module loader's door for text/bytes/JSON imports, which must not
+    /// be wider than `readText`'s.
+    pub fn may_read_resolved(&self, resolved: &Path) -> Result<(), HostError> {
+        if !self.is_read_allowed(resolved) {
             return Err(HostError::Capability(format!(
                 "read denied: {} is outside every declared read path",
                 resolved.display()
             )));
         }
         if resolved.is_file() {
-            let len = fs::metadata(&resolved).map_or(0, |m| m.len());
+            let len = fs::metadata(resolved).map_or(0, |m| m.len());
             if len > MAX_READ_BYTES {
                 return Err(HostError::Capability(format!(
                     "read denied: {} is {len} bytes (limit {MAX_READ_BYTES})",
@@ -307,7 +315,7 @@ impl Capabilities {
                 )));
             }
         }
-        Ok(resolved)
+        Ok(())
     }
 
     /// Check whether a URL's authority is on the net allowlist. Entries of

@@ -95,17 +95,17 @@ impl Default for HostOptions {
 
 /// Build a runtime wired with our ops and the given capabilities.
 ///
-/// `entry_dir` is the program's own directory — an implicit read path for
-/// the *module loader only*. The operator chose this program, so its local
-/// module graph is program-space; ops still see only the manifest's grants.
+/// `entry_dir` is the program's own directory — an implicit source of
+/// *JavaScript modules only* for the loader. The operator chose this
+/// program, so its local module graph is program-space; text/bytes/JSON
+/// imports and every op still see only the manifest's grants.
 fn build_runtime(options: &HostOptions, entry_dir: Option<&Path>) -> JsRuntime {
-    let mut grants = options.capabilities.clone().into_grants();
-    if let Some(dir) = entry_dir.and_then(|d| d.canonicalize().ok()) {
-        grants.read_paths.push(dir);
-    }
-    let loader_capabilities = Capabilities::from_grants(grants);
+    let entry_dir = entry_dir.and_then(|d| d.canonicalize().ok());
     let runtime = JsRuntime::new(RuntimeOptions {
-        module_loader: Some(crate::module_loader::gated_loader(&loader_capabilities)),
+        module_loader: Some(crate::module_loader::gated_loader(
+            &options.capabilities,
+            entry_dir,
+        )),
         extensions: vec![jsrt_core::init(), crate::serve::jsrt_serve::init()],
         ..Default::default()
     });

@@ -55,6 +55,11 @@ does not exist for the script — that is the point.
 
 - Deny by default: no manifest, no filesystem and no network — the script can
   compute and print, nothing else.
+- Imports: the entry's own directory is program space for `.js`/`.mjs`
+  modules only. Text, bytes and JSON imports (`with { type: ... }`) and any
+  other file imported as a module need a declared `read` path and stay under
+  `rt.readText`'s 4 MiB cap — running `jsrt run ~/x.js` does not make `~`
+  readable.
 - Paths are canonicalized before checking (symlinks and `..` cannot escape a
   declared directory); `host` alone allows any port, `host:port` is exact.
 - A *name* grant (`api.example.com`, `localhost`) connects to public

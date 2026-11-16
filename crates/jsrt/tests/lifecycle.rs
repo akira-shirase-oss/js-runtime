@@ -1004,6 +1004,138 @@ fn a_manifest_granted_dir_is_also_importable() {
     assert!(String::from_utf8_lossy(&out.stdout).contains("mod|note"));
 }
 
+// ---- The entry directory is program space for JavaScript only --------------
+//
+// Running `jsrt run ~/x.js` must not turn `~` into a read grant. JS modules
+// beside the entry still import freely; text, bytes and JSON imports -- and
+// any non-.js/.mjs file imported as a module -- need a declared read path and
+// stay under readText's size cap.
+
+#[test]
+fn a_text_import_beside_the_entry_needs_a_read_grant() {
+    let (rig, app) = app_rig();
+    fs::write(app.join("secret.txt"), "TOP-SECRET-TOKEN").unwrap_or_else(|e| panic!("write: {e}"));
+    let script = rig.script_at(
+        &app.join("main.js"),
+        "import s from './secret.txt' with { type: 'text' };\nrt.print(s);\n",
+    );
+    let out = rig.run_script(&script, &[]);
+    assert_eq!(code(&out), 7, "stderr: {}", stderr(&out));
+    assert!(
+        !String::from_utf8_lossy(&out.stdout).contains("TOP-SECRET"),
+        "stdout: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        stderr(&out).contains("secret.txt"),
+        "stderr: {}",
+        stderr(&out)
+    );
+}
+
+#[test]
+fn a_json_import_beside_the_entry_needs_a_read_grant() {
+    let (rig, app) = app_rig();
+    fs::write(app.join("creds.json"), "{\"token\": \"TOP-SECRET-TOKEN\"}")
+        .unwrap_or_else(|e| panic!("write: {e}"));
+    let script = rig.script_at(
+        &app.join("main.js"),
+        "import c from './creds.json' with { type: 'json' };\nrt.print(c.token);\n",
+    );
+    let out = rig.run_script(&script, &[]);
+    assert_eq!(code(&out), 7, "stderr: {}", stderr(&out));
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("TOP-SECRET"));
+}
+
+#[test]
+fn a_dynamic_bytes_import_beside_the_entry_is_refused() {
+    let (rig, app) = app_rig();
+    fs::write(app.join("key.bin"), "TOP-SECRET-TOKEN").unwrap_or_else(|e| panic!("write: {e}"));
+    let script = rig.script_at(
+        &app.join("main.js"),
+        "try {\n\
+           const m = await import('./key.bin', { with: { type: 'bytes' } });\n\
+           rt.print('read ' + m.default.length + '\\n');\n\
+         } catch (e) { rt.print('refused: ' + e.message + '\\n'); }\n",
+    );
+    let out = rig.run_script(&script, &[]);
+    assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("refused: import denied"),
+        "stdout: {stdout}"
+    );
+}
+
+#[test]
+fn a_non_js_file_imported_as_a_module_needs_a_read_grant() {
+    let (rig, app) = app_rig();
+    // Parsed as JavaScript, a secret file would fail to compile -- and the
+    // SyntaxError would quote its first token back to the script.
+    fs::write(
+        app.join("credentials"),
+        "[default]\naws_secret = TOP-SECRET-TOKEN\n",
+    )
+    .unwrap_or_else(|e| panic!("write: {e}"));
+    let script = rig.script_at(
+        &app.join("main.js"),
+        "try { await import('./credentials'); } catch (e) { rt.print(e.name + ': ' + e.message + '\\n'); }\n",
+    );
+    let out = rig.run_script(&script, &[]);
+    assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("import denied"), "stdout: {stdout}");
+    assert!(!stdout.contains("SyntaxError"), "stdout: {stdout}");
+}
+
+#[test]
+fn a_declared_read_path_opens_text_and_json_imports() {
+    let (rig, app) = app_rig();
+    let data = rig.dir.path().join("data");
+    fs::create_dir(&data).unwrap_or_else(|e| panic!("mkdir data: {e}"));
+    fs::write(data.join("note.txt"), "granted text").unwrap_or_else(|e| panic!("write: {e}"));
+    fs::write(data.join("cfg.json"), "{\"v\": 3}").unwrap_or_else(|e| panic!("write: {e}"));
+    let manifest = rig.script("m.manifest.json", "{ \"read\": [\"data\"] }\n");
+    let script = rig.script_at(
+        &app.join("main.js"),
+        "import t from '../data/note.txt' with { type: 'text' };\n\
+         import c from '../data/cfg.json' with { type: 'json' };\n\
+         rt.print(t + '|' + c.v + '\\n');\n",
+    );
+    let out = rig.run_script(
+        &script,
+        &[
+            "--manifest",
+            manifest.to_str().unwrap_or_else(|| panic!("utf8")),
+        ],
+    );
+    assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "granted text|3\n");
+}
+
+#[test]
+fn a_text_import_over_the_read_cap_is_refused() {
+    let (rig, app) = app_rig();
+    let data = rig.dir.path().join("data");
+    fs::create_dir(&data).unwrap_or_else(|e| panic!("mkdir data: {e}"));
+    fs::write(data.join("big.txt"), vec![b'x'; 5 * 1024 * 1024])
+        .unwrap_or_else(|e| panic!("write: {e}"));
+    let manifest = rig.script("m.manifest.json", "{ \"read\": [\"data\"] }\n");
+    let script = rig.script_at(
+        &app.join("main.js"),
+        "import t from '../data/big.txt' with { type: 'text' };\nrt.print(t.length);\n",
+    );
+    let out = rig.run_script(
+        &script,
+        &[
+            "--manifest",
+            manifest.to_str().unwrap_or_else(|| panic!("utf8")),
+        ],
+    );
+    assert_eq!(code(&out), 7, "stderr: {}", stderr(&out));
+    assert!(stderr(&out).contains("limit"), "stderr: {}", stderr(&out));
+}
+
 // ---- rt.kv — the embedded store -------------------------------------------
 //
 // The honest surface: no grant means CapabilityError, puts persist on disk
