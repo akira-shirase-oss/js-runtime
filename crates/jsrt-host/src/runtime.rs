@@ -193,6 +193,9 @@ pub async fn run_file_report(entry: &Path, options: &HostOptions) -> RunReport {
     // Whatever the outcome, the run is over — the watchdog must not fire into
     // a dropped isolate or escalate against a finished process.
     done.store(true, Ordering::SeqCst);
+    // The script may have died before its listener closed; the host still
+    // reports the serve log lines it held back.
+    crate::serve::flush_serve_log(&mut runtime.op_state().borrow_mut());
     let pending = pending_counts(&runtime);
     RunReport { result, pending }
 }
@@ -235,6 +238,9 @@ pub async fn run_source_report(name: &str, source: &str, options: &HostOptions) 
     }
     .await;
     done.store(true, Ordering::SeqCst);
+    // The script may have died before its listener closed; the host still
+    // reports the serve log lines it held back.
+    crate::serve::flush_serve_log(&mut runtime.op_state().borrow_mut());
     let pending = pending_counts(&runtime);
     RunReport { result, pending }
 }

@@ -1134,3 +1134,39 @@ fn a_chunked_body_past_the_free_share_is_refused_fast_when_the_budget_is_full() 
         .unwrap_or_else(|e| panic!("wait: {e}"));
     assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
 }
+
+#[test]
+fn the_suppressed_line_count_survives_the_worker_dying() {
+    let rig = Rig::new();
+    let port = Rig::free_port();
+    let child = route_app(
+        &rig,
+        port,
+        "",
+        "if (req.path === '/bad') return undefined;\n\
+         if (req.path === '/die') { rt.setTimeout(() => { throw new Error('worker dies'); }, 0); return {status: 200, body: 'dying'}; }",
+    );
+    for _ in 0..15 {
+        let (status, _head, _body) = http(
+            port,
+            &format!("GET /bad HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"),
+        );
+        assert_eq!(status, 500);
+    }
+    // The run ends with an uncaught exception: no window rolls over and
+    // the listener never closes, yet the 5 held lines must be reported.
+    let _ = http(
+        port,
+        &format!("GET /die HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"),
+    );
+    let out = child
+        .wait_with_output()
+        .unwrap_or_else(|e| panic!("wait: {e}"));
+    let err = stderr(&out);
+    assert_eq!(code(&out), 5, "stderr: {err}");
+    assert!(err.contains("worker dies"), "stderr: {err}");
+    assert!(
+        err.contains("5 more such lines suppressed"),
+        "stderr: {err}"
+    );
+}

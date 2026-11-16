@@ -654,12 +654,85 @@ fn op_serve_close(state: Rc<RefCell<OpState>>, rid: ResourceId) -> Result<(), Js
     Ok(())
 }
 
+/// Lines the serve loop prints per window before it starts counting.
+const SERVE_LOG_BURST: u32 = 10;
+/// The rate-limit window for serve log lines.
+const SERVE_LOG_WINDOW: Duration = Duration::from_secs(60);
+/// Longest serve log line, in bytes; the script already bounds its parts.
+const SERVE_LOG_LINE_MAX: usize = 512;
+
+/// The serve loop's stderr lines, rate-limited here rather than in the
+/// script, so the count of suppressed lines lives in the host and is
+/// printed at teardown even when the script dies first.
+#[derive(Debug, Default)]
+pub struct ServeLog {
+    window_start: Option<std::time::Instant>,
+    printed: u32,
+    held: u64,
+}
+
+impl ServeLog {
+    fn line(&mut self, text: &str) {
+        let now = std::time::Instant::now();
+        if self
+            .window_start
+            .is_none_or(|start| now.duration_since(start) >= SERVE_LOG_WINDOW)
+        {
+            self.flush();
+            self.window_start = Some(now);
+            self.printed = 0;
+        }
+        if self.printed < SERVE_LOG_BURST {
+            self.printed += 1;
+            let mut end = text.len().min(SERVE_LOG_LINE_MAX);
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            eprintln!("{}", &text[..end]);
+        } else {
+            self.held += 1;
+        }
+    }
+
+    fn flush(&mut self) {
+        if self.held > 0 {
+            eprintln!("jsrt: serve: {} more such lines suppressed", self.held);
+            self.held = 0;
+        }
+    }
+}
+
+/// Print any suppressed-line count still held — called by the runtime
+/// when a run ends, however it ends.
+pub fn flush_serve_log(state: &mut OpState) {
+    if let Some(log) = state.try_borrow_mut::<ServeLog>() {
+        log.flush();
+    }
+}
+
+/// `op_serve_log(line)` — one serve-loop stderr line, rate-limited.
+#[op2(fast)]
+fn op_serve_log(state: &mut OpState, #[string] line: String) {
+    if !state.has::<ServeLog>() {
+        state.put(ServeLog::default());
+    }
+    state.borrow_mut::<ServeLog>().line(&line);
+}
+
+/// `op_serve_log_flush()` — a listener closed: report what was held.
+#[op2(fast)]
+fn op_serve_log_flush(state: &mut OpState) {
+    flush_serve_log(state);
+}
+
 deno_core::extension!(
     jsrt_serve,
     ops = [
         op_serve_listen,
         op_serve_next,
         op_serve_respond,
-        op_serve_close
+        op_serve_close,
+        op_serve_log,
+        op_serve_log_flush
     ],
 );

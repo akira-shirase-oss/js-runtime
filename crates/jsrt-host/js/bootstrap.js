@@ -62,11 +62,9 @@ function schedule(cb, ms, args, repeat) {
 
 // The serve loop's own stderr lines. A client chooses the request path,
 // so a line names only its first segment (no query, nothing deeper), cut
-// to a fixed length, and at most SERVE_LOG_BURST lines are printed per
-// SERVE_LOG_WINDOW_MS; the rest are counted and the count is printed with
-// the next line that gets through, or when the listener closes.
-const SERVE_LOG_BURST = 10;
-const SERVE_LOG_WINDOW_MS = 60000;
+// to a fixed length. The host rate-limits the lines (op_serve_log) and
+// keeps the count of suppressed ones, so the count is printed even when
+// the script dies before its listener closes.
 const SERVE_LOG_PATH_MAX = 64;
 // Only the first path segment is named: tokens ride in later segments
 // (password-reset links, webhook URLs) as often as in the query.
@@ -76,34 +74,6 @@ function servePathForLog(path) {
 	let first = slash === -1 ? bare : bare.slice(0, slash);
 	if (first.length > SERVE_LOG_PATH_MAX) first = first.slice(0, SERVE_LOG_PATH_MAX);
 	return first.length < bare.length ? first + "/..." : first;
-}
-function serveLogger() {
-	let windowStart = -Infinity;
-	let printed = 0;
-	let held = 0;
-	const flushHeld = () => {
-		if (held > 0) {
-			corePrint("jsrt: serve: " + held + " more such lines suppressed\n", true);
-			held = 0;
-		}
-	};
-	return {
-		line(text) {
-			const now = ops.op_now();
-			if (now - windowStart >= SERVE_LOG_WINDOW_MS) {
-				windowStart = now;
-				printed = 0;
-				flushHeld();
-			}
-			if (printed < SERVE_LOG_BURST) {
-				printed++;
-				corePrint(text + "\n", true);
-			} else {
-				held++;
-			}
-		},
-		close: flushHeld,
-	};
 }
 
 // A handler's headers as [name, value] pairs. An array value repeats the
@@ -202,7 +172,6 @@ globalThis.rt = {
 	 */
 	serve: (opts, handler) => {
 		const rid = ops.op_serve_listen(opts.host ?? "127.0.0.1", opts.port);
-		const log = serveLogger();
 		const done = (async () => {
 			try {
 				for (;;) {
@@ -238,7 +207,7 @@ globalThis.rt = {
 							String(res.body ?? ""),
 						);
 					} catch (e2) {
-						log.line(
+						ops.op_serve_log(
 							"jsrt: serve: " + String(req.method).slice(0, 16) + " " +
 								servePathForLog(req.path) + ": " +
 								String(e2 && e2.message).slice(0, 120) + " -- answered 500",
@@ -251,7 +220,7 @@ globalThis.rt = {
 					}
 				}
 			} finally {
-				log.close();
+				ops.op_serve_log_flush();
 				try { ops.op_serve_close(rid); } catch (e) {}
 			}
 		})();
