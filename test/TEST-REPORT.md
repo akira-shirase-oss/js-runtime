@@ -12,7 +12,7 @@ guide and refreshed the webhook-drill evidence artifacts.
 > reach `Deno.core.ops`, fetch followed redirects and private DNS answers, the entry
 > directory was a read grant for data imports, `rt.serve` had no DoS bounds, among
 > others); they are fixed on `main`, listed in the README's "Breaking changes", and the
-> suite is now 125 tests. The manual passes below were **not** re-run on the new code.
+> suite is now 130 tests. The manual passes below were **not** re-run on the new code.
 
 ---
 

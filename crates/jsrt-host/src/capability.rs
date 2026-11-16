@@ -42,6 +42,12 @@ pub const MAX_SERVE_MAX_CONNECTIONS: u64 = 65_536;
 pub const DEFAULT_SERVE_HEADER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 /// Default time a request may take to deliver its body.
 pub const DEFAULT_SERVE_BODY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// Default time a request body has to deliver its first byte; a body that
+/// declares a length and then sends nothing gives up its budget here.
+pub const DEFAULT_SERVE_BODY_FIRST_BYTE: std::time::Duration = std::time::Duration::from_secs(5);
+/// Default average rate, in bytes per second, a body must keep after its
+/// first-byte allowance.
+pub const DEFAULT_SERVE_BODY_MIN_RATE: u64 = 64 * 1024;
 /// Default time a response write may go without progress before the
 /// connection is dropped (a client that stopped reading).
 pub const DEFAULT_SERVE_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
@@ -76,6 +82,11 @@ pub struct ServeGrant {
     pub header_timeout: std::time::Duration,
     /// Deadline for a request body once its head has arrived.
     pub body_timeout: std::time::Duration,
+    /// Time a body has to start arriving, and the average rate (bytes/s)
+    /// it must keep after that; a body that falls behind gets 408 and its
+    /// share of the body budget back.
+    pub body_first_byte: std::time::Duration,
+    pub body_min_rate: u64,
     /// Longest a response write may make no progress; past it the
     /// connection, and its slot, are dropped. Keep it at 5 s or more: a
     /// review run saw 1 s cut legitimate slow downloads under load.
@@ -91,6 +102,8 @@ impl ServeGrant {
             max_connections: DEFAULT_SERVE_MAX_CONNECTIONS,
             header_timeout: DEFAULT_SERVE_HEADER_TIMEOUT,
             body_timeout: DEFAULT_SERVE_BODY_TIMEOUT,
+            body_first_byte: DEFAULT_SERVE_BODY_FIRST_BYTE,
+            body_min_rate: DEFAULT_SERVE_BODY_MIN_RATE,
             write_timeout: DEFAULT_SERVE_WRITE_TIMEOUT,
         }
     }
@@ -211,6 +224,10 @@ struct ManifestServe {
     body_timeout_ms: Option<u64>,
     #[serde(default)]
     write_timeout_ms: Option<u64>,
+    #[serde(default)]
+    body_first_byte_ms: Option<u64>,
+    #[serde(default)]
+    body_min_rate: Option<u64>,
 }
 
 impl Capabilities {
@@ -391,6 +408,13 @@ impl Capabilities {
             if let Some(ms) = serve.body_timeout_ms {
                 grant.body_timeout =
                     std::time::Duration::from_millis(positive("body_timeout_ms", ms)?);
+            }
+            if let Some(ms) = serve.body_first_byte_ms {
+                grant.body_first_byte =
+                    std::time::Duration::from_millis(positive("body_first_byte_ms", ms)?);
+            }
+            if let Some(rate) = serve.body_min_rate {
+                grant.body_min_rate = positive("body_min_rate", rate)?;
             }
             if let Some(ms) = serve.write_timeout_ms {
                 grant.write_timeout =

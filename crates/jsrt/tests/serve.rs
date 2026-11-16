@@ -128,6 +128,10 @@ const READY: &str = "jsrt-test: listening";
 struct ServeChild(Option<Child>);
 
 impl ServeChild {
+    fn pid(&self) -> u32 {
+        self.0.as_ref().map_or(0, Child::id)
+    }
+
     /// Whether the server process has exited (without reaping its output).
     fn try_wait_exited(&mut self) -> bool {
         self.0
@@ -571,41 +575,47 @@ fn a_body_that_stalls_is_answered_408_at_the_body_timeout() {
 }
 
 #[test]
-fn connections_past_the_cap_wait_for_a_free_slot() {
+fn connections_past_the_cap_wait_when_every_slot_is_in_the_script() {
     let rig = Rig::new();
     let port = Rig::free_port();
-    let child = route_app(&rig, port, ", \"max_connections\": 2", "");
-    let request = |path: &str| format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n");
-    // Two keep-alive connections, each proven accepted by a full answer,
-    // then left open: they hold both slots.
-    let mut held = Vec::new();
-    for path in ["/one", "/two"] {
-        let mut s = connect(port);
-        s.set_read_timeout(Some(Duration::from_secs(3)))
-            .unwrap_or_else(|e| panic!("timeout: {e}"));
-        s.write_all(request(path).as_bytes())
-            .unwrap_or_else(|e| panic!("write: {e}"));
-        assert_eq!(read_response(&mut s).map(|r| r.0), Some(200), "{path}");
-        held.push(s);
+    // Two slots, both held by requests the script is working on: nothing
+    // is idle, so nothing can be evicted, and a third client waits.
+    let child = route_app(
+        &rig,
+        port,
+        ", \"max_connections\": 2",
+        "if (req.path.startsWith('/slow')) { await rt.sleep(600); return {status: 200, body: 'slow ' + req.path}; }",
+    );
+    let slow = |path: &'static str| {
+        std::thread::spawn(move || {
+            http(
+                port,
+                &format!(
+                    "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+                ),
+            )
+        })
+    };
+    let first = slow("/slow1");
+    std::thread::sleep(Duration::from_millis(100));
+    let second = slow("/slow2");
+    std::thread::sleep(Duration::from_millis(100));
+    let started = Instant::now();
+    let (status, _head, body) = http(
+        port,
+        &format!("GET /three HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"),
+    );
+    assert_eq!((status, body.as_str()), (200, "ok /three"));
+    // It got in only after a slow request finished, not by evicting one.
+    assert!(
+        started.elapsed() >= Duration::from_millis(300),
+        "{:?}",
+        started.elapsed()
+    );
+    for (handle, path) in [(first, "/slow1"), (second, "/slow2")] {
+        let (status, _head, body) = handle.join().unwrap_or_else(|_| panic!("{path}"));
+        assert_eq!((status, body), (200, format!("slow {path}")));
     }
-    // A third connects (the kernel backlog takes it) but is not served.
-    let mut third = connect(port);
-    third
-        .write_all(request("/three").as_bytes())
-        .unwrap_or_else(|e| panic!("write: {e}"));
-    third
-        .set_read_timeout(Some(Duration::from_millis(700)))
-        .unwrap_or_else(|e| panic!("timeout: {e}"));
-    assert_eq!(read_response(&mut third), None, "served past the cap");
-    // Free one slot; the waiting connection is served.
-    drop(held.remove(0));
-    third
-        .set_read_timeout(Some(Duration::from_secs(3)))
-        .unwrap_or_else(|e| panic!("timeout: {e}"));
-    let answer = read_response(&mut third);
-    assert_eq!(answer.as_ref().map(|r| r.0), Some(200), "{answer:?}");
-    drop(held);
-    drop(third);
     quit(port);
     let out = child
         .wait_with_output()
@@ -1205,6 +1215,206 @@ fn close_ends_the_server_while_a_keep_alive_client_stays_connected() {
     };
     assert!(exited, "the server was still running 5 s after close()");
     drop(kept);
+    let out = child
+        .wait_with_output()
+        .unwrap_or_else(|e| panic!("wait: {e}"));
+    assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
+}
+
+// ---- A reservation must be earned by bytes ---------------------------------
+
+/// Connections that declare `len` bytes and then send nothing.
+fn idle_declarers(port: u16, count: usize, len: u64) -> Vec<TcpStream> {
+    (0..count)
+        .map(|_| {
+            let mut s = connect(port);
+            s.write_all(
+                format!("POST /idle HTTP/1.1\r\nHost: x\r\nContent-Length: {len}\r\n\r\n")
+                    .as_bytes(),
+            )
+            .unwrap_or_else(|e| panic!("write: {e}"));
+            s
+        })
+        .collect()
+}
+
+#[test]
+fn idle_declarations_give_the_budget_back_at_the_first_byte_deadline() {
+    let rig = Rig::new();
+    let port = Rig::free_port();
+    let child = route_app(
+        &rig,
+        port,
+        ", \"body_first_byte_ms\": 500",
+        "if (req.path === '/up') return {status: 200, body: 'got ' + req.body.length};",
+    );
+    // Eight heads declaring 8 MiB each reserve the whole 64 MiB budget
+    // and never send a byte.
+    let idle = idle_declarers(port, 8, 8 * 1024 * 1024);
+    std::thread::sleep(Duration::from_millis(1500));
+    // Past the first-byte deadline their reservations are gone.
+    let (status, head) = upload(port, &vec![b'u'; 1024 * 1024]);
+    assert_eq!(status, 200, "a 1 MiB upload after the deadline: {head:?}");
+    drop(idle);
+    quit(port);
+    let out = child
+        .wait_with_output()
+        .unwrap_or_else(|e| panic!("wait: {e}"));
+    assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
+}
+
+/// The process's virtual size in KiB, from `ps`.
+fn vsz_kib(pid: u32) -> u64 {
+    let out = Command::new("ps")
+        .args(["-o", "vsz=", "-p", &pid.to_string()])
+        .output()
+        .unwrap_or_else(|e| panic!("ps: {e}"));
+    String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse()
+        .unwrap_or_else(|e| panic!("ps vsz: {e}"))
+}
+
+#[test]
+fn an_idle_large_declaration_is_not_allocated_up_front() {
+    let rig = Rig::new();
+    let port = Rig::free_port();
+    let child = route_app(&rig, port, ", \"max_body\": 1073741824", "");
+    drop(connect(port));
+    std::thread::sleep(Duration::from_millis(300));
+    let before = vsz_kib(child.pid());
+    let idle = idle_declarers(port, 1, 1024 * 1024 * 1024);
+    std::thread::sleep(Duration::from_millis(500));
+    let after = vsz_kib(child.pid());
+    let grown_mib = after.saturating_sub(before) / 1024;
+    assert!(
+        grown_mib < 256,
+        "one idle 1 GiB declaration grew the server by {grown_mib} MiB of virtual memory"
+    );
+    drop(idle);
+    quit(port);
+    let out = child
+        .wait_with_output()
+        .unwrap_or_else(|e| panic!("wait: {e}"));
+    assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
+}
+
+// ---- At the connection cap, idle sockets make room -------------------------
+
+#[test]
+fn at_the_cap_the_longest_idle_connection_makes_room() {
+    let rig = Rig::new();
+    let port = Rig::free_port();
+    let child = route_app(&rig, port, ", \"max_connections\": 16", "");
+    // Fill every slot: 8 sockets that never send, 8 slow small bodies.
+    let mut held: Vec<TcpStream> = (0..8).map(|_| connect(port)).collect();
+    for _ in 0..8 {
+        let mut s = connect(port);
+        s.write_all(b"POST /slow HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\nab")
+            .unwrap_or_else(|e| panic!("write: {e}"));
+        held.push(s);
+    }
+    // Let the listener accept all sixteen first.
+    std::thread::sleep(Duration::from_millis(300));
+    let started = Instant::now();
+    let (status, _head, body) = http(
+        port,
+        &format!("GET /new HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"),
+    );
+    let took = started.elapsed();
+    assert_eq!((status, body.as_str()), (200, "ok /new"), "after {took:?}");
+    assert!(took < Duration::from_secs(1), "answered after {took:?}");
+    drop(held);
+    quit(port);
+    let out = child
+        .wait_with_output()
+        .unwrap_or_else(|e| panic!("wait: {e}"));
+    assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
+}
+
+#[test]
+fn eviction_spares_a_request_the_script_is_handling() {
+    let rig = Rig::new();
+    let port = Rig::free_port();
+    let child = route_app(
+        &rig,
+        port,
+        ", \"max_connections\": 2",
+        "if (req.path === '/slow') { await rt.sleep(1500); return {status: 200, body: 'slow done'}; }",
+    );
+    // Slot 1: a request the handler is still working on.
+    let busy = std::thread::spawn(move || {
+        http(
+            port,
+            &format!("GET /slow HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"),
+        )
+    });
+    std::thread::sleep(Duration::from_millis(200));
+    // Slot 2: an idle socket.
+    let mut idle = connect(port);
+    idle.set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap_or_else(|e| panic!("timeout: {e}"));
+    std::thread::sleep(Duration::from_millis(200));
+    // A newcomer arrives at the cap. The idle socket gives way at once
+    // (the server closes it); the busy request does not. The newcomer's
+    // answer itself waits for the slow handler, because the script's serve
+    // loop handles one request at a time.
+    let newcomer = std::thread::spawn(move || {
+        http(
+            port,
+            &format!("GET /new HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"),
+        )
+    });
+    let started = Instant::now();
+    let closed = time_until_closed(&mut idle, started);
+    assert!(
+        closed < Duration::from_secs(1),
+        "the idle socket was closed after {closed:?}"
+    );
+    let (status, _head, body) = busy.join().unwrap_or_else(|_| panic!("busy client"));
+    assert_eq!((status, body.as_str()), (200, "slow done"));
+    let (status, _head, body) = newcomer.join().unwrap_or_else(|_| panic!("newcomer"));
+    assert_eq!((status, body.as_str()), (200, "ok /new"));
+    quit(port);
+    let out = child
+        .wait_with_output()
+        .unwrap_or_else(|e| panic!("wait: {e}"));
+    assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
+}
+
+#[test]
+fn a_refused_upload_without_expect_still_reads_its_503() {
+    let rig = Rig::new();
+    let port = Rig::free_port();
+    let child = route_app(&rig, port, "", "");
+    // Fill the budget for the 5 s first-byte allowance.
+    let idle = idle_declarers(port, 8, 8 * 1024 * 1024);
+    std::thread::sleep(Duration::from_millis(300));
+    // A plain client: head and 1 MiB body in one go, then read. If the
+    // server answers and closes without reading, the client's write fails
+    // or the 503 is lost to a reset.
+    let mut s = connect(port);
+    s.set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap_or_else(|e| panic!("timeout: {e}"));
+    s.set_write_timeout(Some(Duration::from_secs(5)))
+        .unwrap_or_else(|e| panic!("timeout: {e}"));
+    let body = vec![b'p'; 1024 * 1024];
+    let mut request = format!(
+        "POST /up HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    request.extend_from_slice(&body);
+    let wrote = s.write_all(&request);
+    let mut answer = Vec::new();
+    let read = s.read_to_end(&mut answer);
+    let text = String::from_utf8_lossy(&answer).to_ascii_lowercase();
+    assert!(wrote.is_ok(), "the upload was cut off: {wrote:?}");
+    assert!(read.is_ok() || !answer.is_empty(), "no answer: {read:?}");
+    assert!(text.starts_with("http/1.1 503"), "{text:?}");
+    assert!(text.contains("retry-after: 1"), "{text:?}");
+    drop(idle);
+    quit(port);
     let out = child
         .wait_with_output()
         .unwrap_or_else(|e| panic!("wait: {e}"));

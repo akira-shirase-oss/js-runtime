@@ -88,6 +88,10 @@ const BODY_BUFFER_BUDGET: u64 = 64 * 1024 * 1024;
 const FREE_BODY_BYTES: u64 = 64 * 1024;
 /// What a 503 for a full budget tells the client to wait, in seconds.
 const BUSY_RETRY_AFTER_SECS: &str = "1";
+/// How long a refused upload's body is read and thrown away before the
+/// refusal is sent, so a client without `Expect: 100-continue` finishes
+/// writing and reads the answer instead of hitting a reset.
+const REFUSAL_DRAIN: Duration = Duration::from_millis(200);
 
 type PendingResponse = oneshot::Sender<Response<Full<Bytes>>>;
 
@@ -258,6 +262,8 @@ fn op_serve_listen(
     let limits = WireLimits {
         max_body: grant.max_body,
         body_timeout: grant.body_timeout,
+        body_first_byte: grant.body_first_byte,
+        body_min_rate: grant.body_min_rate,
         body_budget: Arc::new(Semaphore::new(
             usize::try_from(budget).unwrap_or(Semaphore::MAX_PERMITS),
         )),
@@ -267,30 +273,61 @@ fn op_serve_listen(
     let slots = Arc::new(Semaphore::new(grant.max_connections));
     let task_resource = resource.clone();
     let task = deno_core::unsync::spawn(async move {
+        let conns = Connections::default();
         loop {
-            // A slot first, then accept: past the cap, connections queue in
-            // the kernel backlog, not as tasks and buffers in this process.
-            let Ok(slot) = Arc::clone(&slots).acquire_owned().await else {
-                return;
+            // Below the cap: a slot first, then accept. At the cap: wait for
+            // a client to actually arrive, then close the connection that
+            // has been idle longest (never one the script is handling) to
+            // make room. Without that, max_connections idle or slow
+            // sockets held every slot for the header/body timeouts and the
+            // attacker just reconnected. If every connection is busy in
+            // the script, the newcomer waits for a slot as before.
+            let (slot, accepted) = match Arc::clone(&slots).try_acquire_owned() {
+                Ok(slot) => (slot, listener.accept().await),
+                Err(_) => {
+                    let accepted = listener.accept().await;
+                    if accepted.is_ok() {
+                        conns.evict_longest_idle();
+                    }
+                    let Ok(slot) = Arc::clone(&slots).acquire_owned().await else {
+                        return;
+                    };
+                    (slot, accepted)
+                }
             };
-            match listener.accept().await {
+            match accepted {
                 Ok((stream, _)) => {
                     let tx = tx.clone();
                     let res = task_resource.clone();
                     let limits = limits.clone();
+                    let (track, evicted) = conns.register();
+                    let conns = conns.clone();
                     deno_core::unsync::spawn(async move {
                         // Held for the connection's whole life.
                         let _slot = slot;
+                        let svc_track = Rc::clone(&track);
                         let svc = service_fn(move |req: Request<Incoming>| {
-                            dispatch(req, tx.clone(), res.clone(), limits.clone())
+                            dispatch(
+                                req,
+                                tx.clone(),
+                                res.clone(),
+                                limits.clone(),
+                                Rc::clone(&svc_track),
+                            )
                         });
-                        let io = TokioIo::new(StallGuard::new(stream, write_timeout));
-                        let _ = hyper::server::conn::http1::Builder::new()
+                        let io =
+                            TokioIo::new(StallGuard::new(stream, write_timeout, Rc::clone(&track)));
+                        let serving = hyper::server::conn::http1::Builder::new()
                             .max_buf_size(HEAD_BUF_MAX)
                             .timer(TokioTimer::new())
                             .header_read_timeout(header_timeout)
-                            .serve_connection(io, svc)
-                            .await;
+                            .serve_connection(io, svc);
+                        // Dropping the connection future closes the socket.
+                        tokio::select! {
+                            _ = serving => {}
+                            _ = evicted => {}
+                        }
+                        conns.forget(track.id);
                     });
                 }
                 Err(_) => {
@@ -310,6 +347,85 @@ fn op_serve_listen(
     Ok(rid)
 }
 
+/// What the accept loop knows about one live connection.
+struct ConnTrack {
+    id: u64,
+    /// When a byte last moved on the socket, either way.
+    last_io: std::cell::Cell<tokio::time::Instant>,
+    /// Requests on this connection the script is handling right now —
+    /// such a connection is never evicted.
+    in_script: std::cell::Cell<u32>,
+    /// Fired to close the connection when it is evicted.
+    evict: RefCell<Option<oneshot::Sender<()>>>,
+}
+
+/// Live connections of one listener, for eviction at the cap. Single
+/// threaded: everything here runs on the script's executor.
+#[derive(Clone, Default)]
+struct Connections {
+    live: Rc<RefCell<HashMap<u64, Rc<ConnTrack>>>>,
+    next_id: Rc<std::cell::Cell<u64>>,
+}
+
+impl Connections {
+    fn register(&self) -> (Rc<ConnTrack>, oneshot::Receiver<()>) {
+        let (tx, rx) = oneshot::channel();
+        let id = self.next_id.get();
+        self.next_id.set(id + 1);
+        let track = Rc::new(ConnTrack {
+            id,
+            last_io: std::cell::Cell::new(tokio::time::Instant::now()),
+            in_script: std::cell::Cell::new(0),
+            evict: RefCell::new(Some(tx)),
+        });
+        self.live.borrow_mut().insert(id, Rc::clone(&track));
+        (track, rx)
+    }
+
+    fn forget(&self, id: u64) {
+        self.live.borrow_mut().remove(&id);
+    }
+
+    /// Close the connection that has moved no bytes for longest and has no
+    /// request in the script. Returns whether one was found.
+    fn evict_longest_idle(&self) -> bool {
+        let victim = self
+            .live
+            .borrow()
+            .values()
+            .filter(|c| c.in_script.get() == 0 && c.evict.borrow().is_some())
+            .min_by_key(|c| c.last_io.get())
+            .cloned();
+        match victim {
+            Some(conn) => {
+                if let Some(tx) = conn.evict.borrow_mut().take() {
+                    let _ = tx.send(());
+                }
+                true
+            }
+            None => false,
+        }
+    }
+}
+
+/// Marks a request as being in the script for as long as it lives.
+struct InScript(Rc<ConnTrack>);
+
+impl InScript {
+    fn new(track: Rc<ConnTrack>) -> Self {
+        track.in_script.set(track.in_script.get() + 1);
+        Self(track)
+    }
+}
+
+impl Drop for InScript {
+    fn drop(&mut self) {
+        self.0
+            .in_script
+            .set(self.0.in_script.get().saturating_sub(1));
+    }
+}
+
 /// A socket whose writes give up when they make no progress for `limit`.
 /// hyper's header timer only runs while it reads a head; once a response
 /// is being written, a peer that stops reading would park the write (and
@@ -319,15 +435,22 @@ struct StallGuard<T> {
     inner: T,
     limit: Duration,
     stalled: Option<Pin<Box<tokio::time::Sleep>>>,
+    /// Every byte that moves refreshes the connection's idle clock.
+    track: Rc<ConnTrack>,
 }
 
 impl<T> StallGuard<T> {
-    fn new(inner: T, limit: Duration) -> Self {
+    fn new(inner: T, limit: Duration, track: Rc<ConnTrack>) -> Self {
         Self {
             inner,
             limit,
             stalled: None,
+            track,
         }
+    }
+
+    fn moved(&self) {
+        self.track.last_io.set(tokio::time::Instant::now());
     }
 
     /// Map a pending write-side poll onto the stall clock.
@@ -362,7 +485,12 @@ impl<T: AsyncRead + Unpin> AsyncRead for StallGuard<T> {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_read(cx, buf)
+        let before = buf.filled().len();
+        let poll = Pin::new(&mut self.inner).poll_read(cx, buf);
+        if matches!(poll, Poll::Ready(Ok(()))) && buf.filled().len() > before {
+            self.moved();
+        }
+        poll
     }
 }
 
@@ -373,6 +501,9 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for StallGuard<T> {
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         let poll = Pin::new(&mut self.inner).poll_write(cx, buf);
+        if matches!(poll, Poll::Ready(Ok(n)) if n > 0) {
+            self.moved();
+        }
         self.watch(cx, poll)
     }
 
@@ -382,6 +513,9 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for StallGuard<T> {
         bufs: &[io::IoSlice<'_>],
     ) -> Poll<io::Result<usize>> {
         let poll = Pin::new(&mut self.inner).poll_write_vectored(cx, bufs);
+        if matches!(poll, Poll::Ready(Ok(n)) if n > 0) {
+            self.moved();
+        }
         self.watch(cx, poll)
     }
 
@@ -405,6 +539,8 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for StallGuard<T> {
 struct WireLimits {
     max_body: u64,
     body_timeout: Duration,
+    body_first_byte: Duration,
+    body_min_rate: u64,
     /// The listener's body byte budget, shared by every connection.
     body_budget: Arc<Semaphore>,
 }
@@ -415,6 +551,9 @@ enum BodyFailure {
     Unreadable,
     /// The body budget is full; the request held nothing when it said so.
     Busy,
+    /// The body did not start within its first-byte allowance, or fell
+    /// below the minimum rate after it.
+    TooSlow,
 }
 
 /// Take `n` bytes of budget now or not at all.
@@ -431,18 +570,35 @@ fn take_budget(budget: &Arc<Semaphore>, n: u64) -> Result<OwnedSemaphorePermit, 
 /// ever waits for budget, so no request can hold some while waiting for
 /// more.
 async fn read_body(
-    mut body: Incoming,
+    body: &mut Incoming,
     declared: Option<u64>,
-    max_body: u64,
-    budget: &Arc<Semaphore>,
+    limits: &WireLimits,
 ) -> Result<(Vec<u8>, Option<OwnedSemaphorePermit>), BodyFailure> {
+    let max_body = limits.max_body;
+    let budget = &limits.body_budget;
     let mut held: Option<OwnedSemaphorePermit> = match declared {
         Some(n) if n > FREE_BODY_BYTES => Some(take_budget(budget, n)?),
         _ => None,
     };
-    let capacity = declared.map_or(0, |n| n.min(max_body));
-    let mut buf = Vec::with_capacity(usize::try_from(capacity).unwrap_or(0));
-    while let Some(frame) = body.frame().await {
+    // Grown as bytes arrive: a declared length is a promise, not memory.
+    let mut buf = Vec::with_capacity(
+        usize::try_from(declared.map_or(0, |n| n.min(FREE_BODY_BYTES))).unwrap_or(0),
+    );
+    // A reservation has to be earned: the first byte within the first-byte
+    // allowance, then on average at least `body_min_rate` bytes a second.
+    // Falling behind is a 408, and dropping `held` gives the budget back.
+    let started = tokio::time::Instant::now();
+    loop {
+        let earned = Duration::try_from_secs_f64(buf.len() as f64 / limits.body_min_rate as f64)
+            .unwrap_or(Duration::MAX);
+        let deadline = started
+            .checked_add(limits.body_first_byte.saturating_add(earned))
+            .unwrap_or_else(|| started + limits.body_timeout);
+        let frame = match tokio::time::timeout_at(deadline, body.frame()).await {
+            Err(_) => return Err(BodyFailure::TooSlow),
+            Ok(None) => break,
+            Ok(Some(frame)) => frame,
+        };
         let frame = frame.map_err(|_| BodyFailure::Unreadable)?;
         let Ok(data) = frame.into_data() else {
             continue; // trailers carry no body bytes
@@ -472,6 +628,28 @@ async fn read_body(
     Ok((buf, held))
 }
 
+/// Read and discard what is left of a refused upload, for at most
+/// [`REFUSAL_DRAIN`] and `max_bytes`, so the client that is still sending
+/// gets to read the answer. Skipped for `Expect: 100-continue` requests:
+/// polling their body would invite the body the refusal is meant to stop.
+async fn drain_refused(body: &mut Incoming, expects_continue: bool, max_bytes: u64) {
+    if expects_continue {
+        return;
+    }
+    let _ = tokio::time::timeout(REFUSAL_DRAIN, async {
+        let mut seen: u64 = 0;
+        while let Some(Ok(frame)) = body.frame().await {
+            if let Ok(data) = frame.into_data() {
+                seen += data.len() as u64;
+                if seen > max_bytes {
+                    return;
+                }
+            }
+        }
+    })
+    .await;
+}
+
 /// Wire-side handler: collect the bounded body, take a dispatch slot, hand
 /// the request to the script, await its response. Every failure mode maps
 /// to a real HTTP answer — the wire never sees a Rust panic.
@@ -480,6 +658,7 @@ async fn dispatch(
     tx: mpsc::Sender<(ServeReq, PendingResponse)>,
     res: Rc<ServeResource>,
     limits: WireLimits,
+    track: Rc<ConnTrack>,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
     fn plain(status: u16, msg: &'static str) -> Response<Full<Bytes>> {
         Response::builder()
@@ -496,7 +675,12 @@ async fn dispatch(
             .unwrap_or_else(|_| Response::new(Full::new(Bytes::new())))
     }
 
-    let (parts, body) = req.into_parts();
+    let (parts, mut body) = req.into_parts();
+    let expects_continue = parts
+        .headers
+        .get(http::header::EXPECT)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.eq_ignore_ascii_case("100-continue"));
     if parts.headers.len() > MAX_HEADERS {
         return Ok(plain(431, "too many headers"));
     }
@@ -518,25 +702,33 @@ async fn dispatch(
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<u64>().ok());
     if declared.is_some_and(|n| n > limits.max_body) {
+        drain_refused(&mut body, expects_continue, limits.max_body).await;
         return Ok(plain(413, "request body too large"));
     }
 
     // The body first, under its own deadline and the shared byte budget;
     // only a complete request competes for a dispatch-queue slot, so a
     // stalled upload can never stand in front of a GET.
-    let collected = tokio::time::timeout(
-        limits.body_timeout,
-        read_body(body, declared, limits.max_body, &limits.body_budget),
-    )
-    .await;
+    let collected =
+        tokio::time::timeout(limits.body_timeout, read_body(&mut body, declared, &limits)).await;
     let (bytes, body_budget) = match collected {
         Ok(Ok(read)) => read,
-        Ok(Err(BodyFailure::TooLarge)) => return Ok(plain(413, "request body too large")),
+        Ok(Err(BodyFailure::TooLarge)) => {
+            drain_refused(&mut body, expects_continue, limits.max_body).await;
+            return Ok(plain(413, "request body too large"));
+        }
         Ok(Err(BodyFailure::Unreadable)) => return Ok(plain(400, "request body unreadable")),
-        Ok(Err(BodyFailure::Busy)) => return Ok(busy()),
+        Ok(Err(BodyFailure::Busy)) => {
+            drain_refused(&mut body, expects_continue, limits.max_body).await;
+            return Ok(busy());
+        }
+        Ok(Err(BodyFailure::TooSlow)) => return Ok(plain(408, "request body too slow")),
         Err(_) => return Ok(plain(408, "request body timeout")),
     };
 
+    // From here until the answer is built the request belongs to the
+    // script, and its connection is not a candidate for eviction.
+    let _in_script = InScript::new(track);
     let id = res.next_id.fetch_add(1, Ordering::Relaxed);
     let (rtx, rrx) = oneshot::channel();
     let msg = ServeReq {
