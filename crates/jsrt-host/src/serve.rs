@@ -19,9 +19,17 @@
 //! kernel backlog rather than as tasks here), `header_timeout` (hyper's
 //! header-read timer, which also runs while a keep-alive connection sits
 //! idle waiting for its next head), and `body_timeout` (408 for a body
-//! that stalls). A request takes its dispatch-queue slot before its body
-//! is buffered, so at most `DISPATCH_QUEUE` bodies are ever held waiting
-//! for the script.
+//! that stalls).
+//!
+//! A body is read *before* the request takes a dispatch-queue slot, so a
+//! stalled upload never sits in the queue ahead of other requests (taking
+//! the slot first let 64 half-sent bodies block every GET for the whole
+//! body timeout). Memory for bodies is bounded separately: every body
+//! byte held in this process — being read or waiting in the queue —
+//! holds a permit from one per-listener byte budget
+//! ([`BODY_BUFFER_BUDGET`], raised to `max_body` if that is larger),
+//! taken chunk by chunk as the bytes arrive. To hold the budget a client
+//! has to actually send the bytes, and the body timeout still ends it.
 
 use std::borrow::Cow;
 use std::cell::RefCell;
@@ -34,13 +42,13 @@ use std::time::Duration;
 
 use deno_core::{op2, OpState, Resource, ResourceId};
 use deno_error::JsErrorBox;
-use http_body_util::{BodyExt, Full, Limited};
+use http_body_util::{BodyExt, Full};
 use hyper::body::{Bytes, Incoming};
 use hyper::service::service_fn;
 use hyper::{Request, Response};
 use hyper_util::rt::{TokioIo, TokioTimer};
 use serde::Serialize;
-use tokio::sync::{mpsc, oneshot, Mutex as TokioMutex, Semaphore};
+use tokio::sync::{mpsc, oneshot, Mutex as TokioMutex, OwnedSemaphorePermit, Semaphore};
 
 use crate::capability::ServeGrant;
 
@@ -51,6 +59,9 @@ const DISPATCH_QUEUE: usize = 64;
 const HEAD_BUF_MAX: usize = 16 * 1024;
 /// Header count cap — past this the request is refused before dispatch.
 const MAX_HEADERS: usize = 64;
+/// Request-body bytes one listener holds at once across all connections,
+/// counting bodies being read and bodies waiting for the script.
+const BODY_BUFFER_BUDGET: u64 = 64 * 1024 * 1024;
 
 type PendingResponse = oneshot::Sender<Response<Full<Bytes>>>;
 
@@ -62,6 +73,9 @@ struct ServeReq {
     path: String,
     headers: Vec<(String, String)>,
     body: String,
+    /// This body's share of the listener's byte budget, released when the
+    /// script takes the request.
+    _body_budget: Option<OwnedSemaphorePermit>,
 }
 
 /// The listener's shared state — held in the resource table so runtime
@@ -203,9 +217,17 @@ fn op_serve_listen(
         accept_task: Mutex::new(None),
     });
 
+    // At least one full-size body must fit, and tokio caps a semaphore.
+    let budget = grant
+        .max_body
+        .max(BODY_BUFFER_BUDGET)
+        .min(Semaphore::MAX_PERMITS as u64);
     let limits = WireLimits {
         max_body: grant.max_body,
         body_timeout: grant.body_timeout,
+        body_budget: Arc::new(Semaphore::new(
+            usize::try_from(budget).unwrap_or(Semaphore::MAX_PERMITS),
+        )),
     };
     let header_timeout = grant.header_timeout;
     let slots = Arc::new(Semaphore::new(grant.max_connections));
@@ -221,11 +243,12 @@ fn op_serve_listen(
                 Ok((stream, _)) => {
                     let tx = tx.clone();
                     let res = task_resource.clone();
+                    let limits = limits.clone();
                     deno_core::unsync::spawn(async move {
                         // Held for the connection's whole life.
                         let _slot = slot;
                         let svc = service_fn(move |req: Request<Incoming>| {
-                            dispatch(req, tx.clone(), res.clone(), limits)
+                            dispatch(req, tx.clone(), res.clone(), limits.clone())
                         });
                         let _ = hyper::server::conn::http1::Builder::new()
                             .max_buf_size(HEAD_BUF_MAX)
@@ -253,13 +276,56 @@ fn op_serve_listen(
 }
 
 /// Per-request bounds the wire side enforces before the script is involved.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct WireLimits {
     max_body: u64,
     body_timeout: Duration,
+    /// The listener's body byte budget, shared by every connection.
+    body_budget: Arc<Semaphore>,
 }
 
-/// Wire-side handler: take a dispatch slot, collect the bounded body, hand
+/// Why a body could not be collected.
+enum BodyFailure {
+    TooLarge,
+    Unreadable,
+}
+
+/// Collect a body, taking a budget permit for each chunk as it arrives —
+/// the budget counts bytes actually received, so declaring a large
+/// `Content-Length` and sending two bytes holds two bytes of it.
+async fn read_body(
+    mut body: Incoming,
+    max_body: u64,
+    budget: &Arc<Semaphore>,
+) -> Result<(Vec<u8>, Option<OwnedSemaphorePermit>), BodyFailure> {
+    let mut buf = Vec::new();
+    let mut held: Option<OwnedSemaphorePermit> = None;
+    while let Some(frame) = body.frame().await {
+        let frame = frame.map_err(|_| BodyFailure::Unreadable)?;
+        let Ok(data) = frame.into_data() else {
+            continue; // trailers carry no body bytes
+        };
+        if data.is_empty() {
+            continue;
+        }
+        if buf.len() as u64 + data.len() as u64 > max_body {
+            return Err(BodyFailure::TooLarge);
+        }
+        let n = u32::try_from(data.len()).map_err(|_| BodyFailure::TooLarge)?;
+        let permit = Arc::clone(budget)
+            .acquire_many_owned(n)
+            .await
+            .map_err(|_| BodyFailure::Unreadable)?;
+        match &mut held {
+            Some(h) => h.merge(permit),
+            None => held = Some(permit),
+        }
+        buf.extend_from_slice(&data);
+    }
+    Ok((buf, held))
+}
+
+/// Wire-side handler: collect the bounded body, take a dispatch slot, hand
 /// the request to the script, await its response. Every failure mode maps
 /// to a real HTTP answer — the wire never sees a Rust panic.
 async fn dispatch(
@@ -300,24 +366,18 @@ async fn dispatch(
         return Ok(plain(413, "request body too large"));
     }
 
-    // The queue slot comes before the body: a busy script stops further
-    // bodies from being read at all, instead of each connection buffering
-    // up to max_body while it waits. If the receiver is gone, the
-    // script's event loop is done and so is this connection.
-    let Ok(slot) = tx.reserve().await else {
-        return Ok(plain(503, "listener closing"));
-    };
+    // The body first, under its own deadline and the shared byte budget;
+    // only a complete request competes for a dispatch-queue slot, so a
+    // stalled upload can never stand in front of a GET.
     let collected = tokio::time::timeout(
         limits.body_timeout,
-        Limited::new(body, limits.max_body as usize).collect(),
+        read_body(body, limits.max_body, &limits.body_budget),
     )
     .await;
-    let bytes = match collected {
-        Ok(Ok(c)) => c.to_bytes(),
-        Ok(Err(e)) if e.is::<http_body_util::LengthLimitError>() => {
-            return Ok(plain(413, "request body too large"));
-        }
-        Ok(Err(_)) => return Ok(plain(400, "request body unreadable")),
+    let (bytes, body_budget) = match collected {
+        Ok(Ok(read)) => read,
+        Ok(Err(BodyFailure::TooLarge)) => return Ok(plain(413, "request body too large")),
+        Ok(Err(BodyFailure::Unreadable)) => return Ok(plain(400, "request body unreadable")),
         Err(_) => return Ok(plain(408, "request body timeout")),
     };
 
@@ -329,9 +389,15 @@ async fn dispatch(
         path,
         headers,
         body: String::from_utf8_lossy(&bytes).into_owned(),
+        _body_budget: body_budget,
     };
-    // The sender travels with the message.
-    slot.send((msg, rtx));
+    drop(bytes);
+    // The queue being full means the script is busy: backpressure is this
+    // await. The sender travels with the message; if the receiver is gone,
+    // the script's event loop is done and so is this connection.
+    if tx.send((msg, rtx)).await.is_err() {
+        return Ok(plain(503, "listener closing"));
+    }
     match rrx.await {
         Ok(response) => Ok(response),
         // The resource closed (or the script's isolate died) while this

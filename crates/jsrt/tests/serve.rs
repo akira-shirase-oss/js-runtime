@@ -575,3 +575,85 @@ fn a_malformed_handler_answer_is_a_500_and_the_listener_lives() {
         stderr(&out)
     );
 }
+
+// ---- Helpers for tests that stop the server themselves ---------------------
+
+/// A serve app with a `/quit` route that closes the listener, plus any
+/// extra `routes` (JS `if (...) return ...;` lines run before the default
+/// answer). Tests end it by calling [`quit`] once their assertions are
+/// done, never on a timer; the run timeout is only a backstop for a test
+/// that fails half-way.
+fn route_app(rig: &Rig, port: u16, serve_extra: &str, routes: &str) -> Child {
+    let manifest = rig.script(
+        "routes.manifest.json",
+        &format!("{{ \"serve\": {{\"host\": \"127.0.0.1\", \"port\": {port}{serve_extra}}} }}\n"),
+    );
+    let script = rig.script(
+        "routes.js",
+        &format!(
+            "const server = rt.serve({{host: '127.0.0.1', port: {port}}}, async (req) => {{\n\
+               if (req.path === '/quit') {{ rt.setTimeout(() => server.close(), 0); return {{status: 200, body: 'bye'}}; }}\n\
+               {routes}\n\
+               return {{status: 200, body: 'ok ' + req.path}};\n\
+             }});\n"
+        ),
+    );
+    rig.spawn_serve(
+        &script,
+        &["--manifest", script_arg(&manifest), "--timeout", "60000"],
+    )
+}
+
+fn script_arg(path: &Path) -> &str {
+    path.to_str().unwrap_or_else(|| panic!("utf8"))
+}
+
+/// Ask a [`route_app`] to close its listener. The answer may race the
+/// process exit, so read errors are not failures here; the exit code the
+/// caller checks next is.
+fn quit(port: u16) {
+    if let Ok(mut s) = TcpStream::connect(("127.0.0.1", port)) {
+        let _ = s.set_read_timeout(Some(Duration::from_secs(5)));
+        let _ = s.write_all(b"GET /quit HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+        let mut sink = Vec::new();
+        let _ = s.read_to_end(&mut sink);
+    }
+}
+
+#[test]
+fn a_get_is_answered_while_sixty_four_bodies_stall() {
+    let rig = Rig::new();
+    let port = Rig::free_port();
+    let child = route_app(&rig, port, "", "");
+    drop(connect(port));
+    // As many half-sent uploads as the dispatch queue is deep, each
+    // promising 100 bytes and sending 2.
+    let stalled: Vec<TcpStream> = (0..64)
+        .map(|_| {
+            let mut s = connect(port);
+            s.write_all(b"POST /slow HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\nab")
+                .unwrap_or_else(|e| panic!("write: {e}"));
+            s
+        })
+        .collect();
+    // Let the listener read all 64 heads first; if the GET overtook them
+    // this test would pass without exercising the queue at all.
+    std::thread::sleep(Duration::from_millis(500));
+    let started = Instant::now();
+    let (status, _head, body) = http(
+        port,
+        &format!("GET /fast HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"),
+    );
+    let took = started.elapsed();
+    assert_eq!(
+        status, 200,
+        "a body-less GET must not wait behind stalled bodies; body {body:?}"
+    );
+    assert!(took < Duration::from_secs(1), "answered after {took:?}");
+    drop(stalled);
+    quit(port);
+    let out = child
+        .wait_with_output()
+        .unwrap_or_else(|e| panic!("wait: {e}"));
+    assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
+}
