@@ -79,7 +79,7 @@ Exit-code contract (don't collapse these):
 
 ## Changes since `c30ac2e`
 
-`cargo test --workspace --locked` now runs **125 tests** (74 lifecycle + 20 serve + 11 supervise + 20 host), not 84. New behaviour worth trying:
+`cargo test --workspace --locked` now runs **130 tests** (74 lifecycle + 25 serve + 11 supervise + 20 host), not 84. New behaviour worth trying:
 
 - `typeof Deno` and `typeof globalThis.__bootstrap` are `"undefined"`; `Deno.core.ops.op_panic(...)` is a `ReferenceError`, not a host abort.
 - A granted host that answers `302` to an ungranted one: exit **7**, and the ungranted host sees no connection.
@@ -87,7 +87,7 @@ Exit-code contract (don't collapse these):
 - Beside the entry, `import x from './a.json' with { type: 'json' }` (or a text/bytes import, or `import './credentials'`) refuses with exit 7 unless the directory is a declared `read` path.
 - `rt.sleep(1e30)` under `--timeout 500` exits 6.
 - Fetch errors name only `scheme://host:port`.
-- `rt.serve`: a slowloris head is closed after `header_timeout_ms`, a stalled body gets 408, connections past `max_connections` wait, a client that never reads a big answer loses its slot after `write_timeout_ms`, 64 stalled uploads do not delay a GET, and a handler returning `undefined` (or a bad header/status) gets 500 with a short stderr line naming only the first path segment. With the 64 MiB body budget full, a large upload gets `503` with `Retry-After` at once (use `Expect: 100-continue`), while bodies up to 64 KiB are never affected; `server.close()` ends the server even with keep-alive clients connected.
+- `rt.serve`: a slowloris head is closed after `header_timeout_ms`, a stalled body gets 408, connections past `max_connections` wait, a client that never reads a big answer loses its slot after `write_timeout_ms`, 64 stalled uploads do not delay a GET, and a handler returning `undefined` (or a bad header/status) gets 500 with a short stderr line naming only the first path segment. With the 64 MiB body budget full, a large upload gets `503` with `Retry-After` at once (use `Expect: 100-continue`), while bodies up to 64 KiB are never affected; `server.close()` ends the server even with keep-alive clients connected. A body that declares a length and sends nothing gets 408 after `body_first_byte_ms` (5 s) and frees its budget share; at the connection cap a new client closes the longest-idle connection instead of waiting.
 - `jsrt supervise --max-output-kb 16` on a flooding worker: a cap notice while it runs, the stream's last 4 KiB re-shown at exit, and `output.*` counts in the report.
 
 ## Happy-path checklist
