@@ -36,8 +36,13 @@ struct RunArgs {
     #[arg(long)]
     read: Vec<PathBuf>,
     /// Extra net destinations, host or host:port (joined with the manifest's).
+    /// A name reaches public addresses only.
     #[arg(long)]
     net: Vec<String>,
+    /// Like --net, but the name may also resolve to loopback, private or
+    /// link-local addresses (localhost, a Docker service, an internal host).
+    #[arg(long)]
+    net_private: Vec<String>,
     /// Embedded KV store path — joins with the manifest's "kv" grant
     /// (a manifest line wins over the flag's default quota).
     #[arg(long)]
@@ -74,6 +79,9 @@ impl RunArgs {
         }
         for n in &self.net {
             v.extend(["--net".into(), n.clone()]);
+        }
+        for n in &self.net_private {
+            v.extend(["--net-private".into(), n.clone()]);
         }
         if let Some(kv) = &self.kv {
             v.extend(["--kv".into(), kv.to_string_lossy().into_owned()]);
@@ -187,6 +195,7 @@ async fn execute(run: RunArgs) -> Result<(), HostError> {
         CliGrants {
             read: run.read,
             net: run.net,
+            net_private: run.net_private,
             kv: run.kv,
             kv_max_mb: run.kv_max_mb,
             media_root: run.media_root,
@@ -210,6 +219,7 @@ async fn execute(run: RunArgs) -> Result<(), HostError> {
 struct CliGrants {
     read: Vec<PathBuf>,
     net: Vec<String>,
+    net_private: Vec<String>,
     kv: Option<PathBuf>,
     kv_max_mb: u64,
     media_root: Option<PathBuf>,
@@ -220,6 +230,7 @@ struct CliGrants {
 fn merge_cli_grants(caps: Capabilities, flags: CliGrants) -> Result<Capabilities, HostError> {
     if flags.read.is_empty()
         && flags.net.is_empty()
+        && flags.net_private.is_empty()
         && flags.kv.is_none()
         && flags.media_root.is_none()
         && flags.serve.is_none()
@@ -234,6 +245,7 @@ fn merge_cli_grants(caps: Capabilities, flags: CliGrants) -> Result<Capabilities
         merged.read_paths.push(resolved);
     }
     merged.net_hosts.extend(flags.net);
+    merged.net_private.extend(flags.net_private);
     if let Some(path) = flags.kv {
         // Only extend, never weaken: a manifest "kv" line keeps its own
         // quota over the flag's default.

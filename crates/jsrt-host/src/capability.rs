@@ -29,11 +29,18 @@ const DEFAULT_SERVE_MAX_BODY: u64 = 8 * 1024 * 1024;
 /// Default concurrent connections per listener; past it, new connections
 /// wait in the kernel's accept backlog.
 pub const DEFAULT_SERVE_MAX_CONNECTIONS: usize = 256;
+/// Largest `max_connections` a manifest may declare — far above what one
+/// process should hold, and far below tokio's semaphore limit (2^61 - 1),
+/// past which building the listener would abort the host.
+pub const MAX_SERVE_MAX_CONNECTIONS: u64 = 65_536;
 /// Default time a connection may take to send a request head — and how
 /// long it may sit idle between keep-alive requests.
 pub const DEFAULT_SERVE_HEADER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 /// Default time a request may take to deliver its body.
 pub const DEFAULT_SERVE_BODY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// Default time a response write may go without progress before the
+/// connection is dropped (a client that stopped reading).
+pub const DEFAULT_SERVE_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// A declared embedded-KV store: the file the script may open and the
 /// quota it must stay under. The `path`'s parent is canonicalized at
@@ -65,6 +72,9 @@ pub struct ServeGrant {
     pub header_timeout: std::time::Duration,
     /// Deadline for a request body once its head has arrived.
     pub body_timeout: std::time::Duration,
+    /// Longest a response write may make no progress; past it the
+    /// connection, and its slot, are dropped.
+    pub write_timeout: std::time::Duration,
 }
 
 impl ServeGrant {
@@ -76,6 +86,7 @@ impl ServeGrant {
             max_connections: DEFAULT_SERVE_MAX_CONNECTIONS,
             header_timeout: DEFAULT_SERVE_HEADER_TIMEOUT,
             body_timeout: DEFAULT_SERVE_BODY_TIMEOUT,
+            write_timeout: DEFAULT_SERVE_WRITE_TIMEOUT,
         }
     }
 }
@@ -87,6 +98,10 @@ pub struct Capabilities {
     read_paths: Vec<PathBuf>,
     /// `host` or `host:port` destinations the script may fetch.
     net_hosts: Vec<String>,
+    /// Destinations whose *name* may also resolve to loopback, private or
+    /// link-local addresses — the explicit opt-in (`"private": true`,
+    /// `--net-private`). They are fetchable like `net_hosts`.
+    net_private: Vec<String>,
     /// The embedded KV store, if declared.
     kv: Option<KvGrant>,
     /// The media store, if declared.
@@ -102,9 +117,10 @@ struct Manifest {
     /// read beneath. Symlinks are resolved before checking.
     #[serde(default)]
     read: Vec<PathBuf>,
-    /// `host` or `host:port` entries. `host` alone allows any port.
+    /// `host` or `host:port` entries. `host` alone allows any port. An
+    /// entry may also be `{"host": "db:5432", "private": true}`.
     #[serde(default)]
-    net: Vec<String>,
+    net: Vec<ManifestNet>,
     /// The KV grant: {"kv": {"path": "app.kv", "max_bytes": 67108864}}.
     #[serde(default)]
     kv: Option<ManifestKv>,
@@ -116,6 +132,24 @@ struct Manifest {
     /// "max_body": 8388608}}.
     #[serde(default)]
     serve: Option<ManifestServe>,
+}
+
+/// One `net` entry: a bare `host[:port]` string, or an object that can
+/// opt the name into private resolution. Unknown keys in the object are an
+/// error — a misspelt opt-in must not turn into a silent public grant.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum ManifestNet {
+    Plain(String),
+    Detailed(ManifestNetDetailed),
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManifestNetDetailed {
+    host: String,
+    #[serde(default)]
+    private: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -149,6 +183,8 @@ struct ManifestServe {
     header_timeout_ms: Option<u64>,
     #[serde(default)]
     body_timeout_ms: Option<u64>,
+    #[serde(default)]
+    write_timeout_ms: Option<u64>,
 }
 
 impl Capabilities {
@@ -162,6 +198,7 @@ impl Capabilities {
         Self {
             read_paths,
             net_hosts,
+            net_private: Vec::new(),
             kv: None,
             media: None,
             serve: None,
@@ -177,6 +214,7 @@ impl Capabilities {
         Self {
             read_paths,
             net_hosts,
+            net_private: Vec::new(),
             kv,
             media: None,
             serve: None,
@@ -208,7 +246,19 @@ impl Capabilities {
             })?;
             caps.read_paths.push(resolved);
         }
-        caps.net_hosts = manifest.net;
+        for entry in manifest.net {
+            match entry {
+                ManifestNet::Plain(host) => caps.net_hosts.push(host),
+                ManifestNet::Detailed(ManifestNetDetailed {
+                    host,
+                    private: false,
+                }) => caps.net_hosts.push(host),
+                ManifestNet::Detailed(ManifestNetDetailed {
+                    host,
+                    private: true,
+                }) => caps.net_private.push(host),
+            }
+        }
         if let Some(kv) = manifest.kv {
             let joined = base.join(&kv.path);
             // The db file itself may not exist yet — its parent must. The
@@ -291,7 +341,14 @@ impl Capabilities {
                 }
             };
             if let Some(n) = serve.max_connections {
-                grant.max_connections = positive("max_connections", n as u64)? as usize;
+                let n = positive("max_connections", n as u64)?;
+                if n > MAX_SERVE_MAX_CONNECTIONS {
+                    return Err(HostError::Host(format!(
+                        "manifest serve max_connections {n} is above the limit of \
+                         {MAX_SERVE_MAX_CONNECTIONS}"
+                    )));
+                }
+                grant.max_connections = n as usize;
             }
             if let Some(ms) = serve.header_timeout_ms {
                 grant.header_timeout =
@@ -300,6 +357,10 @@ impl Capabilities {
             if let Some(ms) = serve.body_timeout_ms {
                 grant.body_timeout =
                     std::time::Duration::from_millis(positive("body_timeout_ms", ms)?);
+            }
+            if let Some(ms) = serve.write_timeout_ms {
+                grant.write_timeout =
+                    std::time::Duration::from_millis(positive("write_timeout_ms", ms)?);
             }
             caps.serve = Some(grant);
         }
@@ -385,7 +446,7 @@ impl Capabilities {
                 crate::net::redact_url(url)
             ))
         })?;
-        let allowed = self.net_hosts.iter().any(|entry| {
+        let allowed = self.net_hosts.iter().chain(&self.net_private).any(|entry| {
             match parse_net_grant(entry) {
                 Some((gh, gp)) => gh == host && gp.is_none_or(|p| p == port),
                 // An unparseable grant can never match — fail closed.
@@ -393,11 +454,29 @@ impl Capabilities {
             }
         });
         if !allowed {
+            // IPv6 hosts in brackets, so the port reads as a port.
+            let shown = if host.contains(':') {
+                format!("[{host}]:{port}")
+            } else {
+                format!("{host}:{port}")
+            };
             return Err(HostError::Capability(format!(
-                "fetch denied: {host}:{port} is not a declared net destination"
+                "fetch denied: {shown} is not a declared net destination"
             )));
         }
         Ok(())
+    }
+
+    /// Whether a resolved *name* may connect to non-public addresses: only
+    /// when an opted-in grant names that host (any of its ports — the
+    /// resolver never sees the port; `may_net` still checks it).
+    pub fn may_resolve_private(&self, host: &str) -> bool {
+        let host = host.to_lowercase();
+        let host = host.strip_suffix('.').unwrap_or(&host);
+        self.net_private
+            .iter()
+            .filter_map(|entry| parse_net_grant(entry))
+            .any(|(granted, _)| granted == host)
     }
 
     /// True when no capabilities were granted — used by ops that want to give
@@ -405,6 +484,7 @@ impl Capabilities {
     pub fn is_empty(&self) -> bool {
         self.read_paths.is_empty()
             && self.net_hosts.is_empty()
+            && self.net_private.is_empty()
             && self.kv.is_none()
             && self.media.is_none()
             && self.serve.is_none()
@@ -415,6 +495,7 @@ impl Capabilities {
         Grants {
             read_paths: self.read_paths,
             net_hosts: self.net_hosts,
+            net_private: self.net_private,
             kv: self.kv,
             media: self.media,
             serve: self.serve,
@@ -427,6 +508,7 @@ impl Capabilities {
         Self {
             read_paths: grants.read_paths,
             net_hosts: grants.net_hosts,
+            net_private: grants.net_private,
             kv: grants.kv,
             media: grants.media,
             serve: grants.serve,
@@ -439,6 +521,7 @@ impl Capabilities {
 pub struct Grants {
     pub read_paths: Vec<PathBuf>,
     pub net_hosts: Vec<String>,
+    pub net_private: Vec<String>,
     pub kv: Option<KvGrant>,
     pub media: Option<MediaGrant>,
     pub serve: Option<ServeGrant>,
@@ -623,6 +706,32 @@ mod tests {
         assert!(caps.may_net("http://[fe80::1]:1234/x").is_ok());
         assert!(caps.may_net("http://[::2]:7777/x").is_ok());
         assert!(caps.may_net("http://[::3]:7777/x").is_err());
+    }
+
+    #[test]
+    fn an_ipv6_refusal_brackets_the_host() {
+        let caps = Capabilities::deny_all();
+        let err = caps
+            .may_net("http://[::1]:8080/x")
+            .err()
+            .unwrap_or_else(|| panic!("must refuse"));
+        assert!(err.to_string().contains("[::1]:8080"), "{err}");
+    }
+
+    #[test]
+    fn only_opted_in_names_may_resolve_privately() {
+        let caps = Capabilities::from_grants(Grants {
+            net_hosts: vec!["public.example:443".into()],
+            net_private: vec!["DB.internal.:5432".into()],
+            ..Default::default()
+        });
+        assert!(caps.may_resolve_private("db.internal"));
+        assert!(caps.may_resolve_private("db.internal."));
+        assert!(!caps.may_resolve_private("public.example"));
+        assert!(!caps.may_resolve_private("other.internal"));
+        // An opted-in grant is still a grant like any other.
+        assert!(caps.may_net("http://db.internal:5432/").is_ok());
+        assert!(caps.may_net("http://db.internal:5433/").is_err());
     }
 
     #[test]

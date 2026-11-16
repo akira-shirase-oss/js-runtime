@@ -807,6 +807,52 @@ fn a_granted_name_that_resolves_to_a_private_address_is_refused() {
 }
 
 #[test]
+fn a_private_name_grant_is_an_explicit_opt_in() {
+    let rig = Rig::new();
+    let stub = Stub::start(respond("200 OK", b"local dev service", 0));
+    let script = fetch_script(&rig, &format!("http://localhost:{}/", stub.port));
+    // Manifest form: the grant says the name may resolve privately.
+    let manifest = rig.script(
+        "m.manifest.json",
+        &format!(
+            "{{ \"net\": [{{\"host\": \"localhost:{}\", \"private\": true}}] }}\n",
+            stub.port
+        ),
+    );
+    let out = rig.run_script(
+        &script,
+        &[
+            "--manifest",
+            manifest.to_str().unwrap_or_else(|| panic!("utf8")),
+        ],
+    );
+    assert_eq!(code(&out), 0, "manifest opt-in; stderr: {}", stderr(&out));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("local dev service"));
+    // CLI form.
+    let out = rig.run_script(
+        &script,
+        &["--net-private", &format!("localhost:{}", stub.port)],
+    );
+    assert_eq!(code(&out), 0, "flag opt-in; stderr: {}", stderr(&out));
+    // A misspelt opt-in is a manifest error, not a silent public grant.
+    let typo = rig.script(
+        "typo.manifest.json",
+        &format!(
+            "{{ \"net\": [{{\"host\": \"localhost:{}\", \"privat\": true}}] }}\n",
+            stub.port
+        ),
+    );
+    let out = rig.run_script(
+        &script,
+        &[
+            "--manifest",
+            typo.to_str().unwrap_or_else(|| panic!("utf8")),
+        ],
+    );
+    assert_eq!(code(&out), 8, "stderr: {}", stderr(&out));
+}
+
+#[test]
 fn a_redirect_loop_inside_the_grant_is_bounded() {
     let rig = Rig::new();
     // The stub's port is only known after bind, so the loop target is
@@ -833,7 +879,11 @@ fn fetch_errors_do_not_echo_credentials_or_query_strings() {
         .port();
     let slow = Stub::start(respond("200 OK", b"late", 3000));
     let big = Stub::start(respond("200 OK", &vec![b'x'; 5 * 1024 * 1024], 0));
-    let secret = |port: u16| format!("http://alice:hunter2@127.0.0.1:{port}/x?token=SEKRET");
+    // Tokens ride in userinfo, the query, and the path (webhook URLs,
+    // `bot<token>` APIs).
+    let secret = |port: u16| {
+        format!("http://alice:hunter2@127.0.0.1:{port}/hooks/PATHSECRET/x?token=SEKRET")
+    };
     let script = rig.script(
         "f.js",
         &format!(
@@ -865,7 +915,7 @@ fn fetch_errors_do_not_echo_credentials_or_query_strings() {
     let err = stderr(&out);
     assert_eq!(code(&out), 8, "stdout: {stdout}\nstderr: {err}");
     assert_eq!(stdout.lines().count(), 4, "stdout: {stdout}");
-    for leaked in ["hunter2", "alice", "SEKRET"] {
+    for leaked in ["hunter2", "alice", "SEKRET", "PATHSECRET"] {
         assert!(!stdout.contains(leaked), "{leaked} in stdout: {stdout}");
         assert!(!err.contains(leaked), "{leaked} in stderr: {err}");
     }

@@ -7,7 +7,10 @@
 //! manifest never named. So the client is built with:
 //! - a redirect policy that re-runs `may_net` on every hop (and keeps the
 //!   ten-hop bound), refusing with the destination it would have reached;
-//! - no proxy: the connection goes to the host that was checked;
+//! - no proxy, deliberately: `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` are
+//!   ignored, because a proxy connects (and resolves names) on the
+//!   script's behalf to destinations this host never checked. There is no
+//!   proxy setting yet; on a proxy-only network fetch cannot leave;
 //! - a resolver that admits only public addresses for a granted *name*.
 //!   `may_net` matches the name's string; DNS decides where it connects,
 //!   and a granted name that resolves (or is rebound) to loopback, a
@@ -16,7 +19,10 @@
 //!   the addresses it admits are the only ones the connector sees, so
 //!   there is no window between check and connect. An IP-literal grant
 //!   (`10.0.0.5:8080`, `127.0.0.1:3000`) is the operator naming the
-//!   address itself and never goes through DNS.
+//!   address itself and never goes through DNS; a name the operator knows
+//!   is private (`localhost`, a Docker service, an internal HTTPS host
+//!   whose certificate names it) is opted in explicitly with
+//!   `{"host": ..., "private": true}` or `--net-private`.
 
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -47,6 +53,7 @@ pub struct ClientUnavailable(pub String);
 
 /// The client every fetch in this run uses.
 pub fn client(caps: &Capabilities) -> Result<reqwest::Client, reqwest::Error> {
+    let resolver_caps = caps.clone();
     let caps = caps.clone();
     let policy = reqwest::redirect::Policy::custom(move |attempt| {
         if attempt.previous().len() > MAX_REDIRECTS {
@@ -60,21 +67,31 @@ pub fn client(caps: &Capabilities) -> Result<reqwest::Client, reqwest::Error> {
     reqwest::Client::builder()
         .redirect(policy)
         .no_proxy()
-        .dns_resolver(Arc::new(PublicOnlyResolver))
+        .dns_resolver(Arc::new(GrantedResolver {
+            caps: resolver_caps,
+        }))
         .build()
 }
 
-/// System DNS, filtered to public addresses — see the module docs.
-struct PublicOnlyResolver;
+/// System DNS, filtered to public addresses unless the grant for that
+/// name opted into private resolution — see the module docs.
+struct GrantedResolver {
+    caps: Capabilities,
+}
 
-impl reqwest::dns::Resolve for PublicOnlyResolver {
+impl reqwest::dns::Resolve for GrantedResolver {
     fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
         let host = name.as_str().to_string();
+        let private_ok = self.caps.may_resolve_private(&host);
         Box::pin(async move {
             // Port 0: the connector sets the URL's port on what we return.
             let found: Vec<SocketAddr> =
                 tokio::net::lookup_host((host.as_str(), 0)).await?.collect();
-            let admitted = admit(&host, found)?;
+            let admitted = if private_ok {
+                found
+            } else {
+                admit(&host, found)?
+            };
             Ok(Box::new(admitted.into_iter()) as reqwest::dns::Addrs)
         })
     }
@@ -88,7 +105,8 @@ pub fn admit(host: &str, found: Vec<SocketAddr>) -> Result<Vec<SocketAddr>, NetD
         let list: Vec<String> = private.iter().map(|a| a.ip().to_string()).collect();
         return Err(NetDenied(format!(
             "fetch denied: {host} resolves to [{}], not a public address — a name grant \
-             reaches public hosts only; grant the address itself (ip:port) for a private one",
+             reaches public hosts only; opt this name in with {{\"host\": ..., \"private\": true}} \
+             or --net-private, or grant the address itself (ip:port)",
             list.join(", ")
         )));
     }
@@ -98,7 +116,10 @@ pub fn admit(host: &str, found: Vec<SocketAddr>) -> Result<Vec<SocketAddr>, NetD
 /// Whether an address is globally routable — not loopback, private,
 /// link-local (cloud metadata lives at 169.254.169.254), shared CGNAT,
 /// unspecified, multicast, broadcast, documentation, benchmarking or
-/// reserved. IPv4 embedded in IPv6 (mapped, NAT64) is judged as IPv4.
+/// reserved. IPv4 embedded in IPv6 (mapped, IPv4-translated, NAT64,
+/// 6to4) is judged as that IPv4; tunnels and prefixes that can reach an
+/// arbitrary IPv4 host behind them (Teredo, local-use NAT64) are not
+/// public.
 pub fn is_public(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => is_public_v4(v4),
@@ -107,17 +128,29 @@ pub fn is_public(ip: IpAddr) -> bool {
                 return is_public_v4(v4);
             }
             let seg = v6.segments();
-            if seg[..6] == [0x64, 0xff9b, 0, 0, 0, 0] {
-                let [a, b] = seg[6].to_be_bytes();
-                let [c, d] = seg[7].to_be_bytes();
-                return is_public_v4(Ipv4Addr::new(a, b, c, d));
+            let v4_at = |hi: u16, lo: u16| {
+                let [a, b] = hi.to_be_bytes();
+                let [c, d] = lo.to_be_bytes();
+                Ipv4Addr::new(a, b, c, d)
+            };
+            // NAT64 well-known prefix 64:ff9b::/96 and IPv4-translated
+            // ::ffff:0:a.b.c.d both carry the IPv4 address last.
+            if seg[..6] == [0x64, 0xff9b, 0, 0, 0, 0] || seg[..6] == [0, 0, 0, 0, 0xffff, 0] {
+                return is_public_v4(v4_at(seg[6], seg[7]));
+            }
+            // 6to4 (2002::/16) carries it right after the prefix.
+            if seg[0] == 0x2002 {
+                return is_public_v4(v4_at(seg[1], seg[2]));
             }
             !(seg[..6] == [0, 0, 0, 0, 0, 0] // ::, ::1, IPv4-compatible
                 || v6.is_multicast()
                 || v6.is_unique_local()
                 || v6.is_unicast_link_local()
                 || (seg[0] & 0xffc0) == 0xfec0 // site-local (deprecated)
-                || (seg[0] == 0x2001 && seg[1] == 0x0db8)) // documentation
+                || (seg[0] == 0x2001 && seg[1] == 0x0db8) // documentation
+                || (seg[0] == 0x2001 && seg[1] == 0) // Teredo 2001::/32
+                || (seg[0] == 0x64 && seg[1] == 0xff9b && seg[2] == 1) // local-use NAT64
+                || seg[..4] == [0x100, 0, 0, 0]) // discard-only 100::/64
         }
     }
 }
@@ -167,22 +200,29 @@ pub fn describe(err: reqwest::Error) -> String {
     out
 }
 
-/// A URL fit for an error message or a log line: userinfo removed, the
-/// query and fragment replaced — those are where tokens and passwords
-/// travel. An unparseable URL is not echoed at all.
+/// A URL fit for an error message or a log line: `scheme://host:port`
+/// and nothing else, with `/...` when something followed. Userinfo, the
+/// query and the fragment carry tokens and passwords, and so does the path
+/// (webhook URLs, `bot<token>` APIs); the operator needs the destination,
+/// which is the part kept. An unparseable URL is not echoed at all.
 pub fn redact_url(url: &str) -> String {
-    let Ok(mut parsed) = reqwest::Url::parse(url) else {
+    let Ok(parsed) = reqwest::Url::parse(url) else {
         return format!("<unparseable URL, {} bytes>", url.len());
     };
-    let had_query = parsed.query().is_some();
-    // Both fail only for URLs that cannot carry userinfo — nothing to strip.
-    let _ = parsed.set_username("");
-    let _ = parsed.set_password(None);
-    parsed.set_query(None);
-    parsed.set_fragment(None);
-    let mut shown = parsed.to_string();
-    if had_query {
-        shown.push_str("?[redacted]");
+    let mut shown = format!("{}://", parsed.scheme());
+    if let Some(host) = parsed.host_str() {
+        shown.push_str(host);
+        if let Some(port) = parsed.port_or_known_default() {
+            shown.push_str(&format!(":{port}"));
+        }
+    }
+    let elided = parsed.path() != "/"
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some();
+    if elided {
+        shown.push_str("/...");
     }
     shown
 }
@@ -196,12 +236,17 @@ mod tests {
     }
 
     #[test]
-    fn redact_url_strips_userinfo_and_query() {
+    fn redact_url_keeps_only_the_destination() {
         assert_eq!(
             redact_url("https://alice:hunter2@api.example.com:8443/v1/x?token=abc#frag"),
-            "https://api.example.com:8443/v1/x?[redacted]"
+            "https://api.example.com:8443/..."
         );
-        assert_eq!(redact_url("http://a.b/plain"), "http://a.b/plain");
+        assert_eq!(
+            redact_url("https://hooks.example.com/services/T0/B0/HOOKSECRET"),
+            "https://hooks.example.com:443/..."
+        );
+        assert_eq!(redact_url("http://a.b/"), "http://a.b:80");
+        assert_eq!(redact_url("http://[::1]:8080/x"), "http://[::1]:8080/...");
         assert_eq!(
             redact_url("http://alice@:99x/?t=1"),
             "<unparseable URL, 22 bytes>"
@@ -233,6 +278,12 @@ mod tests {
             "::ffff:127.0.0.1",
             "::ffff:169.254.169.254",
             "64:ff9b::a9fe:a9fe",
+            "64:ff9b:1::1",        // local-use NAT64
+            "2002:7f00:1::1",      // 6to4 wrapping 127.0.0.1
+            "2002:a9fe:a9fe::1",   // 6to4 wrapping 169.254.169.254
+            "2001:0:4136:e378::1", // Teredo tunnel
+            "::ffff:0:7f00:1",     // IPv4-translated 127.0.0.1
+            "100::1",              // discard-only
         ] {
             assert!(!is_public(ip(s)), "{s} must not count as public");
         }
@@ -249,6 +300,7 @@ mod tests {
             "2606:4700:4700::1111",
             "::ffff:8.8.8.8",
             "64:ff9b::808:808",
+            "2002:808:808::1", // 6to4 wrapping 8.8.8.8
         ] {
             assert!(is_public(ip(s)), "{s} must count as public");
         }

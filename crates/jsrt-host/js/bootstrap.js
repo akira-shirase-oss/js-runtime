@@ -60,6 +60,76 @@ function schedule(cb, ms, args, repeat) {
 	return holder.id;
 }
 
+// The serve loop's own stderr lines. A client chooses the request path,
+// so a line names the path without its query (where tokens ride), cut to a
+// fixed length, and at most SERVE_LOG_BURST lines are printed per
+// SERVE_LOG_WINDOW_MS; the rest are counted and the count is printed with
+// the next line that gets through, or when the listener closes.
+const SERVE_LOG_BURST = 10;
+const SERVE_LOG_WINDOW_MS = 60000;
+const SERVE_LOG_PATH_MAX = 200;
+function servePathForLog(path) {
+	const bare = String(path).split("?")[0];
+	return bare.length > SERVE_LOG_PATH_MAX
+		? bare.slice(0, SERVE_LOG_PATH_MAX) + "...(" + bare.length + " chars)"
+		: bare;
+}
+function serveLogger() {
+	let windowStart = -Infinity;
+	let printed = 0;
+	let held = 0;
+	const flushHeld = () => {
+		if (held > 0) {
+			corePrint("jsrt: serve: " + held + " more such lines suppressed\n", true);
+			held = 0;
+		}
+	};
+	return {
+		line(text) {
+			const now = ops.op_now();
+			if (now - windowStart >= SERVE_LOG_WINDOW_MS) {
+				windowStart = now;
+				printed = 0;
+				flushHeld();
+			}
+			if (printed < SERVE_LOG_BURST) {
+				printed++;
+				corePrint(text + "\n", true);
+			} else {
+				held++;
+			}
+		},
+		close: flushHeld,
+	};
+}
+
+// A handler's headers as [name, value] pairs. An array value repeats the
+// header (set-cookie needs one line per cookie, never a comma-joined one);
+// strings, numbers, booleans and bigints become their text; anything else
+// -- an object, a function, a nested array -- is not a header value and
+// sends the answer down the 500 path instead of "[object Object]".
+function answerHeaders(headers) {
+	if (headers === undefined || headers === null) return [];
+	if (typeof headers !== "object" || Array.isArray(headers)) {
+		throw new TypeError("rt.serve: headers must be an object of name: value");
+	}
+	const pairs = [];
+	for (const [name, value] of Object.entries(headers)) {
+		const values = Array.isArray(value) ? value : [value];
+		for (const one of values) {
+			const kind = typeof one;
+			if (kind !== "string" && kind !== "number" && kind !== "boolean" && kind !== "bigint") {
+				throw new TypeError(
+					"rt.serve: header " + String(name).slice(0, 64) + " has a " +
+						(Array.isArray(one) ? "nested array" : kind) + " value",
+				);
+			}
+			pairs.push([String(name), String(one)]);
+		}
+	}
+	return pairs;
+}
+
 globalThis.rt = {
 	/** Write to stdout with no added newline (deno_core's builtin op_print). */
 	print: (msg) => corePrint(String(msg), false),
@@ -129,6 +199,7 @@ globalThis.rt = {
 	 */
 	serve: (opts, handler) => {
 		const rid = ops.op_serve_listen(opts.host ?? "127.0.0.1", opts.port);
+		const log = serveLogger();
 		const done = (async () => {
 			try {
 				for (;;) {
@@ -155,9 +226,7 @@ globalThis.rt = {
 									", not {status, headers, body}",
 							);
 						}
-						const headers = res.headers
-							? Object.entries(res.headers).map(([k, v]) => [String(k), String(v)])
-							: [];
+						const headers = answerHeaders(res.headers);
 						ops.op_serve_respond(
 							rid,
 							req.id,
@@ -166,10 +235,10 @@ globalThis.rt = {
 							String(res.body ?? ""),
 						);
 					} catch (e2) {
-						corePrint(
-							"jsrt: serve: " + req.method + " " + req.path + ": " +
-								String(e2 && e2.message) + " -- answered 500\n",
-							true,
+						log.line(
+							"jsrt: serve: " + String(req.method).slice(0, 16) + " " +
+								servePathForLog(req.path) + ": " +
+								String(e2 && e2.message).slice(0, 120) + " -- answered 500",
 						);
 						try {
 							ops.op_serve_respond(rid, req.id, 500, [], "invalid handler response");
@@ -179,6 +248,7 @@ globalThis.rt = {
 					}
 				}
 			} finally {
+				log.close();
 				try { ops.op_serve_close(rid); } catch (e) {}
 			}
 		})();

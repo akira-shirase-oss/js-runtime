@@ -335,15 +335,17 @@ fn a_flooding_worker_is_capped_per_stream_and_the_drop_is_counted() {
     assert_eq!(r["output"]["stderr_bytes"], cap, "{r}");
     let stderr_dropped = r["output"]["stderr_dropped_bytes"].as_u64().unwrap_or(0);
     assert!(stderr_dropped >= 200 * 1024 - cap, "{r}");
-    // What reached the operator is bounded: the capped worker output plus
-    // the supervisor's own lines (readiness, drop notices, the report).
+    // What reached the operator is bounded: the capped worker output, the
+    // re-shown tail (at most 4 KiB plus a marker line) and the
+    // supervisor's own lines (readiness, drop notices, the report).
+    let tail = 4096 + 200;
     let stdout = String::from_utf8_lossy(&out.stdout);
     let worker_stdout: u64 = stdout
         .lines()
         .filter(|l| !l.starts_with('{'))
         .map(|l| l.len() as u64 + 1)
         .sum();
-    assert!(worker_stdout <= cap + 1, "{worker_stdout} bytes");
+    assert!(worker_stdout <= cap + tail, "{worker_stdout} bytes");
     assert!(
         stderr.contains("worker stdout reached the 16384-byte cap")
             && stderr.contains("worker stderr reached the 16384-byte cap"),
@@ -351,8 +353,94 @@ fn a_flooding_worker_is_capped_per_stream_and_the_drop_is_counted() {
         &stderr[stderr.len().saturating_sub(400)..]
     );
     assert!(
-        (stderr.len() as u64) < cap + 2048,
+        (stderr.len() as u64) < cap + tail + 2048,
         "{} stderr bytes",
         stderr.len()
     );
+}
+
+#[test]
+fn the_cause_of_death_survives_a_flooded_stream() {
+    let rig = Rig::new();
+    // The host's own final line is 200 KiB long and ends with the part an
+    // operator needs; the stream cap is 16 KiB.
+    let script = rig.script(
+        "die.js",
+        "throw new Error('y'.repeat(200 * 1024) + ' THE-REAL-CAUSE-OF-DEATH');\n",
+    );
+    let out = rig.supervise(&script, &["--max-output-kb", "16"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        code(&out),
+        5,
+        "stderr tail: {}",
+        &stderr[stderr.len().saturating_sub(300)..]
+    );
+    assert!(
+        stderr.contains("THE-REAL-CAUSE-OF-DEATH"),
+        "the end of the worker's stderr was dropped: {}",
+        &stderr[stderr.len().saturating_sub(300)..]
+    );
+    let r = report(&out);
+    assert!(
+        r["output"]["stderr_tail_bytes"].as_u64().unwrap_or(0) > 0,
+        "{r}"
+    );
+}
+
+#[test]
+fn the_cap_notice_appears_while_the_worker_still_runs() {
+    let rig = Rig::new();
+    // Flood stdout past the cap, then stay alive: a long-running worker.
+    let script = rig.script(
+        "chatty.js",
+        "const line = 'x'.repeat(1023) + '\\n';\n\
+         for (let i = 0; i < 64; i++) rt.print(line);\n\
+         await new Promise(() => {});\n",
+    );
+    let mut child = Command::new(JSRT)
+        .args([
+            "supervise",
+            script.to_str().unwrap_or_else(|| panic!("utf8")),
+            "--timeout",
+            "0",
+            "--max-output-kb",
+            "16",
+        ])
+        .current_dir(rig.dir.path())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|e| panic!("spawn supervise: {e}"));
+    let stderr = child
+        .stderr
+        .take()
+        .unwrap_or_else(|| panic!("no stderr pipe"));
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        for line in std::io::BufReader::new(stderr).lines() {
+            let Ok(line) = line else { break };
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut seen = false;
+    while !seen {
+        let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) else {
+            break;
+        };
+        match rx.recv_timeout(left) {
+            Ok(line) => seen = line.contains("worker stdout reached the 16384-byte cap"),
+            Err(_) => break,
+        }
+    }
+    // Stop the supervised run either way, then judge.
+    let _ = Command::new("kill")
+        .args(["-TERM", &child.id().to_string()])
+        .output();
+    let _ = child.wait();
+    assert!(seen, "no cap notice while the worker was running");
 }

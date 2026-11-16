@@ -72,19 +72,39 @@ pub struct SupervisePlan {
     pub max_output_bytes: u64,
 }
 
-/// What one worker stream did: bytes passed through, bytes dropped.
+/// The last bytes of each capped stream, kept and shown at exit — where a
+/// worker's cause of death (the host's final error line) usually is.
+const OUTPUT_TAIL_BYTES: usize = 4096;
+
+/// What one worker stream did: bytes passed through, bytes dropped past
+/// the cap, and how many of the dropped bytes were re-shown as the tail.
 #[derive(Debug, Default, Clone, Copy)]
 struct Forwarded {
     written: u64,
     dropped: u64,
+    tail: u64,
 }
 
 /// Copy `from` to `to` until EOF, passing at most `cap` bytes and counting
 /// the rest. It keeps reading past the cap — a worker blocked on a full
 /// pipe would stall instead of being limited — so the bound is on what
 /// reaches the operator, not on what the worker may try to write.
-fn forward(mut from: impl Read, mut to: impl Write, cap: u64) -> Forwarded {
+///
+/// The moment the cap is first hit, a notice goes to `notice` (the
+/// supervisor's stderr), so a long-running worker's operator learns it
+/// then, not at exit. The last `OUTPUT_TAIL_BYTES` of the dropped output
+/// are kept and written at EOF, starting at a line boundary when there is
+/// one, so the final lines survive.
+fn forward(
+    name: &str,
+    mut from: impl Read,
+    mut to: impl Write,
+    mut notice: impl Write,
+    cap: u64,
+) -> Forwarded {
     let mut done = Forwarded::default();
+    let mut tail: std::collections::VecDeque<u8> =
+        std::collections::VecDeque::with_capacity(OUTPUT_TAIL_BYTES);
     let mut buf = [0u8; 8192];
     loop {
         let n = match from.read(&mut buf) {
@@ -102,7 +122,52 @@ fn forward(mut from: impl Read, mut to: impl Write, cap: u64) -> Forwarded {
                 done.dropped += keep as u64;
             }
         }
-        done.dropped += (n - keep) as u64;
+        let over = &buf[keep..n];
+        if !over.is_empty() {
+            if done.dropped == 0 {
+                let _ = writeln!(
+                    notice,
+                    "\njsrt: supervise: worker {name} reached the {cap}-byte cap; further output \
+                     is dropped and counted, its last {OUTPUT_TAIL_BYTES} bytes are shown at exit"
+                );
+                let _ = notice.flush();
+            }
+            done.dropped += over.len() as u64;
+            for &b in over {
+                if tail.len() == OUTPUT_TAIL_BYTES {
+                    tail.pop_front();
+                }
+                tail.push_back(b);
+            }
+        }
+    }
+    if !tail.is_empty() {
+        let mut bytes: Vec<u8> = tail.into_iter().collect();
+        // Start at a line boundary if the window cut a line — unless the
+        // only newline ends the window, which would leave nothing.
+        if done.dropped > OUTPUT_TAIL_BYTES as u64 {
+            if let Some(i) = bytes.iter().position(|&b| b == b'\n') {
+                if i + 1 < bytes.len() {
+                    bytes.drain(..=i);
+                }
+            }
+        }
+        if !bytes.ends_with(b"\n") {
+            bytes.push(b'\n');
+        }
+        let header = format!(
+            "\n--- jsrt: supervise: last {} of the {} bytes of worker {name} past the cap ---\n",
+            bytes.len(),
+            done.dropped
+        );
+        if to
+            .write_all(header.as_bytes())
+            .and_then(|()| to.write_all(&bytes))
+            .and_then(|()| to.flush())
+            .is_ok()
+        {
+            done.tail = bytes.len() as u64;
+        }
     }
     done
 }
@@ -187,14 +252,16 @@ pub fn supervise(plan: &SupervisePlan) -> Result<i32, HostError> {
     // The forwarders end at EOF, which comes when the worker exits (scripts
     // cannot start processes that would inherit the pipes).
     let cap = plan.max_output_bytes;
-    let out_forwarder = child
-        .stdout
-        .take()
-        .map(|out| std::thread::spawn(move || forward(out, std::io::stdout(), cap)));
-    let err_forwarder = child
-        .stderr
-        .take()
-        .map(|err| std::thread::spawn(move || forward(err, std::io::stderr(), cap)));
+    let out_forwarder = child.stdout.take().map(|out| {
+        std::thread::spawn(move || {
+            forward("stdout", out, std::io::stdout(), std::io::stderr(), cap)
+        })
+    });
+    let err_forwarder = child.stderr.take().map(|err| {
+        std::thread::spawn(move || {
+            forward("stderr", err, std::io::stderr(), std::io::stderr(), cap)
+        })
+    });
     // The handle stays alive purely so the child stays ours until reaped —
     // dropping it would orphan nothing (Child::drop doesn't reap), but the
     // pid is only safe to use while we hold the handle.
@@ -289,8 +356,9 @@ pub fn supervise(plan: &SupervisePlan) -> Result<i32, HostError> {
     for (name, fwd) in [("stdout", stdout_fwd), ("stderr", stderr_fwd)] {
         if fwd.dropped > 0 {
             eprintln!(
-                "\njsrt: supervise: worker {name} reached the {cap}-byte cap; {} bytes dropped",
-                fwd.dropped
+                "\njsrt: supervise: worker {name}: {} bytes past the {cap}-byte cap were dropped \
+                 (the last {} re-shown above)",
+                fwd.dropped, fwd.tail
             );
         }
     }
@@ -315,8 +383,10 @@ pub fn supervise(plan: &SupervisePlan) -> Result<i32, HostError> {
             "max_bytes_per_stream": cap,
             "stdout_bytes": stdout_fwd.written,
             "stdout_dropped_bytes": stdout_fwd.dropped,
+            "stdout_tail_bytes": stdout_fwd.tail,
             "stderr_bytes": stderr_fwd.written,
             "stderr_dropped_bytes": stderr_fwd.dropped,
+            "stderr_tail_bytes": stderr_fwd.tail,
         },
     });
 

@@ -7,6 +7,13 @@
 **Verdict: PASS — no product bugs found.** One documentation commit (`aa0d7d9`) added the
 guide and refreshed the webhook-drill evidence artifacts.
 
+> **Superseded in part (2026-11-16).** This report describes `c30ac2e`. A later review
+> found real security and correctness gaps this pass did not test for (scripts could
+> reach `Deno.core.ops`, fetch followed redirects and private DNS answers, the entry
+> directory was a read grant for data imports, `rt.serve` had no DoS bounds, among
+> others); they are fixed on `main`, listed in the README's "Breaking changes", and the
+> suite is now 120 tests. The manual passes below were **not** re-run on the new code.
+
 ---
 
 ## 1. Build and workspace tests
