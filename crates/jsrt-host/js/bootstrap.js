@@ -61,18 +61,21 @@ function schedule(cb, ms, args, repeat) {
 }
 
 // The serve loop's own stderr lines. A client chooses the request path,
-// so a line names the path without its query (where tokens ride), cut to a
-// fixed length, and at most SERVE_LOG_BURST lines are printed per
+// so a line names only its first segment (no query, nothing deeper), cut
+// to a fixed length, and at most SERVE_LOG_BURST lines are printed per
 // SERVE_LOG_WINDOW_MS; the rest are counted and the count is printed with
 // the next line that gets through, or when the listener closes.
 const SERVE_LOG_BURST = 10;
 const SERVE_LOG_WINDOW_MS = 60000;
-const SERVE_LOG_PATH_MAX = 200;
+const SERVE_LOG_PATH_MAX = 64;
+// Only the first path segment is named: tokens ride in later segments
+// (password-reset links, webhook URLs) as often as in the query.
 function servePathForLog(path) {
 	const bare = String(path).split("?")[0];
-	return bare.length > SERVE_LOG_PATH_MAX
-		? bare.slice(0, SERVE_LOG_PATH_MAX) + "...(" + bare.length + " chars)"
-		: bare;
+	const slash = bare.indexOf("/", 1);
+	let first = slash === -1 ? bare : bare.slice(0, slash);
+	if (first.length > SERVE_LOG_PATH_MAX) first = first.slice(0, SERVE_LOG_PATH_MAX);
+	return first.length < bare.length ? first + "/..." : first;
 }
 function serveLogger() {
 	let windowStart = -Infinity;

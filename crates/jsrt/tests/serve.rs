@@ -817,6 +817,16 @@ fn the_bad_answer_log_line_hides_queries_and_is_rate_limited() {
     assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
     let err = stderr(&out);
     assert!(!err.contains("SEKRET"), "the query reached the log: {err}");
+    // Only the first path segment is named; tokens live deeper (and the
+    // padded segment here is the second one).
+    assert!(
+        !err.contains("ppppp"),
+        "a deeper path segment reached the log"
+    );
+    assert!(
+        err.contains("GET /bad/..."),
+        "the first segment is named: {err}"
+    );
     let lines: Vec<&str> = err.lines().filter(|l| l.contains("answered 500")).collect();
     assert!(
         (1..=10).contains(&lines.len()),
