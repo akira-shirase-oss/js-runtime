@@ -77,7 +77,8 @@ pub struct ServeGrant {
     /// Deadline for a request body once its head has arrived.
     pub body_timeout: std::time::Duration,
     /// Longest a response write may make no progress; past it the
-    /// connection, and its slot, are dropped.
+    /// connection, and its slot, are dropped. Keep it at 5 s or more: a
+    /// review run saw 1 s cut legitimate slow downloads under load.
     pub write_timeout: std::time::Duration,
 }
 
