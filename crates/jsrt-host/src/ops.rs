@@ -120,7 +120,11 @@ async fn op_sleep(ms: f64) -> Result<(), JsErrorBox> {
             "rt.sleep: ms must be a non-negative number",
         ));
     }
-    tokio::time::sleep(Duration::from_secs_f64(ms / 1000.0)).await;
+    // `from_secs_f64` panics past Duration's range (rt.sleep(1e30)), and a
+    // panic inside an op aborts the host. A sleep that long is "longer than
+    // any run": saturate, tokio clamps it further, the run timeout ends it.
+    let duration = Duration::try_from_secs_f64(ms / 1000.0).unwrap_or(Duration::MAX);
+    tokio::time::sleep(duration).await;
     Ok(())
 }
 

@@ -128,6 +128,27 @@ fn a_cpu_bound_loop_dies_terminated() {
 }
 
 #[test]
+fn an_unrepresentable_sleep_is_bounded_by_the_watchdog_not_a_host_panic() {
+    let rig = Rig::new();
+    // 1e30 ms overflows Duration; the sleep must just be "longer than this
+    // run" -- the watchdog ends it as terminated (6), the host never panics.
+    let script = rig.script("sleep.js", "rt.print('start\\n');\nawait rt.sleep(1e30);\n");
+    let out = rig.run_script(&script, &["--timeout", "400"]);
+    assert_eq!(
+        out.status.code(),
+        Some(6),
+        "status {:?}, stderr: {}",
+        out.status,
+        stderr(&out)
+    );
+    assert!(
+        !stderr(&out).contains("panicked"),
+        "stderr: {}",
+        stderr(&out)
+    );
+}
+
+#[test]
 fn a_stalled_promise_dies_terminated() {
     let rig = Rig::new();
     let script = rig.script("stall.js", "await new Promise(() => {});\n");
