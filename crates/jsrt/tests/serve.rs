@@ -867,3 +867,42 @@ fn an_out_of_range_connection_cap_is_a_manifest_error() {
         assert!(stderr(&out).contains("max_connections"), "{}", stderr(&out));
     }
 }
+
+#[test]
+fn header_arrays_repeat_and_non_scalar_values_are_a_500() {
+    let rig = Rig::new();
+    let port = Rig::free_port();
+    let child = route_app(
+        &rig,
+        port,
+        "",
+        "if (req.path === '/cookies') return {headers: {'set-cookie': ['a=1; Path=/', 'b=2; Path=/']}, body: 'c'};\n\
+         if (req.path === '/obj-header') return {headers: {'x-obj': {a: 1}}, body: 'nope'};\n\
+         if (req.path === '/fn-header') return {headers: {'x-fn': () => 1}, body: 'nope'};\n\
+         if (req.path === '/nested-array') return {headers: {'x-a': [['x']]}, body: 'nope'};",
+    );
+    let mut s = connect(port);
+    s.set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap_or_else(|e| panic!("timeout: {e}"));
+    s.write_all(b"GET /cookies HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+        .unwrap_or_else(|e| panic!("write: {e}"));
+    let mut raw = String::new();
+    let _ = s.read_to_string(&mut raw);
+    let cookies: Vec<&str> = raw
+        .lines()
+        .filter_map(|l| l.strip_prefix("set-cookie: "))
+        .collect();
+    assert_eq!(cookies, ["a=1; Path=/", "b=2; Path=/"], "response: {raw:?}");
+    for path in ["/obj-header", "/fn-header", "/nested-array"] {
+        let (status, _head, body) = http(
+            port,
+            &format!("GET {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"),
+        );
+        assert_eq!(status, 500, "{path}: {body:?}");
+    }
+    quit(port);
+    let out = child
+        .wait_with_output()
+        .unwrap_or_else(|e| panic!("wait: {e}"));
+    assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
+}

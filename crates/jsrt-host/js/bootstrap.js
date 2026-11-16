@@ -103,6 +103,33 @@ function serveLogger() {
 	};
 }
 
+// A handler's headers as [name, value] pairs. An array value repeats the
+// header (set-cookie needs one line per cookie, never a comma-joined one);
+// strings, numbers, booleans and bigints become their text; anything else
+// -- an object, a function, a nested array -- is not a header value and
+// sends the answer down the 500 path instead of "[object Object]".
+function answerHeaders(headers) {
+	if (headers === undefined || headers === null) return [];
+	if (typeof headers !== "object" || Array.isArray(headers)) {
+		throw new TypeError("rt.serve: headers must be an object of name: value");
+	}
+	const pairs = [];
+	for (const [name, value] of Object.entries(headers)) {
+		const values = Array.isArray(value) ? value : [value];
+		for (const one of values) {
+			const kind = typeof one;
+			if (kind !== "string" && kind !== "number" && kind !== "boolean" && kind !== "bigint") {
+				throw new TypeError(
+					"rt.serve: header " + String(name).slice(0, 64) + " has a " +
+						(Array.isArray(one) ? "nested array" : kind) + " value",
+				);
+			}
+			pairs.push([String(name), String(one)]);
+		}
+	}
+	return pairs;
+}
+
 globalThis.rt = {
 	/** Write to stdout with no added newline (deno_core's builtin op_print). */
 	print: (msg) => corePrint(String(msg), false),
@@ -199,9 +226,7 @@ globalThis.rt = {
 									", not {status, headers, body}",
 							);
 						}
-						const headers = res.headers
-							? Object.entries(res.headers).map(([k, v]) => [String(k), String(v)])
-							: [];
+						const headers = answerHeaders(res.headers);
 						ops.op_serve_respond(
 							rid,
 							req.id,
