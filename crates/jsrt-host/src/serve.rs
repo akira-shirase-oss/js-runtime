@@ -269,30 +269,61 @@ fn op_serve_listen(
     let slots = Arc::new(Semaphore::new(grant.max_connections));
     let task_resource = resource.clone();
     let task = deno_core::unsync::spawn(async move {
+        let conns = Connections::default();
         loop {
-            // A slot first, then accept: past the cap, connections queue in
-            // the kernel backlog, not as tasks and buffers in this process.
-            let Ok(slot) = Arc::clone(&slots).acquire_owned().await else {
-                return;
+            // Below the cap: a slot first, then accept. At the cap: wait for
+            // a client to actually arrive, then close the connection that
+            // has been idle longest (never one the script is handling) to
+            // make room. Without that, max_connections idle or slow
+            // sockets held every slot for the header/body timeouts and the
+            // attacker just reconnected. If every connection is busy in
+            // the script, the newcomer waits for a slot as before.
+            let (slot, accepted) = match Arc::clone(&slots).try_acquire_owned() {
+                Ok(slot) => (slot, listener.accept().await),
+                Err(_) => {
+                    let accepted = listener.accept().await;
+                    if accepted.is_ok() {
+                        conns.evict_longest_idle();
+                    }
+                    let Ok(slot) = Arc::clone(&slots).acquire_owned().await else {
+                        return;
+                    };
+                    (slot, accepted)
+                }
             };
-            match listener.accept().await {
+            match accepted {
                 Ok((stream, _)) => {
                     let tx = tx.clone();
                     let res = task_resource.clone();
                     let limits = limits.clone();
+                    let (track, evicted) = conns.register();
+                    let conns = conns.clone();
                     deno_core::unsync::spawn(async move {
                         // Held for the connection's whole life.
                         let _slot = slot;
+                        let svc_track = Rc::clone(&track);
                         let svc = service_fn(move |req: Request<Incoming>| {
-                            dispatch(req, tx.clone(), res.clone(), limits.clone())
+                            dispatch(
+                                req,
+                                tx.clone(),
+                                res.clone(),
+                                limits.clone(),
+                                Rc::clone(&svc_track),
+                            )
                         });
-                        let io = TokioIo::new(StallGuard::new(stream, write_timeout));
-                        let _ = hyper::server::conn::http1::Builder::new()
+                        let io =
+                            TokioIo::new(StallGuard::new(stream, write_timeout, Rc::clone(&track)));
+                        let serving = hyper::server::conn::http1::Builder::new()
                             .max_buf_size(HEAD_BUF_MAX)
                             .timer(TokioTimer::new())
                             .header_read_timeout(header_timeout)
-                            .serve_connection(io, svc)
-                            .await;
+                            .serve_connection(io, svc);
+                        // Dropping the connection future closes the socket.
+                        tokio::select! {
+                            _ = serving => {}
+                            _ = evicted => {}
+                        }
+                        conns.forget(track.id);
                     });
                 }
                 Err(_) => {
@@ -312,6 +343,85 @@ fn op_serve_listen(
     Ok(rid)
 }
 
+/// What the accept loop knows about one live connection.
+struct ConnTrack {
+    id: u64,
+    /// When a byte last moved on the socket, either way.
+    last_io: std::cell::Cell<tokio::time::Instant>,
+    /// Requests on this connection the script is handling right now —
+    /// such a connection is never evicted.
+    in_script: std::cell::Cell<u32>,
+    /// Fired to close the connection when it is evicted.
+    evict: RefCell<Option<oneshot::Sender<()>>>,
+}
+
+/// Live connections of one listener, for eviction at the cap. Single
+/// threaded: everything here runs on the script's executor.
+#[derive(Clone, Default)]
+struct Connections {
+    live: Rc<RefCell<HashMap<u64, Rc<ConnTrack>>>>,
+    next_id: Rc<std::cell::Cell<u64>>,
+}
+
+impl Connections {
+    fn register(&self) -> (Rc<ConnTrack>, oneshot::Receiver<()>) {
+        let (tx, rx) = oneshot::channel();
+        let id = self.next_id.get();
+        self.next_id.set(id + 1);
+        let track = Rc::new(ConnTrack {
+            id,
+            last_io: std::cell::Cell::new(tokio::time::Instant::now()),
+            in_script: std::cell::Cell::new(0),
+            evict: RefCell::new(Some(tx)),
+        });
+        self.live.borrow_mut().insert(id, Rc::clone(&track));
+        (track, rx)
+    }
+
+    fn forget(&self, id: u64) {
+        self.live.borrow_mut().remove(&id);
+    }
+
+    /// Close the connection that has moved no bytes for longest and has no
+    /// request in the script. Returns whether one was found.
+    fn evict_longest_idle(&self) -> bool {
+        let victim = self
+            .live
+            .borrow()
+            .values()
+            .filter(|c| c.in_script.get() == 0 && c.evict.borrow().is_some())
+            .min_by_key(|c| c.last_io.get())
+            .cloned();
+        match victim {
+            Some(conn) => {
+                if let Some(tx) = conn.evict.borrow_mut().take() {
+                    let _ = tx.send(());
+                }
+                true
+            }
+            None => false,
+        }
+    }
+}
+
+/// Marks a request as being in the script for as long as it lives.
+struct InScript(Rc<ConnTrack>);
+
+impl InScript {
+    fn new(track: Rc<ConnTrack>) -> Self {
+        track.in_script.set(track.in_script.get() + 1);
+        Self(track)
+    }
+}
+
+impl Drop for InScript {
+    fn drop(&mut self) {
+        self.0
+            .in_script
+            .set(self.0.in_script.get().saturating_sub(1));
+    }
+}
+
 /// A socket whose writes give up when they make no progress for `limit`.
 /// hyper's header timer only runs while it reads a head; once a response
 /// is being written, a peer that stops reading would park the write (and
@@ -321,15 +431,22 @@ struct StallGuard<T> {
     inner: T,
     limit: Duration,
     stalled: Option<Pin<Box<tokio::time::Sleep>>>,
+    /// Every byte that moves refreshes the connection's idle clock.
+    track: Rc<ConnTrack>,
 }
 
 impl<T> StallGuard<T> {
-    fn new(inner: T, limit: Duration) -> Self {
+    fn new(inner: T, limit: Duration, track: Rc<ConnTrack>) -> Self {
         Self {
             inner,
             limit,
             stalled: None,
+            track,
         }
+    }
+
+    fn moved(&self) {
+        self.track.last_io.set(tokio::time::Instant::now());
     }
 
     /// Map a pending write-side poll onto the stall clock.
@@ -364,7 +481,12 @@ impl<T: AsyncRead + Unpin> AsyncRead for StallGuard<T> {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_read(cx, buf)
+        let before = buf.filled().len();
+        let poll = Pin::new(&mut self.inner).poll_read(cx, buf);
+        if matches!(poll, Poll::Ready(Ok(()))) && buf.filled().len() > before {
+            self.moved();
+        }
+        poll
     }
 }
 
@@ -375,6 +497,9 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for StallGuard<T> {
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         let poll = Pin::new(&mut self.inner).poll_write(cx, buf);
+        if matches!(poll, Poll::Ready(Ok(n)) if n > 0) {
+            self.moved();
+        }
         self.watch(cx, poll)
     }
 
@@ -384,6 +509,9 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for StallGuard<T> {
         bufs: &[io::IoSlice<'_>],
     ) -> Poll<io::Result<usize>> {
         let poll = Pin::new(&mut self.inner).poll_write_vectored(cx, bufs);
+        if matches!(poll, Poll::Ready(Ok(n)) if n > 0) {
+            self.moved();
+        }
         self.watch(cx, poll)
     }
 
@@ -504,6 +632,7 @@ async fn dispatch(
     tx: mpsc::Sender<(ServeReq, PendingResponse)>,
     res: Rc<ServeResource>,
     limits: WireLimits,
+    track: Rc<ConnTrack>,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
     fn plain(status: u16, msg: &'static str) -> Response<Full<Bytes>> {
         Response::builder()
@@ -559,6 +688,9 @@ async fn dispatch(
         Err(_) => return Ok(plain(408, "request body timeout")),
     };
 
+    // From here until the answer is built the request belongs to the
+    // script, and its connection is not a candidate for eviction.
+    let _in_script = InScript::new(track);
     let id = res.next_id.fetch_add(1, Ordering::Relaxed);
     let (rtx, rrx) = oneshot::channel();
     let msg = ServeReq {
