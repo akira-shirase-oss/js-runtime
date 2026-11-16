@@ -127,3 +127,7 @@ docs/              ROADMAP and module notes
 
 Build: `export PATH="$(brew --prefix rustup)/bin:$PATH"; cargo build` —
 the first build downloads ~95 MB of prebuilt V8.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
