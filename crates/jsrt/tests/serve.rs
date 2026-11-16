@@ -740,3 +740,37 @@ fn the_bad_answer_log_line_hides_queries_and_is_rate_limited() {
         "the suppressed count is reported: {err}"
     );
 }
+
+#[test]
+fn an_out_of_range_connection_cap_is_a_manifest_error() {
+    let rig = Rig::new();
+    let port = Rig::free_port();
+    let script = rig.script(
+        "s.js",
+        &format!("const s = rt.serve({{host: '127.0.0.1', port: {port}}}, async () => ({{}}));\ns.close();\n"),
+    );
+    // 2^61 is past tokio's semaphore limit (it used to abort the host,
+    // exit 134); 70000 is past the documented bound.
+    for cap in ["2305843009213693952", "70000"] {
+        let manifest = rig.script(
+            "m.manifest.json",
+            &format!(
+                "{{ \"serve\": {{\"host\": \"127.0.0.1\", \"port\": {port}, \"max_connections\": {cap}}} }}\n"
+            ),
+        );
+        let out = rig.run(&[
+            "run",
+            script_arg(&script),
+            "--manifest",
+            script_arg(&manifest),
+        ]);
+        assert_eq!(
+            out.status.code(),
+            Some(8),
+            "cap {cap}: {:?} {}",
+            out.status,
+            stderr(&out)
+        );
+        assert!(stderr(&out).contains("max_connections"), "{}", stderr(&out));
+    }
+}

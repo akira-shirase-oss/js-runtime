@@ -29,6 +29,10 @@ const DEFAULT_SERVE_MAX_BODY: u64 = 8 * 1024 * 1024;
 /// Default concurrent connections per listener; past it, new connections
 /// wait in the kernel's accept backlog.
 pub const DEFAULT_SERVE_MAX_CONNECTIONS: usize = 256;
+/// Largest `max_connections` a manifest may declare — far above what one
+/// process should hold, and far below tokio's semaphore limit (2^61 - 1),
+/// past which building the listener would abort the host.
+pub const MAX_SERVE_MAX_CONNECTIONS: u64 = 65_536;
 /// Default time a connection may take to send a request head — and how
 /// long it may sit idle between keep-alive requests.
 pub const DEFAULT_SERVE_HEADER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
@@ -337,7 +341,14 @@ impl Capabilities {
                 }
             };
             if let Some(n) = serve.max_connections {
-                grant.max_connections = positive("max_connections", n as u64)? as usize;
+                let n = positive("max_connections", n as u64)?;
+                if n > MAX_SERVE_MAX_CONNECTIONS {
+                    return Err(HostError::Host(format!(
+                        "manifest serve max_connections {n} is above the limit of \
+                         {MAX_SERVE_MAX_CONNECTIONS}"
+                    )));
+                }
+                grant.max_connections = n as usize;
             }
             if let Some(ms) = serve.header_timeout_ms {
                 grant.header_timeout =
