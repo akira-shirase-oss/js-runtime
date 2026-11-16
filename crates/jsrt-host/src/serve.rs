@@ -109,6 +109,53 @@ fn host_err(msg: String) -> JsErrorBox {
     JsErrorBox::new("HostError", msg)
 }
 
+/// The first request id a listener hands out (default 1). An embedder
+/// knob that lets tests start past `u32::MAX` without sending four billion
+/// requests; scripts cannot reach `OpState`.
+#[derive(Debug, Clone, Copy)]
+pub struct FirstRequestId(pub u64);
+
+/// Largest integer a JS number carries exactly — ids beyond it would be
+/// rounded on their way through the script.
+const MAX_SAFE_ID: f64 = 9_007_199_254_740_991.0;
+
+/// A request id back from the script: a JS number holding a whole u64.
+fn request_id(raw: f64) -> Result<u64, JsErrorBox> {
+    if raw.is_finite() && raw >= 1.0 && raw.fract() == 0.0 && raw <= MAX_SAFE_ID {
+        Ok(raw as u64)
+    } else {
+        Err(JsErrorBox::type_error(format!(
+            "rt.serve: {raw} is not a request id"
+        )))
+    }
+}
+
+/// Build the wire response, or say why the handler's answer can't be one.
+fn build_response(
+    status: f64,
+    headers: Vec<(String, String)>,
+    body: String,
+) -> Result<Response<Full<Bytes>>, String> {
+    // 1xx cannot be a final answer and hyper would mis-frame it; 6xx-9xx
+    // are not HTTP. Fractions, NaN and out-of-range numbers fail here too.
+    if !(status.fract() == 0.0 && (200.0..=599.0).contains(&status)) {
+        return Err(format!("status {status} is not an HTTP status in 200-599"));
+    }
+    let mut builder = Response::builder().status(status as u16);
+    for (k, v) in headers {
+        builder = builder.header(k, v);
+    }
+    builder
+        .body(Full::new(Bytes::from(body)))
+        .map_err(|e| format!("invalid response: {e}"))
+}
+
+fn internal_error() -> Response<Full<Bytes>> {
+    let mut response = Response::new(Full::new(Bytes::from_static(b"invalid handler response")));
+    *response.status_mut() = http::StatusCode::INTERNAL_SERVER_ERROR;
+    response
+}
+
 /// `rt.serve` step one: bind the declared address, spawn the accept loop,
 /// return the resource id. Sync — `TcpListener::bind` is a syscall, not
 /// worth an await.
@@ -147,7 +194,12 @@ fn op_serve_listen(
     let resource = Rc::new(ServeResource {
         rx: TokioMutex::new(rx),
         pending: Mutex::new(HashMap::new()),
-        next_id: AtomicU64::new(1),
+        next_id: AtomicU64::new(
+            state
+                .borrow()
+                .try_borrow::<FirstRequestId>()
+                .map_or(1, |first| first.0),
+        ),
         accept_task: Mutex::new(None),
     });
 
@@ -332,39 +384,46 @@ async fn op_serve_next(
 }
 
 /// `op_serve_respond(rid, reqId, status, headers, body)` — write the
-/// script's answer back over the wire. Unknown ids (client hung up first)
-/// are a quiet no-op, not an error.
+/// script's answer back over the wire. Unknown ids (client hung up first,
+/// or already answered) and a closed listener (its close answered every
+/// in-flight request 503) are a quiet no-op. An answer that can't be an
+/// HTTP response is sent as a 500 *and* reported to the script as a
+/// TypeError — the client is never left with an empty 200 or no answer.
+///
+/// Ids travel as JS numbers (f64): exact up to 2^53, where a `u32`
+/// parameter used to wrap them after 2^32 requests and drop the answer.
 #[op2]
 fn op_serve_respond(
     state: Rc<RefCell<OpState>>,
     rid: ResourceId,
-    req_id: u32,
-    status: u32,
+    req_id: f64,
+    status: f64,
     #[serde] headers: Vec<(String, String)>,
     #[string] body: String,
 ) -> Result<(), JsErrorBox> {
-    let res = state
-        .borrow()
-        .resource_table
-        .get::<ServeResource>(rid)
-        .map_err(|e| host_err(format!("serve respond: {e}")))?;
+    let id = request_id(req_id)?;
+    let Ok(res) = state.borrow().resource_table.get::<ServeResource>(rid) else {
+        return Ok(());
+    };
     let sender = res
         .pending
         .lock()
         .ok()
-        .and_then(|mut pending| pending.remove(&u64::from(req_id)));
-    if let Some(sender) = sender {
-        let mut builder = Response::builder().status(status as u16);
-        for (k, v) in headers {
-            builder = builder.header(k, v);
+        .and_then(|mut pending| pending.remove(&id));
+    let Some(sender) = sender else {
+        return Ok(());
+    };
+    // If the client already hung up, send fails — fine either way.
+    match build_response(status, headers, body) {
+        Ok(response) => {
+            let _ = sender.send(response);
+            Ok(())
         }
-        let response = builder
-            .body(Full::new(Bytes::from(body)))
-            .unwrap_or_else(|_| Response::new(Full::new(Bytes::new())));
-        // If the client already hung up, send fails — fine.
-        let _ = sender.send(response);
+        Err(why) => {
+            let _ = sender.send(internal_error());
+            Err(JsErrorBox::type_error(format!("rt.serve: {why}")))
+        }
     }
-    Ok(())
 }
 
 /// `op_serve_close(rid)` — take the resource out of the table; its close

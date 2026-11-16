@@ -393,6 +393,84 @@ mod tests {
         );
     }
 
+    /// Request ids are u64 on the wire side and JS numbers in the script.
+    /// The respond op used to take a u32, so from request 2^32 on every
+    /// answer went to the wrong id and the client waited for nothing.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_request_id_past_u32_still_gets_its_answer() {
+        use std::io::{Read, Write};
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .and_then(|l| l.local_addr())
+            .unwrap_or_else(|e| panic!("free port: {e}"))
+            .port();
+        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+        let capabilities = crate::Capabilities::from_grants(crate::capability::Grants {
+            serve: Some(crate::capability::ServeGrant::new(addr, 1024)),
+            ..Default::default()
+        });
+        let options = super::HostOptions {
+            capabilities,
+            ..Default::default()
+        };
+        let mut runtime = super::build_runtime(&options, None);
+        let first = (1u64 << 32) + 5;
+        runtime
+            .op_state()
+            .borrow_mut()
+            .put(crate::serve::FirstRequestId(first));
+
+        let client = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let mut stream = loop {
+                match std::net::TcpStream::connect(addr) {
+                    Ok(s) => break s,
+                    Err(e) if std::time::Instant::now() < deadline => {
+                        let _ = e;
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                    }
+                    Err(e) => panic!("listener never came up: {e}"),
+                }
+            };
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap_or_else(|e| panic!("timeout: {e}"));
+            stream
+                .write_all(b"GET /id HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+                .unwrap_or_else(|e| panic!("write: {e}"));
+            let mut response = String::new();
+            let _ = stream.read_to_string(&mut response);
+            response
+        });
+
+        let source = format!(
+            "const s = rt.serve({{host: '127.0.0.1', port: {port}}}, async (req) => {{\n\
+               rt.setTimeout(() => s.close(), 50);\n\
+               return {{status: 200, body: String(req.id)}};\n\
+             }});\n"
+        );
+        let specifier =
+            ModuleSpecifier::parse("file:///ids.js").unwrap_or_else(|e| panic!("specifier: {e}"));
+        let module = runtime
+            .load_main_es_module_from_code(&specifier, source)
+            .await
+            .unwrap_or_else(|e| panic!("load: {e}"));
+        let evaluation = runtime.mod_evaluate(module);
+        runtime
+            .run_event_loop(Default::default())
+            .await
+            .unwrap_or_else(|e| panic!("event loop: {e}"));
+        evaluation.await.unwrap_or_else(|e| panic!("evaluate: {e}"));
+        let response = client.join().unwrap_or_else(|_| panic!("client panicked"));
+        assert!(
+            response.starts_with("HTTP/1.1 200"),
+            "response: {response:?}"
+        );
+        assert!(
+            response.ends_with(&first.to_string()),
+            "the script saw id {first} exactly: {response:?}"
+        );
+    }
+
     // ---- M2.3: what a script leaves open is counted, and dies with the run.
 
     /// A timer a script abandons is *seen* at teardown — an unref'd pending

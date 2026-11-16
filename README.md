@@ -36,7 +36,7 @@ cannot import `ext:` modules. A test proves `op_panic` is unreachable.
 | `rt.pendingTimers()` | how many timers this script still owns | none |
 | `rt.kv.get/put/delete/list` | embedded SQLite store; `list` is an exact-prefix scan | declared `kv` file + `max_bytes` quota |
 | `rt.media.put/stat` | streamed content-addressed uploads (sha256 names) | declared `media` root; the source still needs a `read` grant |
-| `rt.serve(opts, handler)` | HTTP listener, pull-model dispatch; a handler crash is a 500, not a dead host | declared `serve` host/port — loopback IP literals only — plus `max_body`, `max_connections` (default 256; the rest wait in the accept backlog), `header_timeout_ms` (default 10 s, also bounds keep-alive idling) and `body_timeout_ms` (default 30 s, then 408) |
+| `rt.serve(opts, handler)` | HTTP listener, pull-model dispatch; a handler that throws, returns no object, or returns an invalid status (outside 200-599) or header is a 500 plus a stderr line — not a dead host, an empty 200 or a hung client | declared `serve` host/port — loopback IP literals only — plus `max_body`, `max_connections` (default 256; the rest wait in the accept backlog), `header_timeout_ms` (default 10 s, also bounds keep-alive idling) and `body_timeout_ms` (default 30 s, then 408) |
 
 `console.log` also works (deno_core's minimal console). Anything not listed
 does not exist for the script — that is the point.

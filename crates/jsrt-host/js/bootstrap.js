@@ -140,16 +140,42 @@ globalThis.rt = {
 					} catch (e) {
 						res = { status: 500, body: "handler error" };
 					}
+					// Every request gets an answer. Whatever the handler
+					// returned is normalized here (header values to strings,
+					// status to a number); anything that still cannot become
+					// a response -- no object at all, a bad header name, a
+					// status outside 200-599 -- is a 500 on the wire and a
+					// line on stderr, never an empty 200 or a client left
+					// waiting. A closed listener or a vanished client is not
+					// an error: the op answers those itself.
 					try {
+						if (res === null || typeof res !== "object") {
+							throw new TypeError(
+								"rt.serve: the handler returned " + typeof res +
+									", not {status, headers, body}",
+							);
+						}
+						const headers = res.headers
+							? Object.entries(res.headers).map(([k, v]) => [String(k), String(v)])
+							: [];
 						ops.op_serve_respond(
 							rid,
 							req.id,
-							res.status ?? 200,
-							res.headers ? Object.entries(res.headers) : [],
+							Number(res.status ?? 200),
+							headers,
 							String(res.body ?? ""),
 						);
 					} catch (e2) {
-						// Client gone or listener closing -- nothing to save.
+						corePrint(
+							"jsrt: serve: " + req.method + " " + req.path + ": " +
+								String(e2 && e2.message) + " -- answered 500\n",
+							true,
+						);
+						try {
+							ops.op_serve_respond(rid, req.id, 500, [], "invalid handler response");
+						} catch (e3) {
+							// Already answered by the failing call -- nothing left.
+						}
 					}
 				}
 			} finally {

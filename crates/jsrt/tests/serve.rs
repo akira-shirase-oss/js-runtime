@@ -51,9 +51,12 @@ impl Rig {
         let mut args = vec!["run"];
         args.push(script.to_str().unwrap_or_else(|| panic!("utf8")));
         args.extend_from_slice(extra);
+        // stderr is piped so tests can read what the host told the
+        // operator (it is small: a few lines at most).
         Command::new(JSRT)
             .args(&args)
             .current_dir(self.dir.path())
+            .stderr(std::process::Stdio::piped())
             .spawn()
             .unwrap_or_else(|e| panic!("spawn jsrt: {e}"))
     }
@@ -511,4 +514,64 @@ fn connections_past_the_cap_wait_for_a_free_slot() {
         .wait_with_output()
         .unwrap_or_else(|e| panic!("wait: {e}"));
     assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
+}
+
+// ---- Every request gets a real answer ---------------------------------------
+
+#[test]
+fn a_malformed_handler_answer_is_a_500_and_the_listener_lives() {
+    let rig = Rig::new();
+    let port = Rig::free_port();
+    let manifest = rig.script(
+        "m.manifest.json",
+        &format!("{{ \"serve\": {{\"host\": \"127.0.0.1\", \"port\": {port}}} }}\n"),
+    );
+    let script = rig.script(
+        "app.js",
+        &"const server = rt.serve({host: '127.0.0.1', port: PORT}, async (req) => {\n\
+            switch (req.path) {\n\
+              case '/none': return undefined;\n\
+              case '/bad-header': return {status: 200, headers: {'bad header': 'x'}, body: 'nope'};\n\
+              case '/bad-status': return {status: 70000, body: 'nope'};\n\
+              case '/number-header': return {headers: {'x-n': 5}, body: 'five'};\n\
+              default: return {status: 201, body: 'alive'};\n\
+            }\n\
+          });\n\
+          rt.setTimeout(() => server.close(), 3000);\n"
+            .replace("PORT", &port.to_string()),
+    );
+    let child = rig.spawn_serve(
+        &script,
+        &[
+            "--manifest",
+            manifest.to_str().unwrap_or_else(|| panic!("utf8")),
+        ],
+    );
+    let get = |path: &str| {
+        http(
+            port,
+            &format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"),
+        )
+    };
+    // No answer object, an invalid header name, an out-of-range status:
+    // each is a 500 -- never an empty 200, never a hung client.
+    for path in ["/none", "/bad-header", "/bad-status"] {
+        let (status, _head, body) = get(path);
+        assert_eq!(status, 500, "{path}: body {body:?}");
+    }
+    // A non-string header value is coerced, not a dropped request.
+    let (status, _head, body) = get("/number-header");
+    assert_eq!((status, body.as_str()), (200, "five"));
+    // And the listener is still serving.
+    let (status, _head, body) = get("/alive");
+    assert_eq!((status, body.as_str()), (201, "alive"));
+    let out = child
+        .wait_with_output()
+        .unwrap_or_else(|e| panic!("wait: {e}"));
+    assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
+    assert!(
+        stderr(&out).contains("answered 500"),
+        "the operator is told why: {}",
+        stderr(&out)
+    );
 }
