@@ -49,7 +49,11 @@ Exactly one namespace — `rt.*`. No ambient `Deno`, no ungated global:
 deno_core installs `globalThis.Deno.core` (the raw ops table, including
 `op_panic`) and `globalThis.__bootstrap` for extension code; the bootstrap
 captures what it needs and deletes both before any script runs, and scripts
-cannot import `ext:` modules. A test proves `op_panic` is unreachable.
+cannot import `ext:` modules. Tests probe the known paths (`Deno.core.ops`,
+`__bootstrap.core.ops`, `ext:core/*` imports, the global names); they cannot
+prove no other path exists. The deletion relies on deno_core not reading
+`globalThis.Deno` after start-up, which holds for 0.413 and must be checked
+again on every deno_core upgrade.
 
 | API | What it does | Gate |
 |---|---|---|

@@ -4,7 +4,7 @@ https://github.com/akira-shirase-oss/js-runtime
 
 `jsrt` is a purpose-built JavaScript host: V8 runs the script through `deno_core`, and the Rust host owns capabilities, the process lifecycle, and exit codes. Scripts see one namespace, `rt.*`. There is no ambient `Deno`, and with no manifest there is no filesystem and no network — the script can compute and print, nothing else. The M0–M7 roadmap is marked complete in the README.
 
-Written against commit `c30ac2e` (2026-11-07). `Cargo.toml` says MIT; there is no `LICENSE` file.
+Written against commit `c30ac2e` (2026-11-07) and updated for the 2026-11-16 security fixes and their review follow-ups; see "Changes since `c30ac2e`" below and the README's "Breaking changes". The code is MIT (`LICENSE`).
 
 ## Prerequisites
 
@@ -50,7 +50,7 @@ Example manifest shape (from the README):
 }
 ```
 
-CLI flags `--read`, `--net`, `--kv`, `--media-root`, and `--serve` **extend** the manifest only; they never weaken it.
+CLI flags `--read`, `--net`, `--net-private`, `--kv`, `--media-root`, and `--serve` **extend** the manifest only; they never weaken it.
 
 A small real app (HTTP webhook + embedded SQLite kv, under the supervisor):
 
@@ -60,7 +60,7 @@ cd examples/webhook
 ./drill.sh
 ```
 
-`jsrt supervise` runs the script in a worker process (optional `--max-rss-mb`, `--max-cpu`, `--wall-ms`, `--report`).
+`jsrt supervise` runs the script in a worker process (optional `--max-rss-mb`, `--max-cpu`, `--wall-ms`, `--report`, `--max-output-kb`).
 
 Exit-code contract (don't collapse these):
 
@@ -76,6 +76,19 @@ Exit-code contract (don't collapse these):
 | 8 | host failed (bad manifest, internal) |
 
 **What was verified on a Linux box (2026-11-10, America/Toronto):** `cargo test --workspace --locked` passed (57 lifecycle + 6 serve + 8 supervise + 13 host tests). `jsrt run scripts/hello.js` exited 0 with the expected output. A `rt.readText("/etc/passwd")` with no manifest exited **7** with `CapabilityError`. A manifest with `"serve": { "host": "localhost", ... }` exited **8**: `manifest serve host 'localhost' is not an IP literal`.
+
+## Changes since `c30ac2e`
+
+`cargo test --workspace --locked` now runs **120 tests** (74 lifecycle + 15 serve + 11 supervise + 20 host), not 84. New behaviour worth trying:
+
+- `typeof Deno` and `typeof globalThis.__bootstrap` are `"undefined"`; `Deno.core.ops.op_panic(...)` is a `ReferenceError`, not a host abort.
+- A granted host that answers `302` to an ungranted one: exit **7**, and the ungranted host sees no connection.
+- `--net localhost:PORT` refuses (exit 7, "not a public address"); `--net-private localhost:PORT` or `{"host": "localhost:PORT", "private": true}` allows it. `HTTP(S)_PROXY` is ignored.
+- Beside the entry, `import x from './a.json' with { type: 'json' }` (or a text/bytes import, or `import './credentials'`) refuses with exit 7 unless the directory is a declared `read` path.
+- `rt.sleep(1e30)` under `--timeout 500` exits 6.
+- Fetch errors name only `scheme://host:port`.
+- `rt.serve`: a slowloris head is closed after `header_timeout_ms`, a stalled body gets 408, connections past `max_connections` wait, a client that never reads a big answer loses its slot after `write_timeout_ms`, 64 stalled uploads do not delay a GET, and a handler returning `undefined` (or a bad header/status) gets 500 with a short, query-free stderr line.
+- `jsrt supervise --max-output-kb 16` on a flooding worker: a cap notice while it runs, the stream's last 4 KiB re-shown at exit, and `output.*` counts in the report.
 
 ## Happy-path checklist
 
@@ -117,5 +130,5 @@ Send Vinay (`akira-shirase-oss` / @404humandev) a note, or open a GitHub issue, 
 
 ## Setup notes we hit
 
-- No `LICENSE` file, despite `license = "MIT"` in `Cargo.toml`.
+- (fixed 2026-11-16: the repository now has an MIT `LICENSE`.)
 - No CI and no `rust-toolchain.toml`, so a friend's default `rustc` may not match what this was tested with. Rust 1.99.1 worked.
