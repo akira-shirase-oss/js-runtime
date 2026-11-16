@@ -454,8 +454,14 @@ impl Capabilities {
             }
         });
         if !allowed {
+            // IPv6 hosts in brackets, so the port reads as a port.
+            let shown = if host.contains(':') {
+                format!("[{host}]:{port}")
+            } else {
+                format!("{host}:{port}")
+            };
             return Err(HostError::Capability(format!(
-                "fetch denied: {host}:{port} is not a declared net destination"
+                "fetch denied: {shown} is not a declared net destination"
             )));
         }
         Ok(())
@@ -700,6 +706,16 @@ mod tests {
         assert!(caps.may_net("http://[fe80::1]:1234/x").is_ok());
         assert!(caps.may_net("http://[::2]:7777/x").is_ok());
         assert!(caps.may_net("http://[::3]:7777/x").is_err());
+    }
+
+    #[test]
+    fn an_ipv6_refusal_brackets_the_host() {
+        let caps = Capabilities::deny_all();
+        let err = caps
+            .may_net("http://[::1]:8080/x")
+            .err()
+            .unwrap_or_else(|| panic!("must refuse"));
+        assert!(err.to_string().contains("[::1]:8080"), "{err}");
     }
 
     #[test]

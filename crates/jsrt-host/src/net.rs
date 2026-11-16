@@ -116,7 +116,10 @@ pub fn admit(host: &str, found: Vec<SocketAddr>) -> Result<Vec<SocketAddr>, NetD
 /// Whether an address is globally routable — not loopback, private,
 /// link-local (cloud metadata lives at 169.254.169.254), shared CGNAT,
 /// unspecified, multicast, broadcast, documentation, benchmarking or
-/// reserved. IPv4 embedded in IPv6 (mapped, NAT64) is judged as IPv4.
+/// reserved. IPv4 embedded in IPv6 (mapped, IPv4-translated, NAT64,
+/// 6to4) is judged as that IPv4; tunnels and prefixes that can reach an
+/// arbitrary IPv4 host behind them (Teredo, local-use NAT64) are not
+/// public.
 pub fn is_public(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => is_public_v4(v4),
@@ -125,17 +128,29 @@ pub fn is_public(ip: IpAddr) -> bool {
                 return is_public_v4(v4);
             }
             let seg = v6.segments();
-            if seg[..6] == [0x64, 0xff9b, 0, 0, 0, 0] {
-                let [a, b] = seg[6].to_be_bytes();
-                let [c, d] = seg[7].to_be_bytes();
-                return is_public_v4(Ipv4Addr::new(a, b, c, d));
+            let v4_at = |hi: u16, lo: u16| {
+                let [a, b] = hi.to_be_bytes();
+                let [c, d] = lo.to_be_bytes();
+                Ipv4Addr::new(a, b, c, d)
+            };
+            // NAT64 well-known prefix 64:ff9b::/96 and IPv4-translated
+            // ::ffff:0:a.b.c.d both carry the IPv4 address last.
+            if seg[..6] == [0x64, 0xff9b, 0, 0, 0, 0] || seg[..6] == [0, 0, 0, 0, 0xffff, 0] {
+                return is_public_v4(v4_at(seg[6], seg[7]));
+            }
+            // 6to4 (2002::/16) carries it right after the prefix.
+            if seg[0] == 0x2002 {
+                return is_public_v4(v4_at(seg[1], seg[2]));
             }
             !(seg[..6] == [0, 0, 0, 0, 0, 0] // ::, ::1, IPv4-compatible
                 || v6.is_multicast()
                 || v6.is_unique_local()
                 || v6.is_unicast_link_local()
                 || (seg[0] & 0xffc0) == 0xfec0 // site-local (deprecated)
-                || (seg[0] == 0x2001 && seg[1] == 0x0db8)) // documentation
+                || (seg[0] == 0x2001 && seg[1] == 0x0db8) // documentation
+                || (seg[0] == 0x2001 && seg[1] == 0) // Teredo 2001::/32
+                || (seg[0] == 0x64 && seg[1] == 0xff9b && seg[2] == 1) // local-use NAT64
+                || seg[..4] == [0x100, 0, 0, 0]) // discard-only 100::/64
         }
     }
 }
@@ -263,6 +278,12 @@ mod tests {
             "::ffff:127.0.0.1",
             "::ffff:169.254.169.254",
             "64:ff9b::a9fe:a9fe",
+            "64:ff9b:1::1",        // local-use NAT64
+            "2002:7f00:1::1",      // 6to4 wrapping 127.0.0.1
+            "2002:a9fe:a9fe::1",   // 6to4 wrapping 169.254.169.254
+            "2001:0:4136:e378::1", // Teredo tunnel
+            "::ffff:0:7f00:1",     // IPv4-translated 127.0.0.1
+            "100::1",              // discard-only
         ] {
             assert!(!is_public(ip(s)), "{s} must not count as public");
         }
@@ -279,6 +300,7 @@ mod tests {
             "2606:4700:4700::1111",
             "::ffff:8.8.8.8",
             "64:ff9b::808:808",
+            "2002:808:808::1", // 6to4 wrapping 8.8.8.8
         ] {
             assert!(is_public(ip(s)), "{s} must count as public");
         }
