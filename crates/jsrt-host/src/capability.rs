@@ -324,8 +324,12 @@ impl Capabilities {
     /// before comparison — the checked host is the one the client connects
     /// to, not the one that merely appears in the string.
     pub fn may_net(&self, url: &str) -> Result<(), HostError> {
-        let (host, port) = url_authority(url)
-            .ok_or_else(|| HostError::Capability(format!("fetch denied: unparseable URL {url}")))?;
+        let (host, port) = url_authority(url).ok_or_else(|| {
+            HostError::Capability(format!(
+                "fetch denied: unparseable URL {}",
+                crate::net::redact_url(url)
+            ))
+        })?;
         let allowed = self.net_hosts.iter().any(|entry| {
             match parse_net_grant(entry) {
                 Some((gh, gp)) => gh == host && gp.is_none_or(|p| p == port),

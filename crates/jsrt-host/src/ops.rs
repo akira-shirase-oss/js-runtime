@@ -165,29 +165,32 @@ async fn op_fetch(
     let client = http_client(&state)?;
     let budgets = budgets(&state);
     caps.may_net(&url).map_err(deny)?;
+    // Every message below names the destination without its userinfo or
+    // query string — the places credentials and tokens ride in a URL.
+    let shown = crate::net::redact_url(&url);
     let deadline = budgets.fetch_deadline;
     let max_body = budgets.fetch_max_body;
     let started = std::time::Instant::now();
     let mut response = tokio::time::timeout(deadline, client.get(&url).send())
         .await
-        .map_err(|_| host_err(format!("fetch {url}: deadline {deadline:?} exceeded")))?
+        .map_err(|_| host_err(format!("fetch {shown}: deadline {deadline:?} exceeded")))?
         // A redirect hop outside the grant comes back from inside the
         // client as our own refusal — it stays a CapabilityError.
         .map_err(|e| match crate::net::refusal(&e) {
             Some(why) => JsErrorBox::new("CapabilityError", why),
-            None => host_err(format!("fetch {url}: {}", crate::net::describe(&e))),
+            None => host_err(format!("fetch {shown}: {}", crate::net::describe(e))),
         })?;
     let status = response.status();
     let mut body = Vec::new();
     while let Some(chunk) = response
         .chunk()
         .await
-        .map_err(|e| host_err(format!("fetch {url}: body: {e}")))?
+        .map_err(|e| host_err(format!("fetch {shown}: body: {}", crate::net::describe(e))))?
     {
         body.extend_from_slice(&chunk);
         if body.len() as u64 > max_body {
             return Err(host_err(format!(
-                "fetch {url}: body exceeded {max_body} bytes"
+                "fetch {shown}: body exceeded {max_body} bytes"
             )));
         }
     }

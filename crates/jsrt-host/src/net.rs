@@ -149,10 +149,13 @@ pub fn refusal(err: &reqwest::Error) -> Option<String> {
 }
 
 /// The error and its cause chain on one line — reqwest's own Display stops
-/// at "error following redirect", which hides the reason.
-pub fn describe(err: &reqwest::Error) -> String {
+/// at "error following redirect", which hides the reason. The URL reqwest
+/// attaches is dropped (`without_url`): it carries the query string, and
+/// the caller names the destination itself through [`redact_url`].
+pub fn describe(err: reqwest::Error) -> String {
+    let err = err.without_url();
     let mut out = err.to_string();
-    let mut source = std::error::Error::source(err);
+    let mut source = std::error::Error::source(&err);
     while let Some(e) = source {
         let msg = e.to_string();
         if !out.contains(&msg) {
@@ -164,12 +167,45 @@ pub fn describe(err: &reqwest::Error) -> String {
     out
 }
 
+/// A URL fit for an error message or a log line: userinfo removed, the
+/// query and fragment replaced — those are where tokens and passwords
+/// travel. An unparseable URL is not echoed at all.
+pub fn redact_url(url: &str) -> String {
+    let Ok(mut parsed) = reqwest::Url::parse(url) else {
+        return format!("<unparseable URL, {} bytes>", url.len());
+    };
+    let had_query = parsed.query().is_some();
+    // Both fail only for URLs that cannot carry userinfo — nothing to strip.
+    let _ = parsed.set_username("");
+    let _ = parsed.set_password(None);
+    parsed.set_query(None);
+    parsed.set_fragment(None);
+    let mut shown = parsed.to_string();
+    if had_query {
+        shown.push_str("?[redacted]");
+    }
+    shown
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn ip(s: &str) -> IpAddr {
         s.parse().unwrap_or_else(|e| panic!("{s}: {e}"))
+    }
+
+    #[test]
+    fn redact_url_strips_userinfo_and_query() {
+        assert_eq!(
+            redact_url("https://alice:hunter2@api.example.com:8443/v1/x?token=abc#frag"),
+            "https://api.example.com:8443/v1/x?[redacted]"
+        );
+        assert_eq!(redact_url("http://a.b/plain"), "http://a.b/plain");
+        assert_eq!(
+            redact_url("http://alice@:99x/?t=1"),
+            "<unparseable URL, 22 bytes>"
+        );
     }
 
     #[test]

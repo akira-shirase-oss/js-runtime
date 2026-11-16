@@ -780,6 +780,61 @@ fn a_redirect_loop_inside_the_grant_is_bounded() {
 }
 
 #[test]
+fn fetch_errors_do_not_echo_credentials_or_query_strings() {
+    let rig = Rig::new();
+    // A port with nothing listening: the transport error path.
+    let dead = TcpListener::bind("127.0.0.1:0")
+        .unwrap_or_else(|e| panic!("bind: {e}"))
+        .local_addr()
+        .unwrap_or_else(|e| panic!("addr: {e}"))
+        .port();
+    let slow = Stub::start(respond("200 OK", b"late", 3000));
+    let big = Stub::start(respond("200 OK", &vec![b'x'; 5 * 1024 * 1024], 0));
+    let secret = |port: u16| format!("http://alice:hunter2@127.0.0.1:{port}/x?token=SEKRET");
+    let script = rig.script(
+        "f.js",
+        &format!(
+            "for (const url of ['{}', '{}', '{}', 'http://alice:hunter2@:99x/?token=SEKRET']) {{\n\
+               try {{ await rt.fetch(url); rt.print('fetched\\n'); }}\n\
+               catch (e) {{ rt.print(e.name + ': ' + e.message + '\\n'); }}\n\
+             }}\n\
+             await rt.fetch('{}');\n",
+            secret(dead),
+            secret(slow.port),
+            secret(big.port),
+            secret(dead),
+        ),
+    );
+    let out = rig.run_script(
+        &script,
+        &[
+            "--net",
+            &format!("127.0.0.1:{dead}"),
+            "--net",
+            &format!("127.0.0.1:{}", slow.port),
+            "--net",
+            &format!("127.0.0.1:{}", big.port),
+            "--fetch-timeout",
+            "300",
+        ],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let err = stderr(&out);
+    assert_eq!(code(&out), 8, "stdout: {stdout}\nstderr: {err}");
+    assert_eq!(stdout.lines().count(), 4, "stdout: {stdout}");
+    for leaked in ["hunter2", "alice", "SEKRET"] {
+        assert!(!stdout.contains(leaked), "{leaked} in stdout: {stdout}");
+        assert!(!err.contains(leaked), "{leaked} in stderr: {err}");
+    }
+    // The operator still learns where the failure was.
+    assert!(
+        stdout.contains(&format!("127.0.0.1:{}", slow.port)),
+        "stdout: {stdout}"
+    );
+    assert!(err.contains(&format!("127.0.0.1:{dead}")), "stderr: {err}");
+}
+
+#[test]
 fn a_redirect_inside_the_grant_is_still_followed() {
     let rig = Rig::new();
     let target = Stub::start(respond("200 OK", b"landed", 0));
