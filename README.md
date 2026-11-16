@@ -57,6 +57,11 @@ does not exist for the script — that is the point.
   compute and print, nothing else.
 - Paths are canonicalized before checking (symlinks and `..` cannot escape a
   declared directory); `host` alone allows any port, `host:port` is exact.
+- A *name* grant (`api.example.com`, `localhost`) connects to public
+  addresses only: a DNS answer in loopback, private, link-local (cloud
+  metadata), CGNAT or other non-routable ranges is refused with a
+  `CapabilityError`. To reach a private host, grant its IP literal
+  (`10.0.0.5:8080`, `127.0.0.1:3000`) — that never goes through DNS.
 - `serve` binds loopback IP literals only — `"localhost"` and public addresses
   are refused at manifest parse.
 - `--read`/`--net`/`--kv`/`--serve` CLI flags *extend* the manifest — additive

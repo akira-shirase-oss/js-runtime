@@ -717,6 +717,32 @@ fn a_redirect_to_an_undeclared_destination_is_refused() {
 }
 
 #[test]
+fn a_granted_name_that_resolves_to_a_private_address_is_refused() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    let rig = Rig::new();
+    let reached = Arc::new(AtomicUsize::new(0));
+    let reached_in_stub = Arc::clone(&reached);
+    let stub = Stub::start(move |s| {
+        reached_in_stub.fetch_add(1, Ordering::SeqCst);
+        respond("200 OK", b"loopback service", 0)(s);
+    });
+    // A name grant is checked by its string; what it resolves to decides
+    // where the connection goes. `localhost` stands for any granted name
+    // whose DNS answer is (or is rebound to) loopback, a private range or
+    // a metadata address.
+    let script = fetch_script(&rig, &format!("http://localhost:{}/", stub.port));
+    let out = rig.run_script(&script, &["--net", &format!("localhost:{}", stub.port)]);
+    assert_eq!(code(&out), 7, "stderr: {}", stderr(&out));
+    assert!(
+        stderr(&out).contains("not a public address"),
+        "stderr: {}",
+        stderr(&out)
+    );
+    assert_eq!(reached.load(Ordering::SeqCst), 0, "no connection was made");
+}
+
+#[test]
 fn a_redirect_loop_inside_the_grant_is_bounded() {
     let rig = Rig::new();
     // The stub's port is only known after bind, so the loop target is
