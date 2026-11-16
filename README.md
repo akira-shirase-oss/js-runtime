@@ -106,7 +106,10 @@ does not exist for the script — that is the point.
   `{"host": "db:5432", "private": true}` in the manifest, or
   `--net-private db:5432`. An IP-literal grant (`10.0.0.5:8080`,
   `127.0.0.1:3000`) never goes through DNS and needs no opt-in. A misspelt
-  key in the object form is a manifest error, not a silent public grant.
+  key in the object form is a manifest error naming the key, not a silent
+  public grant. The opt-in is per host name, not per grant: once any grant
+  for `db` says `"private": true`, every grant for `db` may resolve to a
+  private address (ports are still checked grant by grant).
 - `rt.fetch` ignores `HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY` on purpose:
   a proxy would connect, and resolve names, on the script's behalf to
   destinations the host never checked. There is no proxy setting yet, so on

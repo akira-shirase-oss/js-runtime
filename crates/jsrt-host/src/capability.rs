@@ -141,12 +141,33 @@ struct Manifest {
 
 /// One `net` entry: a bare `host[:port]` string, or an object that can
 /// opt the name into private resolution. Unknown keys in the object are an
-/// error — a misspelt opt-in must not turn into a silent public grant.
+/// error — a misspelt opt-in must not turn into a silent public grant —
+/// and the error names the key (an untagged enum would only say that no
+/// variant matched).
 #[derive(Debug, Deserialize)]
-#[serde(untagged)]
+#[serde(try_from = "serde_json::Value")]
 enum ManifestNet {
     Plain(String),
     Detailed(ManifestNetDetailed),
+}
+
+impl TryFrom<serde_json::Value> for ManifestNet {
+    type Error = String;
+
+    fn try_from(value: serde_json::Value) -> Result<Self, String> {
+        match value {
+            serde_json::Value::String(entry) => Ok(Self::Plain(entry)),
+            serde_json::Value::Object(_) => {
+                let shown = value.to_string();
+                serde_json::from_value(value)
+                    .map(Self::Detailed)
+                    .map_err(|e| format!("net entry {shown}: {e}"))
+            }
+            other => Err(format!(
+                "net entry {other}: expected \"host[:port]\" or {{\"host\": \"host[:port]\", \"private\": true}}"
+            )),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
