@@ -68,6 +68,21 @@ not a thing scripts can rely on.
 | 7.2 boundary + serve load (done) | **1,000,000 op calls** → 28.4ns/call (~25.8ns boundary after loop baseline, ~35.2M calls/s). **1,000,000 HTTP requests through `rt.serve`**: 1,000,000/1,000,000 ok, **90,251 rps @32 conns, p50 346µs / p95 430µs / p99 608µs, max 11.7ms, zero errors/refused/timeouts**. Saturation probe @128 conns: rps flat (90,347) while p50 → 1485µs — extra concurrency queues, doesn't buy throughput; the knee is the single-threaded pull-model dispatch loop | measured against the same build; misses kept, not rerun | overload behavior measured — saturation shown as latency growth at flat throughput, not a marketing rps | `perf/results/m7-2*` committed (incl. the broken-workload smoke artifact, kept) |
 | 7.3 soak (done) | one hour, `soak.js`: setTimeout(0) churn + self-cancelling intervals + loopback fetch — **1,558,920 iterations, 389,730 fetches, 0 errors, pending_timers 9 at minute 1 and 9 at hour 1** (retained work fully recycled). RSS +52MB total but the shape is allocator steps, not a slope: flat ~30MB for 15min → one step to ~88MB → flat incl. a visible GC dip to 59MB → stepped down to ~82MB | failures are evidence — a leak climbs; this plateaus | growth investigated: pending count constant across the hour, RSS plateaus with a GC dip visible in the series | `perf/results/m7-3-soak-*` committed (incl. the broken-workload smoke runs) |
 
+**Evidence that predates the 2026-11-16 security fixes.** The M7 numbers
+above were measured on `ecbc7dd`/`e2a0099`, before the sandbox, fetch and
+serve changes on the `fix/sandbox-security-2026-11-16` branch. They stay as
+recorded, but they describe the old code paths and need a fresh run before
+anyone quotes them for the current build: 7.2b serve 1M, the 128-connection
+saturation probe and the composed webhook 1M (the listener now takes a
+connection permit before accept, runs hyper's header timer and reserves a
+queue slot before reading a body); 7.3 soak (its loopback fetch now goes
+through the redirect-checking, public-address-only client under one
+whole-exchange deadline); 7.1 cold start (the bootstrap now deletes the
+`Deno`/`__bootstrap` globals); and the webhook drill (the supervisor now
+pipes worker output through capped forwarders). 7.2a's `rt.now` op path is
+unchanged in code, but its run should be repeated on the same build as the
+rest.
+
 ## Rejected / deferred, honestly
 
 | Point | Why |
