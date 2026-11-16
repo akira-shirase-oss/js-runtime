@@ -27,12 +27,26 @@
 //! A body is read *before* the request takes a dispatch-queue slot, so a
 //! stalled upload never sits in the queue ahead of other requests (taking
 //! the slot first let 64 half-sent bodies block every GET for the whole
-//! body timeout). Memory for bodies is bounded separately: every body
-//! byte held in this process — being read or waiting in the queue —
-//! holds a permit from one per-listener byte budget
-//! ([`BODY_BUFFER_BUDGET`], raised to `max_body` if that is larger),
-//! taken chunk by chunk as the bytes arrive. To hold the budget a client
-//! has to actually send the bytes, and the body timeout still ends it.
+//! body timeout). Memory for bodies is bounded separately, and the rule
+//! is that a request never waits for budget while it holds some (taking
+//! the budget chunk by chunk and waiting for more let concurrent uploads
+//! each hold part of it and none finish — a deadlock ended only by 408s):
+//! - the first [`FREE_BODY_BYTES`] (64 KiB) of every body are outside the
+//!   budget — bounded by `max_connections` x 64 KiB — so small requests
+//!   (webhooks, forms, JSON) never wait on, or fail for, the budget;
+//! - a body that declares a larger `Content-Length` reserves all of it
+//!   from the per-listener budget ([`BODY_BUFFER_BUDGET`], raised to
+//!   `max_body` if that is larger) before a byte is read, or is answered
+//!   503 with `Retry-After` at once; with `Expect: 100-continue` the client
+//!   learns before sending the body;
+//! - a chunked body takes budget for each chunk past the free share
+//!   without waiting; when none is left it lets go of what it holds and
+//!   is answered 503 with `Retry-After`.
+//!
+//! The cost: a client can hold up to `max_body` of the budget per
+//! connection by declaring a length and sending slowly, until
+//! `body_timeout`. Other large uploads get fast 503s meanwhile; small
+//! ones are unaffected.
 
 use std::borrow::Cow;
 use std::cell::RefCell;
@@ -70,6 +84,10 @@ const MAX_HEADERS: usize = 64;
 /// Request-body bytes one listener holds at once across all connections,
 /// counting bodies being read and bodies waiting for the script.
 const BODY_BUFFER_BUDGET: u64 = 64 * 1024 * 1024;
+/// The share of every body that is outside the budget.
+const FREE_BODY_BYTES: u64 = 64 * 1024;
+/// What a 503 for a full budget tells the client to wait, in seconds.
+const BUSY_RETRY_AFTER_SECS: &str = "1";
 
 type PendingResponse = oneshot::Sender<Response<Full<Bytes>>>;
 
@@ -93,6 +111,11 @@ pub struct ServeResource {
     pending: Mutex<HashMap<u64, PendingResponse>>,
     next_id: AtomicU64,
     accept_task: Mutex<Option<tokio::task::AbortHandle>>,
+    /// Set once by `close`. The pending `op_serve_next` watches it, so the
+    /// script's loop ends even while connections (each holding a sender
+    /// of the dispatch queue) stay open; dispatch checks it so a request
+    /// finishing after close is answered 503 instead of queued forever.
+    closed: tokio::sync::watch::Sender<bool>,
 }
 
 impl Resource for ServeResource {
@@ -111,6 +134,7 @@ impl Resource for ServeResource {
         if let Ok(mut pending) = self.pending.lock() {
             pending.clear();
         }
+        self.closed.send_replace(true);
     }
 }
 
@@ -223,6 +247,7 @@ fn op_serve_listen(
                 .map_or(1, |first| first.0),
         ),
         accept_task: Mutex::new(None),
+        closed: tokio::sync::watch::Sender::new(false),
     });
 
     // At least one full-size body must fit, and tokio caps a semaphore.
@@ -388,18 +413,35 @@ struct WireLimits {
 enum BodyFailure {
     TooLarge,
     Unreadable,
+    /// The body budget is full; the request held nothing when it said so.
+    Busy,
 }
 
-/// Collect a body, taking a budget permit for each chunk as it arrives —
-/// the budget counts bytes actually received, so declaring a large
-/// `Content-Length` and sending two bytes holds two bytes of it.
+/// Take `n` bytes of budget now or not at all.
+fn take_budget(budget: &Arc<Semaphore>, n: u64) -> Result<OwnedSemaphorePermit, BodyFailure> {
+    let n = u32::try_from(n).map_err(|_| BodyFailure::TooLarge)?;
+    Arc::clone(budget)
+        .try_acquire_many_owned(n)
+        .map_err(|_| BodyFailure::Busy)
+}
+
+/// Collect a body under the budget rule in the module docs: a declared
+/// length past the free share is reserved whole before anything is read;
+/// a chunked body takes budget per chunk past the free share. Nothing here
+/// ever waits for budget, so no request can hold some while waiting for
+/// more.
 async fn read_body(
     mut body: Incoming,
+    declared: Option<u64>,
     max_body: u64,
     budget: &Arc<Semaphore>,
 ) -> Result<(Vec<u8>, Option<OwnedSemaphorePermit>), BodyFailure> {
-    let mut buf = Vec::new();
-    let mut held: Option<OwnedSemaphorePermit> = None;
+    let mut held: Option<OwnedSemaphorePermit> = match declared {
+        Some(n) if n > FREE_BODY_BYTES => Some(take_budget(budget, n)?),
+        _ => None,
+    };
+    let capacity = declared.map_or(0, |n| n.min(max_body));
+    let mut buf = Vec::with_capacity(usize::try_from(capacity).unwrap_or(0));
     while let Some(frame) = body.frame().await {
         let frame = frame.map_err(|_| BodyFailure::Unreadable)?;
         let Ok(data) = frame.into_data() else {
@@ -408,17 +450,22 @@ async fn read_body(
         if data.is_empty() {
             continue;
         }
-        if buf.len() as u64 + data.len() as u64 > max_body {
+        let total = buf.len() as u64 + data.len() as u64;
+        if total > max_body {
             return Err(BodyFailure::TooLarge);
         }
-        let n = u32::try_from(data.len()).map_err(|_| BodyFailure::TooLarge)?;
-        let permit = Arc::clone(budget)
-            .acquire_many_owned(n)
-            .await
-            .map_err(|_| BodyFailure::Unreadable)?;
-        match &mut held {
-            Some(h) => h.merge(permit),
-            None => held = Some(permit),
+        if declared.is_none() {
+            // Chunked: past the free share, every byte needs budget —
+            // taken now, or the whole request lets go and is refused.
+            let needed = total.saturating_sub(FREE_BODY_BYTES);
+            let have = held.as_ref().map_or(0, |p| p.num_permits() as u64);
+            if needed > have {
+                let more = take_budget(budget, needed - have)?;
+                match &mut held {
+                    Some(h) => h.merge(more),
+                    None => held = Some(more),
+                }
+            }
         }
         buf.extend_from_slice(&data);
     }
@@ -438,6 +485,14 @@ async fn dispatch(
         Response::builder()
             .status(status)
             .body(Full::new(Bytes::from_static(msg.as_bytes())))
+            .unwrap_or_else(|_| Response::new(Full::new(Bytes::new())))
+    }
+    fn busy() -> Response<Full<Bytes>> {
+        Response::builder()
+            .status(503)
+            .header(http::header::RETRY_AFTER, BUSY_RETRY_AFTER_SECS)
+            .header(http::header::CONNECTION, "close")
+            .body(Full::new(Bytes::from_static(b"request body budget full")))
             .unwrap_or_else(|_| Response::new(Full::new(Bytes::new())))
     }
 
@@ -471,13 +526,14 @@ async fn dispatch(
     // stalled upload can never stand in front of a GET.
     let collected = tokio::time::timeout(
         limits.body_timeout,
-        read_body(body, limits.max_body, &limits.body_budget),
+        read_body(body, declared, limits.max_body, &limits.body_budget),
     )
     .await;
     let (bytes, body_budget) = match collected {
         Ok(Ok(read)) => read,
         Ok(Err(BodyFailure::TooLarge)) => return Ok(plain(413, "request body too large")),
         Ok(Err(BodyFailure::Unreadable)) => return Ok(plain(400, "request body unreadable")),
+        Ok(Err(BodyFailure::Busy)) => return Ok(busy()),
         Err(_) => return Ok(plain(408, "request body timeout")),
     };
 
@@ -493,9 +549,9 @@ async fn dispatch(
     };
     drop(bytes);
     // The queue being full means the script is busy: backpressure is this
-    // await. The sender travels with the message; if the receiver is gone,
-    // the script's event loop is done and so is this connection.
-    if tx.send((msg, rtx)).await.is_err() {
+    // await. The sender travels with the message; if the listener closed
+    // or the receiver is gone, nobody will take the request.
+    if *res.closed.borrow() || tx.send((msg, rtx)).await.is_err() {
         return Ok(plain(503, "listener closing"));
     }
     match rrx.await {
@@ -523,14 +579,18 @@ async fn op_serve_next(
     state: Rc<RefCell<OpState>>,
     rid: ResourceId,
 ) -> Result<serde_json::Value, JsErrorBox> {
-    let res = state
-        .borrow()
-        .resource_table
-        .get::<ServeResource>(rid)
-        .map_err(|e| host_err(format!("serve next: {e}")))?;
+    // A listener closed before this call (close() inside the handler) is
+    // the same as one that closes while waiting: no more requests.
+    let Ok(res) = state.borrow().resource_table.get::<ServeResource>(rid) else {
+        return Ok(serde_json::Value::Null);
+    };
+    let mut closed = res.closed.subscribe();
     let msg = {
         let mut rx = res.rx.lock().await;
-        rx.recv().await
+        tokio::select! {
+            msg = rx.recv() => msg,
+            _ = closed.wait_for(|c| *c) => None,
+        }
     };
     match msg {
         Some((req, sender)) => {
@@ -605,12 +665,85 @@ fn op_serve_close(state: Rc<RefCell<OpState>>, rid: ResourceId) -> Result<(), Js
     Ok(())
 }
 
+/// Lines the serve loop prints per window before it starts counting.
+const SERVE_LOG_BURST: u32 = 10;
+/// The rate-limit window for serve log lines.
+const SERVE_LOG_WINDOW: Duration = Duration::from_secs(60);
+/// Longest serve log line, in bytes; the script already bounds its parts.
+const SERVE_LOG_LINE_MAX: usize = 512;
+
+/// The serve loop's stderr lines, rate-limited here rather than in the
+/// script, so the count of suppressed lines lives in the host and is
+/// printed at teardown even when the script dies first.
+#[derive(Debug, Default)]
+pub struct ServeLog {
+    window_start: Option<std::time::Instant>,
+    printed: u32,
+    held: u64,
+}
+
+impl ServeLog {
+    fn line(&mut self, text: &str) {
+        let now = std::time::Instant::now();
+        if self
+            .window_start
+            .is_none_or(|start| now.duration_since(start) >= SERVE_LOG_WINDOW)
+        {
+            self.flush();
+            self.window_start = Some(now);
+            self.printed = 0;
+        }
+        if self.printed < SERVE_LOG_BURST {
+            self.printed += 1;
+            let mut end = text.len().min(SERVE_LOG_LINE_MAX);
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            eprintln!("{}", &text[..end]);
+        } else {
+            self.held += 1;
+        }
+    }
+
+    fn flush(&mut self) {
+        if self.held > 0 {
+            eprintln!("jsrt: serve: {} more such lines suppressed", self.held);
+            self.held = 0;
+        }
+    }
+}
+
+/// Print any suppressed-line count still held — called by the runtime
+/// when a run ends, however it ends.
+pub fn flush_serve_log(state: &mut OpState) {
+    if let Some(log) = state.try_borrow_mut::<ServeLog>() {
+        log.flush();
+    }
+}
+
+/// `op_serve_log(line)` — one serve-loop stderr line, rate-limited.
+#[op2(fast)]
+fn op_serve_log(state: &mut OpState, #[string] line: String) {
+    if !state.has::<ServeLog>() {
+        state.put(ServeLog::default());
+    }
+    state.borrow_mut::<ServeLog>().line(&line);
+}
+
+/// `op_serve_log_flush()` — a listener closed: report what was held.
+#[op2(fast)]
+fn op_serve_log_flush(state: &mut OpState) {
+    flush_serve_log(state);
+}
+
 deno_core::extension!(
     jsrt_serve,
     ops = [
         op_serve_listen,
         op_serve_next,
         op_serve_respond,
-        op_serve_close
+        op_serve_close,
+        op_serve_log,
+        op_serve_log_flush
     ],
 );

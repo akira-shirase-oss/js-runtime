@@ -26,6 +26,10 @@ const DEFAULT_KV_MAX_BYTES: u64 = 64 * 1024 * 1024;
 const DEFAULT_MEDIA_MAX_BYTES: u64 = 256 * 1024 * 1024;
 /// The default per-request body cap for rt.serve.
 const DEFAULT_SERVE_MAX_BODY: u64 = 8 * 1024 * 1024;
+/// Largest `max_body` a manifest may declare. A body is buffered whole and
+/// its declared length is reserved from the listener's body budget in one
+/// go, so the cap has to stay well inside what one reservation can count.
+pub const MAX_SERVE_MAX_BODY: u64 = 1024 * 1024 * 1024;
 /// Default concurrent connections per listener; past it, new connections
 /// wait in the kernel's accept backlog.
 pub const DEFAULT_SERVE_MAX_CONNECTIONS: usize = 256;
@@ -73,7 +77,8 @@ pub struct ServeGrant {
     /// Deadline for a request body once its head has arrived.
     pub body_timeout: std::time::Duration,
     /// Longest a response write may make no progress; past it the
-    /// connection, and its slot, are dropped.
+    /// connection, and its slot, are dropped. Keep it at 5 s or more: a
+    /// review run saw 1 s cut legitimate slow downloads under load.
     pub write_timeout: std::time::Duration,
 }
 
@@ -136,12 +141,33 @@ struct Manifest {
 
 /// One `net` entry: a bare `host[:port]` string, or an object that can
 /// opt the name into private resolution. Unknown keys in the object are an
-/// error — a misspelt opt-in must not turn into a silent public grant.
+/// error — a misspelt opt-in must not turn into a silent public grant —
+/// and the error names the key (an untagged enum would only say that no
+/// variant matched).
 #[derive(Debug, Deserialize)]
-#[serde(untagged)]
+#[serde(try_from = "serde_json::Value")]
 enum ManifestNet {
     Plain(String),
     Detailed(ManifestNetDetailed),
+}
+
+impl TryFrom<serde_json::Value> for ManifestNet {
+    type Error = String;
+
+    fn try_from(value: serde_json::Value) -> Result<Self, String> {
+        match value {
+            serde_json::Value::String(entry) => Ok(Self::Plain(entry)),
+            serde_json::Value::Object(_) => {
+                let shown = value.to_string();
+                serde_json::from_value(value)
+                    .map(Self::Detailed)
+                    .map_err(|e| format!("net entry {shown}: {e}"))
+            }
+            other => Err(format!(
+                "net entry {other}: expected \"host[:port]\" or {{\"host\": \"host[:port]\", \"private\": true}}"
+            )),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -328,7 +354,15 @@ impl Capabilities {
             }
             let mut grant = ServeGrant::new(
                 std::net::SocketAddr::new(ip, serve.port),
-                serve.max_body.unwrap_or(DEFAULT_SERVE_MAX_BODY),
+                match serve.max_body {
+                    Some(n) if n > MAX_SERVE_MAX_BODY => {
+                        return Err(HostError::Host(format!(
+                            "manifest serve max_body {n} is above the limit of {MAX_SERVE_MAX_BODY}"
+                        )));
+                    }
+                    Some(n) => n,
+                    None => DEFAULT_SERVE_MAX_BODY,
+                },
             );
             // Zero would disable a bound, not set one — refuse it.
             let positive = |name: &str, v: u64| {

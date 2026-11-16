@@ -850,6 +850,13 @@ fn a_private_name_grant_is_an_explicit_opt_in() {
         ],
     );
     assert_eq!(code(&out), 8, "stderr: {}", stderr(&out));
+    // ... and the error names the key, not serde's "did not match any
+    // variant of untagged enum".
+    assert!(
+        stderr(&out).contains("unknown field `privat`"),
+        "stderr: {}",
+        stderr(&out)
+    );
 }
 
 #[test]
