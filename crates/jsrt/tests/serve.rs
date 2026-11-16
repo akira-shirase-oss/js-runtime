@@ -696,3 +696,47 @@ fn a_client_that_stops_reading_gives_its_slot_back() {
         .unwrap_or_else(|e| panic!("wait: {e}"));
     assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
 }
+
+#[test]
+fn the_bad_answer_log_line_hides_queries_and_is_rate_limited() {
+    let rig = Rig::new();
+    let port = Rig::free_port();
+    let child = route_app(
+        &rig,
+        port,
+        "",
+        "if (req.path.startsWith('/bad')) return undefined;",
+    );
+    let pad = "p".repeat(2000);
+    for _ in 0..30 {
+        let (status, _head, _body) = http(
+            port,
+            &format!(
+                "GET /bad/{pad}?token=SEKRET HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+            ),
+        );
+        assert_eq!(status, 500);
+    }
+    quit(port);
+    let out = child
+        .wait_with_output()
+        .unwrap_or_else(|e| panic!("wait: {e}"));
+    assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
+    let err = stderr(&out);
+    assert!(!err.contains("SEKRET"), "the query reached the log: {err}");
+    let lines: Vec<&str> = err.lines().filter(|l| l.contains("answered 500")).collect();
+    assert!(
+        (1..=10).contains(&lines.len()),
+        "{} answered-500 lines",
+        lines.len()
+    );
+    assert!(
+        lines.iter().all(|l| l.len() <= 400),
+        "a client-sized path made a long line: {}",
+        lines.iter().map(|l| l.len()).max().unwrap_or(0)
+    );
+    assert!(
+        err.contains("20 more"),
+        "the suppressed count is reported: {err}"
+    );
+}
