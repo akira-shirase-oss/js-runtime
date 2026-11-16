@@ -258,6 +258,8 @@ fn op_serve_listen(
     let limits = WireLimits {
         max_body: grant.max_body,
         body_timeout: grant.body_timeout,
+        body_first_byte: grant.body_first_byte,
+        body_min_rate: grant.body_min_rate,
         body_budget: Arc::new(Semaphore::new(
             usize::try_from(budget).unwrap_or(Semaphore::MAX_PERMITS),
         )),
@@ -405,6 +407,8 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for StallGuard<T> {
 struct WireLimits {
     max_body: u64,
     body_timeout: Duration,
+    body_first_byte: Duration,
+    body_min_rate: u64,
     /// The listener's body byte budget, shared by every connection.
     body_budget: Arc<Semaphore>,
 }
@@ -415,6 +419,9 @@ enum BodyFailure {
     Unreadable,
     /// The body budget is full; the request held nothing when it said so.
     Busy,
+    /// The body did not start within its first-byte allowance, or fell
+    /// below the minimum rate after it.
+    TooSlow,
 }
 
 /// Take `n` bytes of budget now or not at all.
@@ -433,16 +440,33 @@ fn take_budget(budget: &Arc<Semaphore>, n: u64) -> Result<OwnedSemaphorePermit, 
 async fn read_body(
     mut body: Incoming,
     declared: Option<u64>,
-    max_body: u64,
-    budget: &Arc<Semaphore>,
+    limits: &WireLimits,
 ) -> Result<(Vec<u8>, Option<OwnedSemaphorePermit>), BodyFailure> {
+    let max_body = limits.max_body;
+    let budget = &limits.body_budget;
     let mut held: Option<OwnedSemaphorePermit> = match declared {
         Some(n) if n > FREE_BODY_BYTES => Some(take_budget(budget, n)?),
         _ => None,
     };
-    let capacity = declared.map_or(0, |n| n.min(max_body));
-    let mut buf = Vec::with_capacity(usize::try_from(capacity).unwrap_or(0));
-    while let Some(frame) = body.frame().await {
+    // Grown as bytes arrive: a declared length is a promise, not memory.
+    let mut buf = Vec::with_capacity(
+        usize::try_from(declared.map_or(0, |n| n.min(FREE_BODY_BYTES))).unwrap_or(0),
+    );
+    // A reservation has to be earned: the first byte within the first-byte
+    // allowance, then on average at least `body_min_rate` bytes a second.
+    // Falling behind is a 408, and dropping `held` gives the budget back.
+    let started = tokio::time::Instant::now();
+    loop {
+        let earned = Duration::try_from_secs_f64(buf.len() as f64 / limits.body_min_rate as f64)
+            .unwrap_or(Duration::MAX);
+        let deadline = started
+            .checked_add(limits.body_first_byte.saturating_add(earned))
+            .unwrap_or_else(|| started + limits.body_timeout);
+        let frame = match tokio::time::timeout_at(deadline, body.frame()).await {
+            Err(_) => return Err(BodyFailure::TooSlow),
+            Ok(None) => break,
+            Ok(Some(frame)) => frame,
+        };
         let frame = frame.map_err(|_| BodyFailure::Unreadable)?;
         let Ok(data) = frame.into_data() else {
             continue; // trailers carry no body bytes
@@ -524,16 +548,14 @@ async fn dispatch(
     // The body first, under its own deadline and the shared byte budget;
     // only a complete request competes for a dispatch-queue slot, so a
     // stalled upload can never stand in front of a GET.
-    let collected = tokio::time::timeout(
-        limits.body_timeout,
-        read_body(body, declared, limits.max_body, &limits.body_budget),
-    )
-    .await;
+    let collected =
+        tokio::time::timeout(limits.body_timeout, read_body(body, declared, &limits)).await;
     let (bytes, body_budget) = match collected {
         Ok(Ok(read)) => read,
         Ok(Err(BodyFailure::TooLarge)) => return Ok(plain(413, "request body too large")),
         Ok(Err(BodyFailure::Unreadable)) => return Ok(plain(400, "request body unreadable")),
         Ok(Err(BodyFailure::Busy)) => return Ok(busy()),
+        Ok(Err(BodyFailure::TooSlow)) => return Ok(plain(408, "request body too slow")),
         Err(_) => return Ok(plain(408, "request body timeout")),
     };
 
