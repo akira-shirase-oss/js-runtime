@@ -4,7 +4,21 @@
 //
 // This file is the API contract: keep it small, keep names honest, and never
 // expose an op here that the docs don't describe.
-const ops = Deno.core.ops;
+//
+// deno_core hands extension code `globalThis.Deno.core` and
+// `globalThis.__bootstrap`. Both reach the raw ops table -- every builtin op,
+// including op_panic (aborts the host), op_close and raw resource reads and
+// writes -- so this module captures the handful of functions it needs into
+// module-local bindings and deletes both globals at the end (see the bottom
+// of this file). Scripts cannot import `ext:` modules (deno_core refuses
+// them outside extension code), so after that the only door left is `rt.*`.
+const core = globalThis.Deno.core;
+const ops = core.ops;
+const corePrint = core.print;
+const createTimer = core.createTimer;
+const cancelTimer = core.cancelTimer;
+const refTimer = core.refTimer;
+const unrefTimer = core.unrefTimer;
 
 // Error classes for op rejections. The class strings in ops.rs
 // (JsErrorBox::new) mean nothing to V8 until a constructor is registered here
@@ -16,8 +30,8 @@ class CapabilityError extends Error {
 class HostError extends Error {
 	constructor(msg) { super(msg); this.name = "HostError"; }
 }
-Deno.core.registerErrorClass("CapabilityError", CapabilityError);
-Deno.core.registerErrorClass("HostError", HostError);
+core.registerErrorClass("CapabilityError", CapabilityError);
+core.registerErrorClass("HostError", HostError);
 
 // Timers: Node-style semantics over deno_core's built-in timer machinery.
 // Ref-counted timers hold the event loop open until they fire (the watchdog
@@ -32,7 +46,7 @@ function track(timer) {
 function untrack(id) {
 	const timer = timers.get(id);
 	if (timer !== undefined) {
-		Deno.core.cancelTimer(timer);
+		cancelTimer(timer);
 		timers.delete(id);
 	}
 }
@@ -42,13 +56,13 @@ function schedule(cb, ms, args, repeat) {
 		if (!repeat) timers.delete(holder.id);
 		cb(...a);
 	};
-	holder.id = track(Deno.core.createTimer(wrapped, ms, args, repeat, true, false));
+	holder.id = track(createTimer(wrapped, ms, args, repeat, true, false));
 	return holder.id;
 }
 
 globalThis.rt = {
 	/** Write to stdout with no added newline (deno_core's builtin op_print). */
-	print: (msg) => Deno.core.print(String(msg), false),
+	print: (msg) => corePrint(String(msg), false),
 	/** {runtime, version, engine} -- who's hosting this script. */
 	hostInfo: () => ops.op_host_info(),
 	/** Wall clock in milliseconds, for measurements. */
@@ -69,12 +83,12 @@ globalThis.rt = {
 	/** Let the event loop exit without waiting for this timer. */
 	unrefTimer: (id) => {
 		const t = timers.get(id);
-		if (t !== undefined) Deno.core.unrefTimer(t);
+		if (t !== undefined) unrefTimer(t);
 	},
 	/** Undo unrefTimer -- the timer holds the loop open again. */
 	refTimer: (id) => {
 		const t = timers.get(id);
-		if (t !== undefined) Deno.core.refTimer(t);
+		if (t !== undefined) refTimer(t);
 	},
 	/** Timer ids this script still owns (fired one-shots remove themselves). */
 	pendingTimers: () => timers.size,
@@ -150,3 +164,10 @@ globalThis.rt = {
 		};
 	},
 };
+
+// Close the doors deno_core left open for extension code. Everything above
+// holds its own references; deno_core itself captured its callbacks before
+// this module ran. Nothing a script evaluates afterwards can name the ops
+// table, so a script can only do what `rt.*` grants.
+delete globalThis.Deno;
+delete globalThis.__bootstrap;

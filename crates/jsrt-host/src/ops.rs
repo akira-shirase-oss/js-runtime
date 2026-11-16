@@ -511,7 +511,6 @@ deno_core::extension!(
         op_sleep,
         op_read_text,
         op_fetch,
-        op_noop,
         op_kv_get,
         op_kv_put,
         op_kv_delete,
@@ -522,12 +521,6 @@ deno_core::extension!(
     esm_entry_point = "ext:jsrt_core/bootstrap.js",
     esm = [dir "js", "bootstrap.js"],
 );
-
-/// A no-op used by the perf harness to measure raw op-boundary overhead —
-/// wired into the extension but absent from `bootstrap.js`, so scripts see it
-/// only via `Deno.core.ops.op_noop` when explicitly told to.
-#[op2(fast)]
-fn op_noop() {}
 
 #[cfg(test)]
 mod tests {

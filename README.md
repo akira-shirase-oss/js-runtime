@@ -19,6 +19,10 @@ starts, a one-hour soak) are all built, with committed results under
 ## What scripts see
 
 Exactly one namespace — `rt.*`. No ambient `Deno`, no ungated global:
+deno_core installs `globalThis.Deno.core` (the raw ops table, including
+`op_panic`) and `globalThis.__bootstrap` for extension code; the bootstrap
+captures what it needs and deletes both before any script runs, and scripts
+cannot import `ext:` modules. A test proves `op_panic` is unreachable.
 
 | API | What it does | Gate |
 |---|---|---|

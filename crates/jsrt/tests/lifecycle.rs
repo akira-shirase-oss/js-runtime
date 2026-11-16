@@ -407,6 +407,78 @@ fn there_are_no_bare_timer_globals() {
     );
 }
 
+// ---- Sandbox: a script sees rt.* and none of the engine's plumbing ----------
+//
+// deno_core installs `globalThis.Deno.core.ops` (every builtin op, including
+// `op_panic`, raw resource reads/writes and `op_close`) and
+// `globalThis.__bootstrap` for extension code. The bootstrap captures what it
+// needs and removes both before any script runs.
+
+#[test]
+fn there_is_no_ambient_deno_namespace() {
+    let rig = Rig::new();
+    let script = rig.script(
+        "probe.js",
+        "const leaked = Object.getOwnPropertyNames(globalThis).filter((n) => /deno|bootstrap/i.test(n));\n\
+         rt.print([typeof Deno, typeof globalThis.__bootstrap, 'Deno' in globalThis, '__bootstrap' in globalThis, leaked.length].join(',') + '\\n');\n",
+    );
+    let out = rig.run_script(&script, &[]);
+    assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "undefined,undefined,false,false,0\n"
+    );
+}
+
+#[test]
+fn a_script_cannot_reach_builtin_ops_to_panic_the_host() {
+    let rig = Rig::new();
+    // `op_panic` is a deno_core builtin that panics the host process. If any
+    // path to the raw ops table survives, this run dies instead of printing.
+    let script = rig.script(
+        "panic.js",
+        "const reaches = [\n\
+           () => Deno.core.ops.op_panic('from script'),\n\
+           () => globalThis.__bootstrap.core.ops.op_panic('from script'),\n\
+         ];\n\
+         for (const reach of reaches) {\n\
+           try { reach(); rt.print('reached\\n'); } catch (e) { rt.print('blocked:' + e.name + '\\n'); }\n\
+         }\n",
+    );
+    let out = rig.run_script(&script, &[]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the host must survive: status {:?}, stderr: {}",
+        out.status,
+        stderr(&out)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "blocked:ReferenceError\nblocked:TypeError\n"
+    );
+}
+
+#[test]
+fn a_script_cannot_import_the_ops_through_ext_modules() {
+    let rig = Rig::new();
+    // The other way to the ops table: the `ext:` modules extension code
+    // imports. deno_core refuses them for non-extension referrers.
+    let script = rig.script(
+        "ext.js",
+        "for (const spec of ['ext:core/ops', 'ext:core/mod.js']) {\n\
+           try { await import(spec); rt.print('imported ' + spec + '\\n'); }\n\
+           catch (e) { rt.print('refused ' + spec + '\\n'); }\n\
+         }\n",
+    );
+    let out = rig.run_script(&script, &[]);
+    assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "refused ext:core/ops\nrefused ext:core/mod.js\n"
+    );
+}
+
 #[test]
 fn cli_flags_extend_never_weaken() {
     let rig = Rig::new();
