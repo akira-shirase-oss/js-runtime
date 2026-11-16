@@ -39,7 +39,8 @@ differently:
   progress before a connection is dropped, 413 for a declared
   `Content-Length` over `max_body` before anything is read. A status outside
   200-599, a bad header or a handler that returns no object is a 500 with a
-  stderr line.
+  stderr line. Large uploads can get `503` with `Retry-After` while the
+  per-listener body budget is full.
 - **`jsrt supervise` caps worker output** at 8 MiB per stream per run
   (`--max-output-kb`); the run report gains an `output` object.
 
@@ -67,7 +68,7 @@ again on every deno_core upgrade.
 | `rt.pendingTimers()` | how many timers this script still owns | none |
 | `rt.kv.get/put/delete/list` | embedded SQLite store; `list` is an exact-prefix scan | declared `kv` file + `max_bytes` quota |
 | `rt.media.put/stat` | streamed content-addressed uploads (sha256 names) | declared `media` root; the source still needs a `read` grant |
-| `rt.serve(opts, handler)` | HTTP listener, pull-model dispatch; a handler that throws, returns no object, or returns an invalid status (outside 200-599) or header (a bad name, or a value that is an object, function or nested array; an array value repeats the header, as `set-cookie` needs) is a 500 plus a stderr line (path without its query, length-capped, at most 10 lines a minute with the rest counted) — not a dead host, an empty 200 or a hung client | declared `serve` host/port — loopback IP literals only — plus `max_body`, `max_connections` (default 256, at most 65,536; the rest wait in the accept backlog), `header_timeout_ms` (default 10 s, also bounds keep-alive idling) and `body_timeout_ms` (default 30 s, then 408) and `write_timeout_ms` (default 30 s: a response write with no progress for that long — a client that stopped reading — drops the connection and frees its slot); bodies are read before they queue for the script and share a 64 MiB per-listener buffer budget |
+| `rt.serve(opts, handler)` | HTTP listener, pull-model dispatch; a handler that throws, returns no object, or returns an invalid status (outside 200-599) or header (a bad name, or a value that is an object, function or nested array; an array value repeats the header, as `set-cookie` needs) is a 500 plus a stderr line (path without its query, length-capped, at most 10 lines a minute with the rest counted) — not a dead host, an empty 200 or a hung client | declared `serve` host/port — loopback IP literals only — plus `max_body`, `max_connections` (default 256, at most 65,536; the rest wait in the accept backlog), `header_timeout_ms` (default 10 s, also bounds keep-alive idling) and `body_timeout_ms` (default 30 s, then 408) and `write_timeout_ms` (default 30 s: a response write with no progress for that long — a client that stopped reading — drops the connection and frees its slot); `max_body` at most 1 GiB. Bodies are read before they queue for the script. The first 64 KiB of every body is outside the body budget, so small requests never wait on it; a larger declared `Content-Length` reserves its whole length from a 64 MiB per-listener budget before anything is read, and a chunked body takes budget per chunk past 64 KiB. When the budget is full such a request is answered 503 with `Retry-After: 1` at once — never queued, never left to time out (send large uploads with `Expect: 100-continue` to get that answer before sending the body). A client can hold up to `max_body` of the budget per connection by declaring a length and sending slowly, until `body_timeout_ms` |
 
 `console.log` also works (deno_core's minimal console). Anything not listed
 does not exist for the script — that is the point.

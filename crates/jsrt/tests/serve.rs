@@ -835,7 +835,7 @@ fn the_bad_answer_log_line_hides_queries_and_is_rate_limited() {
 }
 
 #[test]
-fn an_out_of_range_connection_cap_is_a_manifest_error() {
+fn an_out_of_range_serve_bound_is_a_manifest_error() {
     let rig = Rig::new();
     let port = Rig::free_port();
     let script = rig.script(
@@ -843,12 +843,17 @@ fn an_out_of_range_connection_cap_is_a_manifest_error() {
         &format!("const s = rt.serve({{host: '127.0.0.1', port: {port}}}, async () => ({{}}));\ns.close();\n"),
     );
     // 2^61 is past tokio's semaphore limit (it used to abort the host,
-    // exit 134); 70000 is past the documented bound.
-    for cap in ["2305843009213693952", "70000"] {
+    // exit 134); 70000 is past the documented bound. A max_body past 1 GiB
+    // could never be reserved from the body budget in one go.
+    for (field, value) in [
+        ("max_connections", "2305843009213693952"),
+        ("max_connections", "70000"),
+        ("max_body", "1073741825"),
+    ] {
         let manifest = rig.script(
             "m.manifest.json",
             &format!(
-                "{{ \"serve\": {{\"host\": \"127.0.0.1\", \"port\": {port}, \"max_connections\": {cap}}} }}\n"
+                "{{ \"serve\": {{\"host\": \"127.0.0.1\", \"port\": {port}, \"{field}\": {value}}} }}\n"
             ),
         );
         let out = rig.run(&[
@@ -860,11 +865,11 @@ fn an_out_of_range_connection_cap_is_a_manifest_error() {
         assert_eq!(
             out.status.code(),
             Some(8),
-            "cap {cap}: {:?} {}",
+            "{field} {value}: {:?} {}",
             out.status,
             stderr(&out)
         );
-        assert!(stderr(&out).contains("max_connections"), "{}", stderr(&out));
+        assert!(stderr(&out).contains(field), "{}", stderr(&out));
     }
 }
 
@@ -900,6 +905,219 @@ fn header_arrays_repeat_and_non_scalar_values_are_a_500() {
         );
         assert_eq!(status, 500, "{path}: {body:?}");
     }
+    quit(port);
+    let out = child
+        .wait_with_output()
+        .unwrap_or_else(|e| panic!("wait: {e}"));
+    assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
+}
+
+// ---- The body budget never deadlocks and never convoys ---------------------
+
+/// One upload that announces itself with `Expect: 100-continue`, as real
+/// clients do for large bodies: the body is sent only after the server
+/// says `100 Continue`, so a refusal arrives as a readable answer instead
+/// of a reset mid-upload. Returns the final status and the head.
+fn upload(port: u16, body: &[u8]) -> (u16, String) {
+    let mut s = connect(port);
+    s.set_read_timeout(Some(Duration::from_secs(40)))
+        .unwrap_or_else(|e| panic!("timeout: {e}"));
+    s.write_all(
+        format!(
+            "POST /up HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\nExpect: 100-continue\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .as_bytes(),
+    )
+    .unwrap_or_else(|e| panic!("write head: {e}"));
+    let read_head = |s: &mut TcpStream| -> String {
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            match s.read(&mut byte) {
+                Ok(1) => head.push(byte[0]),
+                _ => break,
+            }
+        }
+        String::from_utf8_lossy(&head).into_owned()
+    };
+    let status_of = |head: &str| -> u16 {
+        head.split_whitespace()
+            .nth(1)
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    };
+    let mut head = read_head(&mut s);
+    if status_of(&head) == 100 {
+        if s.write_all(body).is_err() {
+            return (0, "body write failed".into());
+        }
+        head = read_head(&mut s);
+    }
+    (status_of(&head), head)
+}
+
+#[test]
+fn concurrent_large_uploads_finish_or_are_refused_fast_never_deadlock() {
+    let rig = Rig::new();
+    let port = Rig::free_port();
+    // A long body timeout: a deadlock would show as a 20 s wait and 408s.
+    let child = route_app(
+        &rig,
+        port,
+        ", \"body_timeout_ms\": 20000",
+        "if (req.path === '/up') return {status: 200, body: 'got ' + req.body.length};",
+    );
+    // 24 uploads of 7.5 MiB each (180 MiB) against the 64 MiB budget.
+    let body = std::sync::Arc::new(vec![b'u'; 7_864_320]);
+    let started = Instant::now();
+    let workers: Vec<_> = (0..24)
+        .map(|_| {
+            let body = std::sync::Arc::clone(&body);
+            std::thread::spawn(move || upload(port, &body))
+        })
+        .collect();
+    let results: Vec<(u16, String)> = workers
+        .into_iter()
+        .map(|w| {
+            w.join()
+                .unwrap_or_else(|_| panic!("upload thread panicked"))
+        })
+        .collect();
+    let took = started.elapsed();
+    let ok = results.iter().filter(|r| r.0 == 200).count();
+    let busy: Vec<&String> = results
+        .iter()
+        .filter(|r| r.0 == 503)
+        .map(|r| &r.1)
+        .collect();
+    let statuses: Vec<u16> = results.iter().map(|r| r.0).collect();
+    assert_eq!(
+        ok + busy.len(),
+        24,
+        "only 200 or 503, never 408: {statuses:?}"
+    );
+    assert!(ok >= 1, "some uploads must get through: {statuses:?}");
+    assert!(
+        busy.iter()
+            .all(|h| h.to_ascii_lowercase().contains("retry-after:")),
+        "a 503 says when to retry"
+    );
+    assert!(
+        took < Duration::from_secs(10),
+        "took {took:?}: {statuses:?}"
+    );
+    quit(port);
+    let out = child
+        .wait_with_output()
+        .unwrap_or_else(|e| panic!("wait: {e}"));
+    assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
+}
+
+#[test]
+fn a_small_post_answers_while_large_bodies_stall() {
+    let rig = Rig::new();
+    let port = Rig::free_port();
+    let child = route_app(&rig, port, "", "");
+    // 16 uploads that each declare 8 MiB, send all but the last byte and
+    // stop: together they want twice the 64 MiB budget. Each runs on its
+    // own thread and keeps its socket open; a writer the server stops
+    // reading from just blocks, which is the point.
+    let almost = std::sync::Arc::new(vec![b's'; 8 * 1024 * 1024 - 1]);
+    let (held_tx, held_rx) = std::sync::mpsc::channel();
+    for _ in 0..16 {
+        let almost = std::sync::Arc::clone(&almost);
+        let held_tx = held_tx.clone();
+        std::thread::spawn(move || {
+            let mut s = connect(port);
+            let _ = s.write_all(
+                format!(
+                    "POST /big HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\r\n",
+                    8 * 1024 * 1024
+                )
+                .as_bytes(),
+            );
+            let _ = s.write_all(&almost);
+            // Kept open, one byte short, until the test is done.
+            let _ = held_tx.send(s);
+        });
+    }
+    // Let the uploads take (or be refused) their budget first.
+    std::thread::sleep(Duration::from_secs(2));
+    let started = Instant::now();
+    let (status, _head, body) = http(
+        port,
+        &format!(
+            "POST /small HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello"
+        ),
+    );
+    let took = started.elapsed();
+    assert_eq!(
+        (status, body.as_str()),
+        (200, "ok /small"),
+        "after {took:?}"
+    );
+    assert!(took < Duration::from_secs(1), "answered after {took:?}");
+    // Close the stalled uploads, then the server.
+    for _ in 0..16 {
+        if held_rx.recv_timeout(Duration::from_secs(5)).is_err() {
+            break;
+        }
+    }
+    quit(port);
+    let out = child
+        .wait_with_output()
+        .unwrap_or_else(|e| panic!("wait: {e}"));
+    assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
+}
+
+#[test]
+fn a_chunked_body_past_the_free_share_is_refused_fast_when_the_budget_is_full() {
+    let rig = Rig::new();
+    let port = Rig::free_port();
+    let child = route_app(&rig, port, ", \"body_timeout_ms\": 20000", "");
+    // Fill the budget: 8 uploads declaring 8 MiB each and sending a little.
+    let fillers: Vec<TcpStream> = (0..8)
+        .map(|_| {
+            let mut s = connect(port);
+            s.write_all(
+                format!(
+                    "POST /fill HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\r\nxxxx",
+                    8 * 1024 * 1024
+                )
+                .as_bytes(),
+            )
+            .unwrap_or_else(|e| panic!("write: {e}"));
+            s
+        })
+        .collect();
+    std::thread::sleep(Duration::from_millis(300));
+    // A chunked body: 64 KiB is free of the budget, 128 KiB is not.
+    let chunk = "c".repeat(64 * 1024);
+    let chunked = |chunks: usize| {
+        let mut req = format!(
+            "POST /chunked HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+        );
+        for _ in 0..chunks {
+            req.push_str(&format!("{:x}\r\n{chunk}\r\n", chunk.len()));
+        }
+        req.push_str("0\r\n\r\n");
+        req
+    };
+    let started = Instant::now();
+    let (status, _head, _body) = http(port, &chunked(2));
+    assert_eq!(
+        status, 503,
+        "a chunked body over the free share, budget full"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "{:?}",
+        started.elapsed()
+    );
+    let (status, _head, body) = http(port, &chunked(1));
+    assert_eq!((status, body.as_str()), (200, "ok /chunked"));
+    drop(fillers);
     quit(port);
     let out = child
         .wait_with_output()

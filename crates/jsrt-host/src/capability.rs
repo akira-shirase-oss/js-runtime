@@ -26,6 +26,10 @@ const DEFAULT_KV_MAX_BYTES: u64 = 64 * 1024 * 1024;
 const DEFAULT_MEDIA_MAX_BYTES: u64 = 256 * 1024 * 1024;
 /// The default per-request body cap for rt.serve.
 const DEFAULT_SERVE_MAX_BODY: u64 = 8 * 1024 * 1024;
+/// Largest `max_body` a manifest may declare. A body is buffered whole and
+/// its declared length is reserved from the listener's body budget in one
+/// go, so the cap has to stay well inside what one reservation can count.
+pub const MAX_SERVE_MAX_BODY: u64 = 1024 * 1024 * 1024;
 /// Default concurrent connections per listener; past it, new connections
 /// wait in the kernel's accept backlog.
 pub const DEFAULT_SERVE_MAX_CONNECTIONS: usize = 256;
@@ -328,7 +332,15 @@ impl Capabilities {
             }
             let mut grant = ServeGrant::new(
                 std::net::SocketAddr::new(ip, serve.port),
-                serve.max_body.unwrap_or(DEFAULT_SERVE_MAX_BODY),
+                match serve.max_body {
+                    Some(n) if n > MAX_SERVE_MAX_BODY => {
+                        return Err(HostError::Host(format!(
+                            "manifest serve max_body {n} is above the limit of {MAX_SERVE_MAX_BODY}"
+                        )));
+                    }
+                    Some(n) => n,
+                    None => DEFAULT_SERVE_MAX_BODY,
+                },
             );
             // Zero would disable a bound, not set one — refuse it.
             let positive = |name: &str, v: u64| {
