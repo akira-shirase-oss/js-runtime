@@ -113,7 +113,12 @@ fn build_runtime(options: &HostOptions, entry_dir: Option<&Path>) -> JsRuntime {
     {
         let mut state = state.borrow_mut();
         state.put(Rc::new(options.capabilities.clone()));
-        state.put(Rc::new(reqwest::Client::new()));
+        // The fetch client re-checks the manifest on every redirect hop and
+        // never routes through an environment proxy — see net.rs.
+        match crate::net::client(&options.capabilities) {
+            Ok(client) => state.put(Rc::new(client)),
+            Err(e) => state.put(Rc::new(crate::net::ClientUnavailable(e.to_string()))),
+        }
         let budgets = crate::ops::OpBudgets {
             fetch_deadline: options.fetch_deadline.unwrap_or(crate::ops::FETCH_DEADLINE),
             ..Default::default()

@@ -65,11 +65,16 @@ fn capabilities(state: &Rc<RefCell<OpState>>) -> Result<Rc<Capabilities>, JsErro
 }
 
 fn http_client(state: &Rc<RefCell<OpState>>) -> Result<Rc<reqwest::Client>, JsErrorBox> {
-    state
-        .borrow()
-        .try_borrow::<Rc<reqwest::Client>>()
-        .cloned()
-        .ok_or_else(|| host_err("http client not installed".into()))
+    let state = state.borrow();
+    if let Some(client) = state.try_borrow::<Rc<reqwest::Client>>() {
+        return Ok(client.clone());
+    }
+    Err(host_err(
+        match state.try_borrow::<Rc<crate::net::ClientUnavailable>>() {
+            Some(why) => format!("http client unavailable: {}", why.0),
+            None => "http client not installed".into(),
+        },
+    ))
 }
 
 fn budgets(state: &Rc<RefCell<OpState>>) -> OpBudgets {
@@ -162,7 +167,12 @@ async fn op_fetch(
     let mut response = tokio::time::timeout(deadline, client.get(&url).send())
         .await
         .map_err(|_| host_err(format!("fetch {url}: deadline {deadline:?} exceeded")))?
-        .map_err(|e| host_err(format!("fetch {url}: {e}")))?;
+        // A redirect hop outside the grant comes back from inside the
+        // client as our own refusal — it stays a CapabilityError.
+        .map_err(|e| match crate::net::refusal(&e) {
+            Some(why) => JsErrorBox::new("CapabilityError", why),
+            None => host_err(format!("fetch {url}: {}", crate::net::describe(&e))),
+        })?;
     let status = response.status();
     let mut body = Vec::new();
     while let Some(chunk) = response

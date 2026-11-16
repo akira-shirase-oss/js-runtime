@@ -670,6 +670,91 @@ fn an_oversized_body_is_cut_off() {
     );
 }
 
+/// Read the request, answer `302 Found` pointing at `location`.
+fn redirect_to(location: String) -> impl Fn(&mut std::net::TcpStream) {
+    move |s| {
+        let mut buf = [0u8; 2048];
+        let _ = s.read(&mut buf);
+        let head = format!(
+            "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+        let _ = s.write_all(head.as_bytes());
+    }
+}
+
+#[test]
+fn a_redirect_to_an_undeclared_destination_is_refused() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    let rig = Rig::new();
+    // `inner` stands for an internal service the script was never granted.
+    let reached = Arc::new(AtomicUsize::new(0));
+    let reached_in_stub = Arc::clone(&reached);
+    let inner = Stub::start(move |s| {
+        reached_in_stub.fetch_add(1, Ordering::SeqCst);
+        respond("200 OK", b"internal secret", 0)(s);
+    });
+    // The granted host answers with a redirect to the ungranted one.
+    let granted = Stub::start(redirect_to(inner.url("/admin")));
+    let script = fetch_script(&rig, &granted.url("/start"));
+    let out = rig.run_script(&script, &["--net", &format!("127.0.0.1:{}", granted.port)]);
+    assert_eq!(code(&out), 7, "stderr: {}", stderr(&out));
+    assert!(
+        stderr(&out).contains(&format!("127.0.0.1:{}", inner.port)),
+        "the refusal names the real destination; stderr: {}",
+        stderr(&out)
+    );
+    assert!(
+        !String::from_utf8_lossy(&out.stdout).contains("internal secret"),
+        "stdout: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert_eq!(
+        reached.load(Ordering::SeqCst),
+        0,
+        "the ungranted host must never see a connection"
+    );
+}
+
+#[test]
+fn a_redirect_loop_inside_the_grant_is_bounded() {
+    let rig = Rig::new();
+    // The stub's port is only known after bind, so the loop target is
+    // relative — every hop lands back on the same granted listener.
+    let looping = Stub::start(redirect_to("/again".to_string()));
+    let script = fetch_script(&rig, &looping.url("/start"));
+    let out = rig.run_script(&script, &["--net", &format!("127.0.0.1:{}", looping.port)]);
+    assert_eq!(code(&out), 8, "stderr: {}", stderr(&out));
+    assert!(
+        stderr(&out).contains("redirects"),
+        "stderr: {}",
+        stderr(&out)
+    );
+}
+
+#[test]
+fn a_redirect_inside_the_grant_is_still_followed() {
+    let rig = Rig::new();
+    let target = Stub::start(respond("200 OK", b"landed", 0));
+    let hop = Stub::start(redirect_to(target.url("/final")));
+    let script = fetch_script(&rig, &hop.url("/start"));
+    let out = rig.run_script(
+        &script,
+        &[
+            "--net",
+            &format!("127.0.0.1:{}", hop.port),
+            "--net",
+            &format!("127.0.0.1:{}", target.port),
+        ],
+    );
+    assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("status=200 body=landed"),
+        "stdout: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
 #[test]
 fn a_script_can_see_its_own_pending_timers() {
     let rig = Rig::new();

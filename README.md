@@ -31,7 +31,7 @@ cannot import `ext:` modules. A test proves `op_panic` is unreachable.
 | `rt.now()` | wall-clock ms for measurements | none |
 | `rt.sleep(ms)` | async timer | deadline (run timeout) |
 | `rt.readText(path)` | read a text file | declared `read` paths only |
-| `rt.fetch(url)` | HTTP GET → `{status, statusText, body, bytes, durationMs}` | declared `net` destinations, 10 s deadline, 4 MiB body cap |
+| `rt.fetch(url)` | HTTP GET → `{status, statusText, body, bytes, durationMs}` | declared `net` destinations — re-checked on every redirect hop (at most 10), never through an environment proxy — 10 s deadline, 4 MiB body cap |
 | `rt.setTimeout` `setInterval` `clearTimeout` `clearInterval` | Node-style timers, id-tracked; `unrefTimer`/`refTimer` release the loop | deadline (run timeout) |
 | `rt.pendingTimers()` | how many timers this script still owns | none |
 | `rt.kv.get/put/delete/list` | embedded SQLite store; `list` is an exact-prefix scan | declared `kv` file + `max_bytes` quota |
