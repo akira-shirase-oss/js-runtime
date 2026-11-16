@@ -100,7 +100,7 @@ backstop covers the fully-idle case. **What this does not cover:** memory
 bombs — a runaway allocation needs a process boundary, which is what
 `jsrt supervise` is for (`RLIMIT_CPU` seconds, RSS polling, SIGTERM→SIGKILL,
 bounded JSONL run reports, worker stdout and stderr each capped per run by
-`--max-output-kb` — default 8 MiB — with passed and dropped bytes in the report), and we don't pretend an in-process flag replaces
+`--max-output-kb` — default 8 MiB, a lifetime budget per run — with a notice the moment a stream hits it, its last 4 KiB re-shown at exit so the cause of death survives, and passed/dropped/re-shown bytes in the report), and we don't pretend an in-process flag replaces
 it.
 
 ## Layout
