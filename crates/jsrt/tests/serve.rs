@@ -28,14 +28,25 @@ impl Rig {
         path
     }
 
-    /// A free loopback port: bind :0, read the port, drop. Small race —
-    /// fine on loopback for tests, and retry covers the rare collision.
+    /// A loopback port for one test's server. Not from `bind(:0)`, which
+    /// hands out ephemeral ports — the same range every client socket in
+    /// this busy test run takes its local port from. Ports come from
+    /// 20000-29999, below the ephemeral ranges of macOS (49152+) and Linux
+    /// (32768+), each handed out once per run and checked free before use.
+    /// A port can still be taken between this check and the server's bind
+    /// (observed here, by a holder gone a moment later); `spawn_serve`
+    /// notices and starts the server again.
     fn free_port() -> u16 {
-        TcpListener::bind("127.0.0.1:0")
-            .unwrap_or_else(|e| panic!("bind :0: {e}"))
-            .local_addr()
-            .unwrap_or_else(|e| panic!("local_addr: {e}"))
-            .port()
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let start = std::process::id() % 10_000;
+        loop {
+            let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            assert!(n < 10_000, "no free test port in 20000-29999");
+            let port = 20_000 + ((start + n) % 10_000) as u16;
+            if TcpListener::bind(("127.0.0.1", port)).is_ok() {
+                return port;
+            }
+        }
     }
 
     fn run(&self, args: &[&str]) -> Output {
@@ -46,19 +57,100 @@ impl Rig {
             .unwrap_or_else(|e| panic!("spawn jsrt: {e}"))
     }
 
-    /// Spawn a serve script in the background; caller polls the port.
-    fn spawn_serve(&self, script: &Path, extra: &[&str]) -> Child {
+    /// Spawn a serve script and return once *its* listener is up: every
+    /// serve script here prints [`READY`] right after `rt.serve` returns
+    /// (the bind is synchronous), so a connection that succeeds can only
+    /// reach this child — never a stranger that happens to hold the port.
+    /// If the port was taken between the probe and the bind (seen on this
+    /// shared machine: something briefly holds it, then it is free), the
+    /// child exits with "Address already in use" and is started again.
+    fn spawn_serve(&self, script: &Path, extra: &[&str]) -> ServeChild {
         let mut args = vec!["run"];
         args.push(script.to_str().unwrap_or_else(|| panic!("utf8")));
         args.extend_from_slice(extra);
-        // stderr is piped so tests can read what the host told the
-        // operator (it is small: a few lines at most).
-        Command::new(JSRT)
-            .args(&args)
-            .current_dir(self.dir.path())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .unwrap_or_else(|e| panic!("spawn jsrt: {e}"))
+        for _attempt in 0..20 {
+            // stderr is piped so tests can read what the host told the
+            // operator (it is small: a few lines at most).
+            let mut child = Command::new(JSRT)
+                .args(&args)
+                .current_dir(self.dir.path())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap_or_else(|e| panic!("spawn jsrt: {e}"));
+            let stdout = child
+                .stdout
+                .take()
+                .unwrap_or_else(|| panic!("no stdout pipe"));
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                use std::io::BufRead;
+                // Keep draining after the marker so the pipe never fills.
+                for line in std::io::BufReader::new(stdout).lines() {
+                    let Ok(line) = line else { break };
+                    let _ = tx.send(line);
+                }
+            });
+            let deadline = Instant::now() + Duration::from_secs(20);
+            let ready = loop {
+                let Some(left) = deadline.checked_duration_since(Instant::now()) else {
+                    break false;
+                };
+                match rx.recv_timeout(left) {
+                    Ok(line) if line.contains(READY) => break true,
+                    Ok(_) => {}
+                    Err(_) => break false,
+                }
+            };
+            if ready {
+                return ServeChild(Some(child));
+            }
+            let _ = child.kill();
+            let out = child
+                .wait_with_output()
+                .unwrap_or_else(|e| panic!("wait: {e}"));
+            let err = String::from_utf8_lossy(&out.stderr);
+            if !err.contains("Address already in use") {
+                panic!("the server never came up: {:?}, stderr: {err}", out.status);
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        panic!("the test port stayed in use");
+    }
+}
+
+/// What every serve script here prints once its listener is bound.
+const READY: &str = "jsrt-test: listening";
+
+/// A spawned server that is killed if the test fails before waiting for
+/// it — a listener left behind would hold its port, and its backlog, for
+/// the rest of the run.
+struct ServeChild(Option<Child>);
+
+impl ServeChild {
+    fn wait_with_output(mut self) -> std::io::Result<Output> {
+        match self.0.take() {
+            Some(child) => child.wait_with_output(),
+            None => Err(std::io::Error::other("already waited")),
+        }
+    }
+}
+
+impl Drop for ServeChild {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            let _ = child.kill();
+            // A failing test gets the server's side of the story.
+            if let Ok(out) = child.wait_with_output() {
+                if std::thread::panicking() {
+                    eprintln!(
+                        "server exit {:?}, stderr: {}",
+                        out.status,
+                        String::from_utf8_lossy(&out.stderr)
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -119,6 +211,11 @@ fn http(port: u16, request: &str) -> (u16, String, String) {
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => panic!(
+                "read: the server reset the connection after {} bytes -- did the \
+                 listener close or the run time out before this request? ({e})",
+                raw.len()
+            ),
             Err(e) => panic!("read: {e}"),
         }
     }
@@ -195,10 +292,11 @@ fn serve_answers_requests_and_survives_a_handler_crash() {
     let script = rig.script(
         "app.js",
         "const server = rt.serve({host: '127.0.0.1', port: PORT}, async (req) => {\n\
+           if (req.path === '/quit') { rt.setTimeout(() => server.close(), 0); return {status: 200, body: 'bye'}; }\n\
            if (req.path === '/boom') throw new Error('handler died');\n\
            return {status: 201, headers: {'x-jsrt': 'y'}, body: req.method + ' ' + req.path};\n\
          });\n\
-         rt.setTimeout(() => server.close(), 3000);\n"
+         rt.print('jsrt-test: listening\\n');\n"
             .replace("PORT", &port.to_string())
             .as_str(),
     );
@@ -241,6 +339,7 @@ fn serve_answers_requests_and_survives_a_handler_crash() {
     assert_eq!(status, 201, "body: {body}");
     assert!(body.contains("POST /echo"), "body: {body}");
 
+    quit(port);
     let out = child
         .wait_with_output()
         .unwrap_or_else(|e| panic!("wait: {e}"));
@@ -263,10 +362,11 @@ fn serve_over_cap_body_is_refused_before_the_script_sees_it() {
         "app.js",
         "let seen = 0;\n\
          const server = rt.serve({host: '127.0.0.1', port: PORT}, async (req) => {\n\
+           if (req.path === '/quit') { rt.setTimeout(() => server.close(), 0); return {status: 200, body: 'bye'}; }\n\
            seen++;\n\
            return {status: 200, body: 'seen:' + seen + ' len:' + req.body.length};\n\
          });\n\
-         rt.setTimeout(() => server.close(), 3000);\n"
+         rt.print('jsrt-test: listening\\n');\n"
             .replace("PORT", &port.to_string())
             .as_str(),
     );
@@ -298,6 +398,7 @@ fn serve_over_cap_body_is_refused_before_the_script_sees_it() {
     assert_eq!(status, 200, "body: {body}");
     assert!(body.contains("seen:1"), "body: {body}");
 
+    quit(port);
     let out = child
         .wait_with_output()
         .unwrap_or_else(|e| panic!("wait: {e}"));
@@ -310,8 +411,11 @@ fn serve_flag_grants_a_listener() {
     let port = Rig::free_port();
     let script = rig.script(
         "app.js",
-        "const s = rt.serve({host: '127.0.0.1', port: PORT}, async (r) => ({status: 200, body: 'flag'}));\n\
-         rt.setTimeout(() => s.close(), 3000);\n"
+        "const server = rt.serve({host: '127.0.0.1', port: PORT}, async (req) => {\n\
+           if (req.path === '/quit') { rt.setTimeout(() => server.close(), 0); return {status: 200, body: 'bye'}; }\n\
+           return {status: 200, body: 'flag'};\n\
+         });\n\
+         rt.print('jsrt-test: listening\\n');\n"
             .replace("PORT", &port.to_string())
             .as_str(),
     );
@@ -322,6 +426,7 @@ fn serve_flag_grants_a_listener() {
     );
     assert_eq!(status, 200, "body: {body}");
     assert_eq!(body, "flag");
+    quit(port);
     let out = child
         .wait_with_output()
         .unwrap_or_else(|e| panic!("wait: {e}"));
@@ -356,36 +461,11 @@ fn a_non_loopback_serve_grant_fails_at_manifest_parse() {
 // listener caps its connections, closes a connection that is idle or slow
 // to send its head, and answers 408 to a body that stalls.
 
-/// A serve app that answers every request and closes itself after `ms`.
-fn bounded_app(rig: &Rig, port: u16, serve_extra: &str, close_ms: u64) -> Child {
-    let manifest = rig.script(
-        "m.manifest.json",
-        &format!("{{ \"serve\": {{\"host\": \"127.0.0.1\", \"port\": {port}{serve_extra}}} }}\n"),
-    );
-    let script = rig.script(
-        "app.js",
-        &format!(
-            "const s = rt.serve({{host: '127.0.0.1', port: {port}}}, async (r) => ({{status: 200, body: 'ok ' + r.path}}));\n\
-             rt.setTimeout(() => s.close(), {close_ms});\n"
-        ),
-    );
-    rig.spawn_serve(
-        &script,
-        &[
-            "--manifest",
-            manifest.to_str().unwrap_or_else(|| panic!("utf8")),
-            "--timeout",
-            "0",
-        ],
-    )
-}
-
 /// Read until the server closes; how long that took. Panics if the read
 /// timeout passes first — the server kept the connection.
+/// The stream's read timeout must already be set: once the server has
+/// closed it, macOS refuses `setsockopt` on the socket (EINVAL).
 fn time_until_closed(stream: &mut TcpStream, started: Instant) -> Duration {
-    stream
-        .set_read_timeout(Some(Duration::from_secs(4)))
-        .unwrap_or_else(|e| panic!("timeout: {e}"));
     let mut buf = [0u8; 1024];
     loop {
         match stream.read(&mut buf) {
@@ -432,18 +512,24 @@ fn read_response(stream: &mut TcpStream) -> Option<(u16, String)> {
 fn an_idle_or_slow_head_connection_is_closed_at_the_header_timeout() {
     let rig = Rig::new();
     let port = Rig::free_port();
-    let child = bounded_app(&rig, port, ", \"header_timeout_ms\": 300", 4000);
+    let child = route_app(&rig, port, ", \"header_timeout_ms\": 300", "");
+    let with_timeout = |s: TcpStream| {
+        s.set_read_timeout(Some(Duration::from_secs(4)))
+            .unwrap_or_else(|e| panic!("timeout: {e}"));
+        s
+    };
     // Idle: connected, sends nothing.
-    let mut idle = connect(port);
+    let mut idle = with_timeout(connect(port));
     let started = Instant::now();
     // Slowloris: a head that never finishes.
-    let mut slow = connect(port);
+    let mut slow = with_timeout(connect(port));
     slow.write_all(format!("GET / HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n").as_bytes())
         .unwrap_or_else(|e| panic!("write: {e}"));
     for (name, stream) in [("idle", &mut idle), ("slow head", &mut slow)] {
         let took = time_until_closed(stream, started);
         assert!(took < Duration::from_secs(3), "{name} held for {took:?}");
     }
+    quit(port);
     let out = child
         .wait_with_output()
         .unwrap_or_else(|e| panic!("wait: {e}"));
@@ -454,7 +540,9 @@ fn an_idle_or_slow_head_connection_is_closed_at_the_header_timeout() {
 fn a_body_that_stalls_is_answered_408_at_the_body_timeout() {
     let rig = Rig::new();
     let port = Rig::free_port();
-    let child = bounded_app(&rig, port, ", \"body_timeout_ms\": 300", 4000);
+    let child = route_app(&rig, port, ", \"body_timeout_ms\": 300", "");
+    // Time the body deadline, not the server's start-up.
+    drop(connect(port));
     let started = Instant::now();
     let (status, _head, _body) = http(
         port,
@@ -468,6 +556,7 @@ fn a_body_that_stalls_is_answered_408_at_the_body_timeout() {
         "{:?}",
         started.elapsed()
     );
+    quit(port);
     let out = child
         .wait_with_output()
         .unwrap_or_else(|e| panic!("wait: {e}"));
@@ -478,7 +567,7 @@ fn a_body_that_stalls_is_answered_408_at_the_body_timeout() {
 fn connections_past_the_cap_wait_for_a_free_slot() {
     let rig = Rig::new();
     let port = Rig::free_port();
-    let child = bounded_app(&rig, port, ", \"max_connections\": 2", 5000);
+    let child = route_app(&rig, port, ", \"max_connections\": 2", "");
     let request = |path: &str| format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n");
     // Two keep-alive connections, each proven accepted by a full answer,
     // then left open: they hold both slots.
@@ -510,6 +599,7 @@ fn connections_past_the_cap_wait_for_a_free_slot() {
     assert_eq!(answer.as_ref().map(|r| r.0), Some(200), "{answer:?}");
     drop(held);
     drop(third);
+    quit(port);
     let out = child
         .wait_with_output()
         .unwrap_or_else(|e| panic!("wait: {e}"));
@@ -529,6 +619,7 @@ fn a_malformed_handler_answer_is_a_500_and_the_listener_lives() {
     let script = rig.script(
         "app.js",
         &"const server = rt.serve({host: '127.0.0.1', port: PORT}, async (req) => {\n\
+            if (req.path === '/quit') { rt.setTimeout(() => server.close(), 0); return {status: 200, body: 'bye'}; }\n\
             switch (req.path) {\n\
               case '/none': return undefined;\n\
               case '/bad-header': return {status: 200, headers: {'bad header': 'x'}, body: 'nope'};\n\
@@ -537,7 +628,7 @@ fn a_malformed_handler_answer_is_a_500_and_the_listener_lives() {
               default: return {status: 201, body: 'alive'};\n\
             }\n\
           });\n\
-          rt.setTimeout(() => server.close(), 3000);\n"
+          rt.print('jsrt-test: listening\\n');\n"
             .replace("PORT", &port.to_string()),
     );
     let child = rig.spawn_serve(
@@ -565,6 +656,7 @@ fn a_malformed_handler_answer_is_a_500_and_the_listener_lives() {
     // And the listener is still serving.
     let (status, _head, body) = get("/alive");
     assert_eq!((status, body.as_str()), (201, "alive"));
+    quit(port);
     let out = child
         .wait_with_output()
         .unwrap_or_else(|e| panic!("wait: {e}"));
@@ -583,7 +675,7 @@ fn a_malformed_handler_answer_is_a_500_and_the_listener_lives() {
 /// answer). Tests end it by calling [`quit`] once their assertions are
 /// done, never on a timer; the run timeout is only a backstop for a test
 /// that fails half-way.
-fn route_app(rig: &Rig, port: u16, serve_extra: &str, routes: &str) -> Child {
+fn route_app(rig: &Rig, port: u16, serve_extra: &str, routes: &str) -> ServeChild {
     let manifest = rig.script(
         "routes.manifest.json",
         &format!("{{ \"serve\": {{\"host\": \"127.0.0.1\", \"port\": {port}{serve_extra}}} }}\n"),
@@ -595,7 +687,8 @@ fn route_app(rig: &Rig, port: u16, serve_extra: &str, routes: &str) -> Child {
                if (req.path === '/quit') {{ rt.setTimeout(() => server.close(), 0); return {{status: 200, body: 'bye'}}; }}\n\
                {routes}\n\
                return {{status: 200, body: 'ok ' + req.path}};\n\
-             }});\n"
+             }});\n\
+             rt.print('jsrt-test: listening\\n');\n"
         ),
     );
     rig.spawn_serve(
