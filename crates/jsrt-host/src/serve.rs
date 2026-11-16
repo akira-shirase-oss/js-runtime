@@ -18,8 +18,11 @@
 //! taken *before* `accept`, so connections past the cap wait in the
 //! kernel backlog rather than as tasks here), `header_timeout` (hyper's
 //! header-read timer, which also runs while a keep-alive connection sits
-//! idle waiting for its next head), and `body_timeout` (408 for a body
-//! that stalls).
+//! idle waiting for its next head), `body_timeout` (408 for a body
+//! that stalls) and `write_timeout` (a response write that makes no
+//! progress for that long drops the connection — without it, a client
+//! that requests a large answer and never reads would hold its slot
+//! forever, and `max_connections` such clients would stop the listener).
 //!
 //! A body is read *before* the request takes a dispatch-queue slot, so a
 //! stalled upload never sits in the queue ahead of other requests (taking
@@ -35,9 +38,13 @@ use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::convert::Infallible;
+use std::future::Future;
+use std::io;
+use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use deno_core::{op2, OpState, Resource, ResourceId};
@@ -48,6 +55,7 @@ use hyper::service::service_fn;
 use hyper::{Request, Response};
 use hyper_util::rt::{TokioIo, TokioTimer};
 use serde::Serialize;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{mpsc, oneshot, Mutex as TokioMutex, OwnedSemaphorePermit, Semaphore};
 
 use crate::capability::ServeGrant;
@@ -230,6 +238,7 @@ fn op_serve_listen(
         )),
     };
     let header_timeout = grant.header_timeout;
+    let write_timeout = grant.write_timeout;
     let slots = Arc::new(Semaphore::new(grant.max_connections));
     let task_resource = resource.clone();
     let task = deno_core::unsync::spawn(async move {
@@ -250,11 +259,12 @@ fn op_serve_listen(
                         let svc = service_fn(move |req: Request<Incoming>| {
                             dispatch(req, tx.clone(), res.clone(), limits.clone())
                         });
+                        let io = TokioIo::new(StallGuard::new(stream, write_timeout));
                         let _ = hyper::server::conn::http1::Builder::new()
                             .max_buf_size(HEAD_BUF_MAX)
                             .timer(TokioTimer::new())
                             .header_read_timeout(header_timeout)
-                            .serve_connection(TokioIo::new(stream), svc)
+                            .serve_connection(io, svc)
                             .await;
                     });
                 }
@@ -273,6 +283,96 @@ fn op_serve_listen(
 
     let rid = state.borrow_mut().resource_table.add_rc(resource);
     Ok(rid)
+}
+
+/// A socket whose writes give up when they make no progress for `limit`.
+/// hyper's header timer only runs while it reads a head; once a response
+/// is being written, a peer that stops reading would park the write (and
+/// the connection's slot) forever. The clock starts at the first write
+/// that cannot proceed and resets whenever bytes move.
+struct StallGuard<T> {
+    inner: T,
+    limit: Duration,
+    stalled: Option<Pin<Box<tokio::time::Sleep>>>,
+}
+
+impl<T> StallGuard<T> {
+    fn new(inner: T, limit: Duration) -> Self {
+        Self {
+            inner,
+            limit,
+            stalled: None,
+        }
+    }
+
+    /// Map a pending write-side poll onto the stall clock.
+    fn watch<R>(&mut self, cx: &mut Context<'_>, poll: Poll<io::Result<R>>) -> Poll<io::Result<R>> {
+        match poll {
+            Poll::Ready(r) => {
+                self.stalled = None;
+                Poll::Ready(r)
+            }
+            Poll::Pending => {
+                let limit = self.limit;
+                let timer = self
+                    .stalled
+                    .get_or_insert_with(|| Box::pin(tokio::time::sleep(limit)));
+                if timer.as_mut().poll(cx).is_ready() {
+                    self.stalled = None;
+                    Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "client stopped reading the response",
+                    )))
+                } else {
+                    Poll::Pending
+                }
+            }
+        }
+    }
+}
+
+impl<T: AsyncRead + Unpin> AsyncRead for StallGuard<T> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl<T: AsyncWrite + Unpin> AsyncWrite for StallGuard<T> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let poll = Pin::new(&mut self.inner).poll_write(cx, buf);
+        self.watch(cx, poll)
+    }
+
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        let poll = Pin::new(&mut self.inner).poll_write_vectored(cx, bufs);
+        self.watch(cx, poll)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let poll = Pin::new(&mut self.inner).poll_flush(cx);
+        self.watch(cx, poll)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let poll = Pin::new(&mut self.inner).poll_shutdown(cx);
+        self.watch(cx, poll)
+    }
 }
 
 /// Per-request bounds the wire side enforces before the script is involved.

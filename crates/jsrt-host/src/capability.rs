@@ -34,6 +34,9 @@ pub const DEFAULT_SERVE_MAX_CONNECTIONS: usize = 256;
 pub const DEFAULT_SERVE_HEADER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 /// Default time a request may take to deliver its body.
 pub const DEFAULT_SERVE_BODY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// Default time a response write may go without progress before the
+/// connection is dropped (a client that stopped reading).
+pub const DEFAULT_SERVE_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// A declared embedded-KV store: the file the script may open and the
 /// quota it must stay under. The `path`'s parent is canonicalized at
@@ -65,6 +68,9 @@ pub struct ServeGrant {
     pub header_timeout: std::time::Duration,
     /// Deadline for a request body once its head has arrived.
     pub body_timeout: std::time::Duration,
+    /// Longest a response write may make no progress; past it the
+    /// connection, and its slot, are dropped.
+    pub write_timeout: std::time::Duration,
 }
 
 impl ServeGrant {
@@ -76,6 +82,7 @@ impl ServeGrant {
             max_connections: DEFAULT_SERVE_MAX_CONNECTIONS,
             header_timeout: DEFAULT_SERVE_HEADER_TIMEOUT,
             body_timeout: DEFAULT_SERVE_BODY_TIMEOUT,
+            write_timeout: DEFAULT_SERVE_WRITE_TIMEOUT,
         }
     }
 }
@@ -149,6 +156,8 @@ struct ManifestServe {
     header_timeout_ms: Option<u64>,
     #[serde(default)]
     body_timeout_ms: Option<u64>,
+    #[serde(default)]
+    write_timeout_ms: Option<u64>,
 }
 
 impl Capabilities {
@@ -300,6 +309,10 @@ impl Capabilities {
             if let Some(ms) = serve.body_timeout_ms {
                 grant.body_timeout =
                     std::time::Duration::from_millis(positive("body_timeout_ms", ms)?);
+            }
+            if let Some(ms) = serve.write_timeout_ms {
+                grant.write_timeout =
+                    std::time::Duration::from_millis(positive("write_timeout_ms", ms)?);
             }
             caps.serve = Some(grant);
         }

@@ -657,3 +657,42 @@ fn a_get_is_answered_while_sixty_four_bodies_stall() {
         .unwrap_or_else(|e| panic!("wait: {e}"));
     assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
 }
+
+#[test]
+fn a_client_that_stops_reading_gives_its_slot_back() {
+    let rig = Rig::new();
+    let port = Rig::free_port();
+    // One connection slot; /big answers 32 MiB, more than loopback socket
+    // buffers hold, so a client that never reads stalls the write.
+    let child = route_app(
+        &rig,
+        port,
+        ", \"max_connections\": 1, \"write_timeout_ms\": 500",
+        "if (req.path === '/big') return {status: 200, body: 'x'.repeat(32 * 1024 * 1024)};",
+    );
+    drop(connect(port));
+    let mut stuck = connect(port);
+    stuck
+        .write_all(b"GET /big HTTP/1.1\r\nHost: x\r\n\r\n")
+        .unwrap_or_else(|e| panic!("write: {e}"));
+    // `stuck` never reads. The next client must still get an answer: the
+    // stalled write gives up after 500 ms and frees the only slot.
+    let started = Instant::now();
+    let (status, _head, body) = http(
+        port,
+        &format!("GET /small HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"),
+    );
+    let took = started.elapsed();
+    assert_eq!(
+        (status, body.as_str()),
+        (200, "ok /small"),
+        "after {took:?}"
+    );
+    assert!(took < Duration::from_secs(4), "answered after {took:?}");
+    drop(stuck);
+    quit(port);
+    let out = child
+        .wait_with_output()
+        .unwrap_or_else(|e| panic!("wait: {e}"));
+    assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
+}
