@@ -185,22 +185,29 @@ pub fn describe(err: reqwest::Error) -> String {
     out
 }
 
-/// A URL fit for an error message or a log line: userinfo removed, the
-/// query and fragment replaced — those are where tokens and passwords
-/// travel. An unparseable URL is not echoed at all.
+/// A URL fit for an error message or a log line: `scheme://host:port`
+/// and nothing else, with `/...` when something followed. Userinfo, the
+/// query and the fragment carry tokens and passwords, and so does the path
+/// (webhook URLs, `bot<token>` APIs); the operator needs the destination,
+/// which is the part kept. An unparseable URL is not echoed at all.
 pub fn redact_url(url: &str) -> String {
-    let Ok(mut parsed) = reqwest::Url::parse(url) else {
+    let Ok(parsed) = reqwest::Url::parse(url) else {
         return format!("<unparseable URL, {} bytes>", url.len());
     };
-    let had_query = parsed.query().is_some();
-    // Both fail only for URLs that cannot carry userinfo — nothing to strip.
-    let _ = parsed.set_username("");
-    let _ = parsed.set_password(None);
-    parsed.set_query(None);
-    parsed.set_fragment(None);
-    let mut shown = parsed.to_string();
-    if had_query {
-        shown.push_str("?[redacted]");
+    let mut shown = format!("{}://", parsed.scheme());
+    if let Some(host) = parsed.host_str() {
+        shown.push_str(host);
+        if let Some(port) = parsed.port_or_known_default() {
+            shown.push_str(&format!(":{port}"));
+        }
+    }
+    let elided = parsed.path() != "/"
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some();
+    if elided {
+        shown.push_str("/...");
     }
     shown
 }
@@ -214,12 +221,17 @@ mod tests {
     }
 
     #[test]
-    fn redact_url_strips_userinfo_and_query() {
+    fn redact_url_keeps_only_the_destination() {
         assert_eq!(
             redact_url("https://alice:hunter2@api.example.com:8443/v1/x?token=abc#frag"),
-            "https://api.example.com:8443/v1/x?[redacted]"
+            "https://api.example.com:8443/..."
         );
-        assert_eq!(redact_url("http://a.b/plain"), "http://a.b/plain");
+        assert_eq!(
+            redact_url("https://hooks.example.com/services/T0/B0/HOOKSECRET"),
+            "https://hooks.example.com:443/..."
+        );
+        assert_eq!(redact_url("http://a.b/"), "http://a.b:80");
+        assert_eq!(redact_url("http://[::1]:8080/x"), "http://[::1]:8080/...");
         assert_eq!(
             redact_url("http://alice@:99x/?t=1"),
             "<unparseable URL, 22 bytes>"

@@ -879,7 +879,11 @@ fn fetch_errors_do_not_echo_credentials_or_query_strings() {
         .port();
     let slow = Stub::start(respond("200 OK", b"late", 3000));
     let big = Stub::start(respond("200 OK", &vec![b'x'; 5 * 1024 * 1024], 0));
-    let secret = |port: u16| format!("http://alice:hunter2@127.0.0.1:{port}/x?token=SEKRET");
+    // Tokens ride in userinfo, the query, and the path (webhook URLs,
+    // `bot<token>` APIs).
+    let secret = |port: u16| {
+        format!("http://alice:hunter2@127.0.0.1:{port}/hooks/PATHSECRET/x?token=SEKRET")
+    };
     let script = rig.script(
         "f.js",
         &format!(
@@ -911,7 +915,7 @@ fn fetch_errors_do_not_echo_credentials_or_query_strings() {
     let err = stderr(&out);
     assert_eq!(code(&out), 8, "stdout: {stdout}\nstderr: {err}");
     assert_eq!(stdout.lines().count(), 4, "stdout: {stdout}");
-    for leaked in ["hunter2", "alice", "SEKRET"] {
+    for leaked in ["hunter2", "alice", "SEKRET", "PATHSECRET"] {
         assert!(!stdout.contains(leaked), "{leaked} in stdout: {stdout}");
         assert!(!err.contains(leaked), "{leaked} in stderr: {err}");
     }
