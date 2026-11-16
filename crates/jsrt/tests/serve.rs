@@ -1381,3 +1381,42 @@ fn eviction_spares_a_request_the_script_is_handling() {
         .unwrap_or_else(|e| panic!("wait: {e}"));
     assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
 }
+
+#[test]
+fn a_refused_upload_without_expect_still_reads_its_503() {
+    let rig = Rig::new();
+    let port = Rig::free_port();
+    let child = route_app(&rig, port, "", "");
+    // Fill the budget for the 5 s first-byte allowance.
+    let idle = idle_declarers(port, 8, 8 * 1024 * 1024);
+    std::thread::sleep(Duration::from_millis(300));
+    // A plain client: head and 1 MiB body in one go, then read. If the
+    // server answers and closes without reading, the client's write fails
+    // or the 503 is lost to a reset.
+    let mut s = connect(port);
+    s.set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap_or_else(|e| panic!("timeout: {e}"));
+    s.set_write_timeout(Some(Duration::from_secs(5)))
+        .unwrap_or_else(|e| panic!("timeout: {e}"));
+    let body = vec![b'p'; 1024 * 1024];
+    let mut request = format!(
+        "POST /up HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    request.extend_from_slice(&body);
+    let wrote = s.write_all(&request);
+    let mut answer = Vec::new();
+    let read = s.read_to_end(&mut answer);
+    let text = String::from_utf8_lossy(&answer).to_ascii_lowercase();
+    assert!(wrote.is_ok(), "the upload was cut off: {wrote:?}");
+    assert!(read.is_ok() || !answer.is_empty(), "no answer: {read:?}");
+    assert!(text.starts_with("http/1.1 503"), "{text:?}");
+    assert!(text.contains("retry-after: 1"), "{text:?}");
+    drop(idle);
+    quit(port);
+    let out = child
+        .wait_with_output()
+        .unwrap_or_else(|e| panic!("wait: {e}"));
+    assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
+}

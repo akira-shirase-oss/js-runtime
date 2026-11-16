@@ -88,6 +88,10 @@ const BODY_BUFFER_BUDGET: u64 = 64 * 1024 * 1024;
 const FREE_BODY_BYTES: u64 = 64 * 1024;
 /// What a 503 for a full budget tells the client to wait, in seconds.
 const BUSY_RETRY_AFTER_SECS: &str = "1";
+/// How long a refused upload's body is read and thrown away before the
+/// refusal is sent, so a client without `Expect: 100-continue` finishes
+/// writing and reads the answer instead of hitting a reset.
+const REFUSAL_DRAIN: Duration = Duration::from_millis(200);
 
 type PendingResponse = oneshot::Sender<Response<Full<Bytes>>>;
 
@@ -566,7 +570,7 @@ fn take_budget(budget: &Arc<Semaphore>, n: u64) -> Result<OwnedSemaphorePermit, 
 /// ever waits for budget, so no request can hold some while waiting for
 /// more.
 async fn read_body(
-    mut body: Incoming,
+    body: &mut Incoming,
     declared: Option<u64>,
     limits: &WireLimits,
 ) -> Result<(Vec<u8>, Option<OwnedSemaphorePermit>), BodyFailure> {
@@ -624,6 +628,28 @@ async fn read_body(
     Ok((buf, held))
 }
 
+/// Read and discard what is left of a refused upload, for at most
+/// [`REFUSAL_DRAIN`] and `max_bytes`, so the client that is still sending
+/// gets to read the answer. Skipped for `Expect: 100-continue` requests:
+/// polling their body would invite the body the refusal is meant to stop.
+async fn drain_refused(body: &mut Incoming, expects_continue: bool, max_bytes: u64) {
+    if expects_continue {
+        return;
+    }
+    let _ = tokio::time::timeout(REFUSAL_DRAIN, async {
+        let mut seen: u64 = 0;
+        while let Some(Ok(frame)) = body.frame().await {
+            if let Ok(data) = frame.into_data() {
+                seen += data.len() as u64;
+                if seen > max_bytes {
+                    return;
+                }
+            }
+        }
+    })
+    .await;
+}
+
 /// Wire-side handler: collect the bounded body, take a dispatch slot, hand
 /// the request to the script, await its response. Every failure mode maps
 /// to a real HTTP answer — the wire never sees a Rust panic.
@@ -649,7 +675,12 @@ async fn dispatch(
             .unwrap_or_else(|_| Response::new(Full::new(Bytes::new())))
     }
 
-    let (parts, body) = req.into_parts();
+    let (parts, mut body) = req.into_parts();
+    let expects_continue = parts
+        .headers
+        .get(http::header::EXPECT)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.eq_ignore_ascii_case("100-continue"));
     if parts.headers.len() > MAX_HEADERS {
         return Ok(plain(431, "too many headers"));
     }
@@ -671,6 +702,7 @@ async fn dispatch(
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<u64>().ok());
     if declared.is_some_and(|n| n > limits.max_body) {
+        drain_refused(&mut body, expects_continue, limits.max_body).await;
         return Ok(plain(413, "request body too large"));
     }
 
@@ -678,12 +710,18 @@ async fn dispatch(
     // only a complete request competes for a dispatch-queue slot, so a
     // stalled upload can never stand in front of a GET.
     let collected =
-        tokio::time::timeout(limits.body_timeout, read_body(body, declared, &limits)).await;
+        tokio::time::timeout(limits.body_timeout, read_body(&mut body, declared, &limits)).await;
     let (bytes, body_budget) = match collected {
         Ok(Ok(read)) => read,
-        Ok(Err(BodyFailure::TooLarge)) => return Ok(plain(413, "request body too large")),
+        Ok(Err(BodyFailure::TooLarge)) => {
+            drain_refused(&mut body, expects_continue, limits.max_body).await;
+            return Ok(plain(413, "request body too large"));
+        }
         Ok(Err(BodyFailure::Unreadable)) => return Ok(plain(400, "request body unreadable")),
-        Ok(Err(BodyFailure::Busy)) => return Ok(busy()),
+        Ok(Err(BodyFailure::Busy)) => {
+            drain_refused(&mut body, expects_continue, limits.max_body).await;
+            return Ok(busy());
+        }
         Ok(Err(BodyFailure::TooSlow)) => return Ok(plain(408, "request body too slow")),
         Err(_) => return Ok(plain(408, "request body timeout")),
     };
