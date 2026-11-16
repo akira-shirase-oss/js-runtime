@@ -171,29 +171,38 @@ async fn op_fetch(
     let deadline = budgets.fetch_deadline;
     let max_body = budgets.fetch_max_body;
     let started = std::time::Instant::now();
-    let mut response = tokio::time::timeout(deadline, client.get(&url).send())
+    // One deadline over the whole exchange — connect, redirects, headers
+    // and every body chunk. A deadline on send() alone let a server that
+    // drips a byte at a time hold the op for as long as it liked.
+    let exchange =
+        async {
+            let mut response = client
+                .get(&url)
+                .send()
+                .await
+                // A redirect hop outside the grant comes back from inside the
+                // client as our own refusal — it stays a CapabilityError.
+                .map_err(|e| match crate::net::refusal(&e) {
+                    Some(why) => JsErrorBox::new("CapabilityError", why),
+                    None => host_err(format!("fetch {shown}: {}", crate::net::describe(e))),
+                })?;
+            let status = response.status();
+            let mut body = Vec::new();
+            while let Some(chunk) = response.chunk().await.map_err(|e| {
+                host_err(format!("fetch {shown}: body: {}", crate::net::describe(e)))
+            })? {
+                body.extend_from_slice(&chunk);
+                if body.len() as u64 > max_body {
+                    return Err(host_err(format!(
+                        "fetch {shown}: body exceeded {max_body} bytes"
+                    )));
+                }
+            }
+            Ok((status, body))
+        };
+    let (status, body) = tokio::time::timeout(deadline, exchange)
         .await
-        .map_err(|_| host_err(format!("fetch {shown}: deadline {deadline:?} exceeded")))?
-        // A redirect hop outside the grant comes back from inside the
-        // client as our own refusal — it stays a CapabilityError.
-        .map_err(|e| match crate::net::refusal(&e) {
-            Some(why) => JsErrorBox::new("CapabilityError", why),
-            None => host_err(format!("fetch {shown}: {}", crate::net::describe(e))),
-        })?;
-    let status = response.status();
-    let mut body = Vec::new();
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .map_err(|e| host_err(format!("fetch {shown}: body: {}", crate::net::describe(e))))?
-    {
-        body.extend_from_slice(&chunk);
-        if body.len() as u64 > max_body {
-            return Err(host_err(format!(
-                "fetch {shown}: body exceeded {max_body} bytes"
-            )));
-        }
-    }
+        .map_err(|_| host_err(format!("fetch {shown}: deadline {deadline:?} exceeded")))??;
     Ok(FetchResult {
         status: status.as_u16(),
         status_text: status.canonical_reason().unwrap_or("").to_string(),

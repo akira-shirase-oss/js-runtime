@@ -631,6 +631,49 @@ fn a_slow_endpoint_dies_at_the_deadline() {
 }
 
 #[test]
+fn a_trickling_body_dies_at_the_same_deadline() {
+    let rig = Rig::new();
+    // Headers arrive at once, then one body byte every 100 ms for 2 s: each
+    // read makes progress, so only a deadline over the whole exchange --
+    // not just send() -- can end it.
+    let stub = Stub::start(|s| {
+        let mut buf = [0u8; 2048];
+        let _ = s.read(&mut buf);
+        let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 20\r\nConnection: close\r\n\r\n");
+        for _ in 0..20 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            if s.write_all(b"x").is_err() {
+                return;
+            }
+        }
+    });
+    let script = fetch_script(&rig, &stub.url("/drip"));
+    let started = std::time::Instant::now();
+    let out = rig.run_script(
+        &script,
+        &[
+            "--net",
+            &format!("127.0.0.1:{}", stub.port),
+            "--fetch-timeout",
+            "300",
+            "--timeout",
+            "15000",
+        ],
+    );
+    let elapsed = started.elapsed();
+    assert_eq!(code(&out), 8, "stderr: {}", stderr(&out));
+    assert!(
+        stderr(&out).contains("deadline"),
+        "stderr: {}",
+        stderr(&out)
+    );
+    assert!(
+        elapsed < std::time::Duration::from_millis(1800),
+        "the fetch must end near its 300 ms deadline, not when the body finishes; took {elapsed:?}"
+    );
+}
+
+#[test]
 fn an_authority_smuggle_is_refused_not_connecting_elsewhere() {
     let rig = Rig::new();
     let stub = Stub::start(respond("200 OK", b"x", 0));

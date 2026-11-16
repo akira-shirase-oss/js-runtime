@@ -28,7 +28,7 @@ not a thing scripts can rely on.
 | Step | Outcome | Invariant | Failure case | Acceptance test |
 |---|---|---|---|---|
 | 2.1 timers | `setTimeout`/`clearTimeout`/`setInterval`/`unref` over deno_core's timer machinery, id-tracked in `rt.*` | cancellation actually cancels; dropped runtimes drop their timers; no bare globals | timer left pending at exit can't hang the loop — ref'd holds until it fires, unref'd lets it exit, watchdog bounds the rest | 7 lifecycle tests, `79ef3a2` |
-| 2.2 bounded fetch | streaming body cap, per-op deadline (`--fetch-timeout`/`OpBudgets`), error classification | a slow endpoint can't hold an op forever; a 500 is a result, not a crash | stall → deadline `HostError`(8), oversized → cut at the cap | 5 TCP-stub tests, `93b80b7` |
+| 2.2 bounded fetch | streaming body cap, per-op deadline (`--fetch-timeout`/`OpBudgets`), error classification | a slow endpoint can't hold an op forever; a 500 is a result, not a crash | stall → deadline `HostError`(8), oversized → cut at the cap. *2026-11-16 fix:* the deadline covered `send()` only, so a body dripped a byte at a time held the op indefinitely; it now spans the whole exchange (trickle-body test) | 5 TCP-stub tests, `93b80b7` |
 | 2.3 retained resources | `PendingCounts` snapshot from the activity tracker before isolate drop; `rt.pendingTimers()` script-side | teardown is complete — no zombie work; a leak is *seen*, not silently dropped | pending interval named even on a terminated run | 3 host tests + script-side count, `afbbef4` |
 
 ## M3 — capabilities
