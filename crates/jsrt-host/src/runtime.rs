@@ -222,7 +222,14 @@ pub async fn run_file_report(entry: &Path, options: &HostOptions) -> RunReport {
         }
     };
 
-    let (mut runtime, stopped) = build_runtime(options, entry.parent());
+    // `main.js` has the parent "", which is the working directory; left
+    // as it is, it would not canonicalize and the program would lose its
+    // own directory as module space.
+    let entry_dir = match entry.parent() {
+        Some(dir) if dir.as_os_str().is_empty() => Some(Path::new(".")),
+        dir => dir,
+    };
+    let (mut runtime, stopped) = build_runtime(options, entry_dir);
     let done = Arc::new(AtomicBool::new(false));
     spawn_watchdog(
         &mut runtime,
