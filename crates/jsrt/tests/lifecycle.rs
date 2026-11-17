@@ -637,22 +637,30 @@ fn a_slow_endpoint_dies_at_the_deadline() {
 #[test]
 fn a_trickling_body_dies_at_the_same_deadline() {
     let rig = Rig::new();
-    // Headers arrive at once, then one body byte every 100 ms for 2 s: each
-    // read makes progress, so only a deadline over the whole exchange --
-    // not just send() -- can end it.
-    let stub = Stub::start(|s| {
+    // Headers arrive at once, then one body byte every 100 ms for 10 s:
+    // each read makes progress, so only a deadline over the whole exchange
+    // -- not just send() -- can end it. The stub times the hang-up itself,
+    // from the moment its head went out, so process start, V8 boot and
+    // teardown are outside the measurement (they took up to 0.25 s cold
+    // on a loaded machine, more inside a parallel test run).
+    let (hung_up_tx, hung_up_rx) = std::sync::mpsc::channel();
+    let stub = Stub::start(move |s| {
         let mut buf = [0u8; 2048];
         let _ = s.read(&mut buf);
-        let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 20\r\nConnection: close\r\n\r\n");
-        for _ in 0..20 {
+        let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\n");
+        let head_sent = std::time::Instant::now();
+        for _ in 0..100 {
             std::thread::sleep(std::time::Duration::from_millis(100));
+            // The first byte after the client closed may still be taken
+            // by the kernel; the next one fails.
             if s.write_all(b"x").is_err() {
+                let _ = hung_up_tx.send(Some(head_sent.elapsed()));
                 return;
             }
         }
+        let _ = hung_up_tx.send(None);
     });
     let script = fetch_script(&rig, &stub.url("/drip"));
-    let started = std::time::Instant::now();
     let out = rig.run_script(
         &script,
         &[
@@ -664,16 +672,20 @@ fn a_trickling_body_dies_at_the_same_deadline() {
             "15000",
         ],
     );
-    let elapsed = started.elapsed();
     assert_eq!(code(&out), 8, "stderr: {}", stderr(&out));
     assert!(
         stderr(&out).contains("deadline"),
         "stderr: {}",
         stderr(&out)
     );
+    let hung_up = hung_up_rx
+        .recv_timeout(std::time::Duration::from_secs(15))
+        .unwrap_or_else(|e| panic!("the stub never reported: {e}"))
+        .unwrap_or_else(|| panic!("the client read the whole 10 s drip"));
     assert!(
-        elapsed < std::time::Duration::from_millis(1800),
-        "the fetch must end near its 300 ms deadline, not when the body finishes; took {elapsed:?}"
+        hung_up < std::time::Duration::from_secs(2),
+        "the fetch must end near its 300 ms deadline, not when the body finishes; \
+         the client hung up {hung_up:?} after the head"
     );
 }
 
