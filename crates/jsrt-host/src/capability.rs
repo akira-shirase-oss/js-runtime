@@ -7,9 +7,18 @@
 //! - **Validate the real target.** Paths are canonicalized before comparison
 //!   (symlinks and `..` cannot escape a declared directory), and URLs are
 //!   checked by parsed host:port, never by string prefix.
+//!
+//! And one that keeps a refusal from becoming an answer: **a path outside
+//! the fence is refused before the filesystem is asked about it.** A path
+//! a script names is first normalized lexically (made absolute against the
+//! working directory, `.` and `..` folded) and compared with the declared
+//! roots, as declared and as canonicalized. Only a path that falls inside
+//! one is canonicalized; outside, the refusal is the same whether anything
+//! is there or not, so a script with no grant cannot probe which host
+//! paths exist. `..` is folded before symlinks are followed, as a URL is.
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use serde::Deserialize;
 
@@ -91,6 +100,10 @@ pub struct ServeGrant {
     /// connection, and its slot, are dropped. Keep it at 5 s or more: a
     /// review run saw 1 s cut legitimate slow downloads under load.
     pub write_timeout: std::time::Duration,
+    /// Longest one response may take to write, progress or not; `None`
+    /// (the default) leaves it to `write_timeout` and, at the connection
+    /// cap, the minimum-rate eviction rule.
+    pub response_timeout: Option<std::time::Duration>,
 }
 
 impl ServeGrant {
@@ -105,6 +118,7 @@ impl ServeGrant {
             body_first_byte: DEFAULT_SERVE_BODY_FIRST_BYTE,
             body_min_rate: DEFAULT_SERVE_BODY_MIN_RATE,
             write_timeout: DEFAULT_SERVE_WRITE_TIMEOUT,
+            response_timeout: None,
         }
     }
 }
@@ -114,6 +128,10 @@ impl ServeGrant {
 pub struct Capabilities {
     /// Canonicalized directories the script may read beneath.
     read_paths: Vec<PathBuf>,
+    /// The same directories as they were declared (absolute, lexically
+    /// normalized), where that differs: `/tmp/x` for `/private/tmp/x`. A
+    /// path a script names is matched against both before it is resolved.
+    read_spellings: Vec<PathBuf>,
     /// `host` or `host:port` destinations the script may fetch.
     net_hosts: Vec<String>,
     /// Destinations whose *name* may also resolve to loopback, private or
@@ -128,8 +146,11 @@ pub struct Capabilities {
     serve: Option<ServeGrant>,
 }
 
-/// The manifest file format (`jsrt.manifest.json`).
+/// The manifest file format (`jsrt.manifest.json`). Unknown keys, here and
+/// in every grant object, are an error that names the key: a misspelt
+/// bound (`max_byte`) must not quietly become the default.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Manifest {
     /// Directories (resolved relative to the manifest file) the script may
     /// read beneath. Symlinks are resolved before checking.
@@ -192,6 +213,7 @@ struct ManifestNetDetailed {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ManifestKv {
     path: PathBuf,
     #[serde(default)]
@@ -199,6 +221,7 @@ struct ManifestKv {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ManifestMedia {
     /// Only "local" ships today — anything else is a manifest error, not a
     /// silent fallback.
@@ -209,6 +232,7 @@ struct ManifestMedia {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ManifestServe {
     /// Must parse as an IP literal and be loopback — v1 does not bind
     /// public addresses, and "localhost" DNS games don't get a say.
@@ -225,6 +249,8 @@ struct ManifestServe {
     #[serde(default)]
     write_timeout_ms: Option<u64>,
     #[serde(default)]
+    response_timeout_ms: Option<u64>,
+    #[serde(default)]
     body_first_byte_ms: Option<u64>,
     #[serde(default)]
     body_min_rate: Option<u64>,
@@ -240,6 +266,7 @@ impl Capabilities {
     pub fn grant(read_paths: Vec<PathBuf>, net_hosts: Vec<String>) -> Self {
         Self {
             read_paths,
+            read_spellings: Vec::new(),
             net_hosts,
             net_private: Vec::new(),
             kv: None,
@@ -256,6 +283,7 @@ impl Capabilities {
     ) -> Self {
         Self {
             read_paths,
+            read_spellings: Vec::new(),
             net_hosts,
             net_private: Vec::new(),
             kv,
@@ -277,18 +305,20 @@ impl Capabilities {
             .parent()
             .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
         let mut caps = Self::default();
+        let mut reads = Grants::default();
         for dir in &manifest.read {
             let joined = base.join(dir);
             // Canonicalize at load time: the manifest line must point at a
             // real directory, and the stored entry is the *resolved* path.
-            let resolved = fs::canonicalize(&joined).map_err(|e| {
+            reads.add_read_root(&joined).map_err(|e| {
                 HostError::Host(format!(
                     "manifest read path {} does not resolve: {e}",
                     joined.display()
                 ))
             })?;
-            caps.read_paths.push(resolved);
         }
+        caps.read_paths = reads.read_paths;
+        caps.read_spellings = reads.read_spellings;
         for entry in manifest.net {
             match entry {
                 ManifestNet::Plain(host) => caps.net_hosts.push(host),
@@ -420,6 +450,12 @@ impl Capabilities {
                 grant.write_timeout =
                     std::time::Duration::from_millis(positive("write_timeout_ms", ms)?);
             }
+            if let Some(ms) = serve.response_timeout_ms {
+                grant.response_timeout = Some(std::time::Duration::from_millis(positive(
+                    "response_timeout_ms",
+                    ms,
+                )?));
+            }
             caps.serve = Some(grant);
         }
         Ok(caps)
@@ -447,47 +483,83 @@ impl Capabilities {
         })
     }
 
-    /// The allowlist check on an already-canonical path — the module
-    /// loader's gate uses this so an unresolvable path stays a *load*
-    /// failure instead of becoming a refusal it isn't.
+    /// The allowlist check on an already-canonical path.
     pub fn is_read_allowed(&self, resolved: &Path) -> bool {
         self.read_paths
             .iter()
             .any(|root| resolved.starts_with(root))
     }
 
-    /// Check whether `path` may be read. Returns the canonical path on
-    /// success — callers must use the returned path so the checked path is
-    /// the read path (no TOCTOU window between check and use).
-    pub fn may_read(&self, path: &Path) -> Result<PathBuf, HostError> {
-        let resolved = fs::canonicalize(path).map_err(|e| {
-            HostError::Capability(format!(
-                "read denied: {} does not resolve ({e})",
-                path.display()
-            ))
-        })?;
-        self.may_read_resolved(&resolved, &path.display().to_string())?;
-        Ok(resolved)
+    /// Whether a lexically normalized absolute path is beneath a declared
+    /// root, in either spelling. No filesystem access.
+    fn is_lexically_inside(&self, path: &Path) -> bool {
+        self.read_paths
+            .iter()
+            .chain(&self.read_spellings)
+            .any(|root| path.starts_with(root))
     }
 
-    /// `may_read`'s allowlist and size cap on an already-canonical path —
-    /// the module loader's door for text/bytes/JSON imports, which must not
-    /// be wider than `readText`'s. A refusal names `asked`, what the script
-    /// asked for: the script can read the message, and the canonical path
-    /// would tell it where the host's files live and where a link points.
-    pub fn may_read_resolved(&self, resolved: &Path, asked: &str) -> Result<(), HostError> {
-        if !self.is_read_allowed(resolved) {
-            return Err(HostError::Capability(format!(
-                "read denied: {asked} resolves outside every declared read path"
-            )));
+    /// Where `asked`, a path a script named, really is — judged against
+    /// the read fence without asking the filesystem about anything outside
+    /// it (see the module docs). Relative paths are taken against the
+    /// working directory.
+    pub fn locate(&self, asked: &Path) -> Located {
+        let Some(path) = lexical_absolute(asked) else {
+            return Located::Refused;
+        };
+        if !self.is_lexically_inside(&path) {
+            return Located::Refused;
         }
-        if resolved.is_file() {
-            let len = fs::metadata(resolved).map_or(0, |m| m.len());
-            if len > MAX_READ_BYTES {
-                return Err(HostError::Capability(format!(
-                    "read denied: {asked} is {len} bytes (limit {MAX_READ_BYTES})"
-                )));
+        // Inside by its spelling. Follow links: the path itself if it is
+        // there, else its nearest existing ancestor, which says whether a
+        // missing file would be inside the fence. Something that is there
+        // but cannot be followed (a dangling or looping link) is refused
+        // rather than described.
+        for candidate in path.ancestors() {
+            match fs::canonicalize(candidate) {
+                Ok(real) if !self.is_read_allowed(&real) => return Located::Refused,
+                Ok(real) if candidate == path.as_path() => return Located::Found(real),
+                Ok(_) => return Located::Missing,
+                Err(_) if fs::symlink_metadata(candidate).is_ok() => return Located::Refused,
+                Err(_) => {}
             }
+        }
+        Located::Refused
+    }
+
+    /// Check whether `path` may be read. Returns the canonical path on
+    /// success — callers must use the returned path so the checked path is
+    /// the read path (no TOCTOU window between check and use). Every
+    /// refusal but the size cap reads the same: see [`read_refusal`].
+    pub fn may_read(&self, path: &Path) -> Result<PathBuf, HostError> {
+        let asked = path.display().to_string();
+        match self.locate(path) {
+            Located::Found(resolved) => {
+                self.read_cap(&resolved, &asked)?;
+                Ok(resolved)
+            }
+            Located::Missing | Located::Refused => Err(read_refusal(&asked)),
+        }
+    }
+
+    /// `may_read`'s file checks on a path [`Capabilities::locate`] found:
+    /// a regular file (a FIFO or a device has no size to check, and opening
+    /// one can block), within the size cap — the module loader's door for
+    /// text/bytes/JSON imports, which must not be wider than `readText`'s.
+    /// A refusal names `asked`, what the script asked for: the script can
+    /// read the message, and the canonical path would tell it where the
+    /// host's files live and where a link points. The size is checked
+    /// again as the file is read ([`read_text_capped`]).
+    pub fn read_cap(&self, resolved: &Path, asked: &str) -> Result<(), HostError> {
+        let meta = fs::metadata(resolved).map_err(|_| read_refusal(asked))?;
+        if !meta.is_file() {
+            return Err(not_a_regular_file(asked));
+        }
+        if meta.len() > MAX_READ_BYTES {
+            return Err(HostError::Capability(format!(
+                "read denied: {asked} is {} bytes (limit {MAX_READ_BYTES})",
+                meta.len()
+            )));
         }
         Ok(())
     }
@@ -552,6 +624,7 @@ impl Capabilities {
     pub fn into_grants(self) -> Grants {
         Grants {
             read_paths: self.read_paths,
+            read_spellings: self.read_spellings,
             net_hosts: self.net_hosts,
             net_private: self.net_private,
             kv: self.kv,
@@ -565,6 +638,7 @@ impl Capabilities {
     pub fn from_grants(grants: Grants) -> Self {
         Self {
             read_paths: grants.read_paths,
+            read_spellings: grants.read_spellings,
             net_hosts: grants.net_hosts,
             net_private: grants.net_private,
             kv: grants.kv,
@@ -574,15 +648,116 @@ impl Capabilities {
     }
 }
 
+/// Where a path a script named is, by [`Capabilities::locate`].
+#[derive(Debug, PartialEq, Eq)]
+pub enum Located {
+    /// It exists inside the fence: its canonical path.
+    Found(PathBuf),
+    /// Nothing is there, and its nearest existing directory is inside the
+    /// fence — something the script may know.
+    Missing,
+    /// Outside the fence, or there but not followable. Every case answers
+    /// alike, whether or not anything exists at that path.
+    Refused,
+}
+
+/// The one refusal `rt.readText` and `rt.media.put` give for a path that
+/// is not a readable file inside the fence — missing, outside, or a link
+/// that leaves — so the message says nothing about the host's files.
+pub fn read_refusal(asked: &str) -> HostError {
+    HostError::Capability(format!(
+        "read denied: {asked} is missing or outside every declared read path"
+    ))
+}
+
+/// The refusal for a path inside the fence that is not a regular file.
+pub fn not_a_regular_file(asked: &str) -> HostError {
+    HostError::Capability(format!("read denied: {asked} is not a regular file"))
+}
+
+/// Read a file [`Capabilities::may_read`] allowed as text, bounded by the
+/// read cap whatever its metadata said: what is opened must be a regular
+/// file, and at most the cap plus one byte is read, so a file that grew
+/// after the check is refused rather than read whole. Blocking: run it off
+/// the event loop.
+pub fn read_text_capped(resolved: &Path, asked: &str) -> Result<String, HostError> {
+    read_text_bounded(resolved, asked, MAX_READ_BYTES)
+}
+
+fn read_text_bounded(resolved: &Path, asked: &str, cap: u64) -> Result<String, HostError> {
+    use std::io::Read as _;
+    let io = |e: std::io::Error| HostError::Host(format!("read {asked}: {e}"));
+    let file = fs::File::open(resolved).map_err(io)?;
+    if !file.metadata().map_err(io)?.is_file() {
+        return Err(not_a_regular_file(asked));
+    }
+    let mut bytes = Vec::new();
+    file.take(cap.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(io)?;
+    if bytes.len() as u64 > cap {
+        return Err(HostError::Capability(format!(
+            "read denied: {asked} is more than {cap} bytes (limit {cap})"
+        )));
+    }
+    String::from_utf8(bytes)
+        .map_err(|_| HostError::Host(format!("read {asked}: stream did not contain valid UTF-8")))
+}
+
+/// `path` made absolute against the working directory, with `.` dropped
+/// and `..` folded into its parent — by the spelling alone, no filesystem
+/// access. `None` only when a relative path meets an unreadable working
+/// directory.
+pub fn lexical_absolute(path: &Path) -> Option<PathBuf> {
+    let joined = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().ok()?.join(path)
+    };
+    let mut out = PathBuf::new();
+    for component in joined.components() {
+        match component {
+            Component::Prefix(prefix) => out.push(prefix.as_os_str()),
+            Component::RootDir => out.push(Component::RootDir.as_os_str()),
+            Component::CurDir => {}
+            // At the root, `..` stays at the root, as the kernel has it.
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::Normal(name) => out.push(name),
+        }
+    }
+    Some(out)
+}
+
 /// The raw grant lists, for merging a manifest with CLI flags.
 #[derive(Debug, Default)]
 pub struct Grants {
     pub read_paths: Vec<PathBuf>,
+    /// The read roots as declared, where that differs from the canonical
+    /// form; see [`Grants::add_read_root`].
+    pub read_spellings: Vec<PathBuf>,
     pub net_hosts: Vec<String>,
     pub net_private: Vec<String>,
     pub kv: Option<KvGrant>,
     pub media: Option<MediaGrant>,
     pub serve: Option<ServeGrant>,
+}
+
+impl Grants {
+    /// Add a read root: the directory must exist, and it is kept both
+    /// canonicalized and as declared (absolute, lexically normalized), so
+    /// a script can name files under it either way.
+    pub fn add_read_root(&mut self, declared: &Path) -> std::io::Result<()> {
+        let canonical = fs::canonicalize(declared)?;
+        if let Some(spelling) = lexical_absolute(declared) {
+            if spelling != canonical {
+                self.read_spellings.push(spelling);
+            }
+        }
+        self.read_paths.push(canonical);
+        Ok(())
+    }
 }
 
 /// Extract `host` and `port` (defaulted by scheme) from an http(s) URL
@@ -713,6 +888,89 @@ mod tests {
             auth("http://granted.com@evil.com/x"),
             Some(("evil.com".into(), 80))
         );
+    }
+
+    #[test]
+    fn lexical_absolute_folds_dots_without_the_filesystem() {
+        let abs = |p: &str| lexical_absolute(Path::new(p)).map(|p| p.display().to_string());
+        assert_eq!(abs("/a/b/../c/./d"), Some("/a/c/d".into()));
+        assert_eq!(abs("/../../etc"), Some("/etc".into()));
+        assert_eq!(abs("/a/b/"), Some("/a/b".into()));
+        let cwd = std::env::current_dir().unwrap_or_else(|e| panic!("cwd: {e}"));
+        assert_eq!(
+            lexical_absolute(Path::new("x/../y")),
+            Some(cwd.join("y")),
+            "relative paths are taken against the working directory"
+        );
+    }
+
+    #[test]
+    fn locate_refuses_outside_paths_alike_and_finds_inside_ones() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("tempdir: {e}"));
+        let root = dir.path().join("data");
+        std::fs::create_dir(&root).unwrap_or_else(|e| panic!("mkdir: {e}"));
+        std::fs::write(root.join("in.txt"), "in").unwrap_or_else(|e| panic!("write: {e}"));
+        std::fs::write(dir.path().join("out.txt"), "out").unwrap_or_else(|e| panic!("write: {e}"));
+        std::os::unix::fs::symlink(dir.path().join("out.txt"), root.join("leave.txt"))
+            .unwrap_or_else(|e| panic!("symlink: {e}"));
+        std::os::unix::fs::symlink(dir.path().join("gone.txt"), root.join("dangling.txt"))
+            .unwrap_or_else(|e| panic!("symlink: {e}"));
+        let mut grants = Grants::default();
+        // Declared through the temp dir's own spelling (on macOS /var/...,
+        // canonically /private/var/...): both spellings must work.
+        grants
+            .add_read_root(&root)
+            .unwrap_or_else(|e| panic!("root: {e}"));
+        let caps = Capabilities::from_grants(grants);
+        let canonical = std::fs::canonicalize(&root).unwrap_or_else(|e| panic!("canon: {e}"));
+        assert_eq!(
+            caps.locate(&root.join("in.txt")),
+            Located::Found(canonical.join("in.txt"))
+        );
+        assert_eq!(
+            caps.locate(&canonical.join("in.txt")),
+            Located::Found(canonical.join("in.txt"))
+        );
+        assert_eq!(caps.locate(&root.join("nope.txt")), Located::Missing);
+        assert_eq!(caps.locate(&root.join("sub/nope.txt")), Located::Missing);
+        for refused in [
+            dir.path().join("out.txt"),
+            dir.path().join("gone.txt"),
+            root.join("leave.txt"),
+            root.join("dangling.txt"),
+            root.join("../out.txt"),
+            PathBuf::from("/etc/hosts"),
+            PathBuf::from("/etc/jsrt-no-such-file"),
+        ] {
+            assert_eq!(
+                caps.locate(&refused),
+                Located::Refused,
+                "{}",
+                refused.display()
+            );
+        }
+    }
+
+    #[test]
+    fn a_capped_read_stops_at_the_cap_not_at_the_metadata() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("tempdir: {e}"));
+        let file = dir.path().join("f.txt");
+        std::fs::write(&file, "0123456789abcdef").unwrap_or_else(|e| panic!("write: {e}"));
+        assert_eq!(
+            read_text_bounded(&file, "f.txt", 16).ok().as_deref(),
+            Some("0123456789abcdef")
+        );
+        let err = read_text_bounded(&file, "f.txt", 15)
+            .err()
+            .unwrap_or_else(|| panic!("over the cap must refuse"));
+        assert!(
+            matches!(&err, HostError::Capability(m) if m.contains("more than 15 bytes")),
+            "{err}"
+        );
+        let err = read_text_bounded(dir.path(), "dir", 15)
+            .err()
+            .unwrap_or_else(|| panic!("a directory must refuse"));
+        assert!(err.to_string().contains("not a regular file"), "{err}");
     }
 
     #[test]

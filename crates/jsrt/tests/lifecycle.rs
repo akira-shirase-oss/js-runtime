@@ -247,9 +247,13 @@ fn a_host_side_failure_exits_eight() {
     let data = rig.dir.path().join("data");
     fs::create_dir(&data).unwrap_or_else(|e| panic!("mkdir: {e}"));
     let manifest = rig.script("m.manifest.json", "{ \"read\": [\"data\"] }\n");
-    // `data` is granted and canonicalizes, but reading a directory fails at
-    // the host — a HostError (8), not a refusal (7) or a script error (5).
-    let script = rig.script("read.js", "await rt.readText('data');\n");
+    // `data/bad.txt` is granted and a regular file, but it is not UTF-8, so
+    // reading it as text fails at the host — a HostError (8), not a refusal
+    // (7) or a script error (5). (A directory used to be the example; it
+    // is now refused as not a regular file.)
+    fs::write(data.join("bad.txt"), [0xff, 0xfe, 0x00, 0xc3])
+        .unwrap_or_else(|e| panic!("write: {e}"));
+    let script = rig.script("read.js", "await rt.readText('data/bad.txt');\n");
     let out = rig.run_script(
         &script,
         &[
@@ -633,22 +637,31 @@ fn a_slow_endpoint_dies_at_the_deadline() {
 #[test]
 fn a_trickling_body_dies_at_the_same_deadline() {
     let rig = Rig::new();
-    // Headers arrive at once, then one body byte every 100 ms for 2 s: each
-    // read makes progress, so only a deadline over the whole exchange --
-    // not just send() -- can end it.
-    let stub = Stub::start(|s| {
+    // Headers arrive at once, then one body byte every 100 ms for 10 s:
+    // each read makes progress, so only a deadline over the whole exchange
+    // -- not just send() -- can end it. The stub times the hang-up itself,
+    // from the moment its head went out, so process start, V8 boot and
+    // teardown are outside the measurement (a first cold start of the
+    // debug binary took 121 ms here at a load average of 35-44, and runs
+    // slower inside a parallel test run).
+    let (hung_up_tx, hung_up_rx) = std::sync::mpsc::channel();
+    let stub = Stub::start(move |s| {
         let mut buf = [0u8; 2048];
         let _ = s.read(&mut buf);
-        let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 20\r\nConnection: close\r\n\r\n");
-        for _ in 0..20 {
+        let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\n");
+        let head_sent = std::time::Instant::now();
+        for _ in 0..100 {
             std::thread::sleep(std::time::Duration::from_millis(100));
+            // The first byte after the client closed may still be taken
+            // by the kernel; the next one fails.
             if s.write_all(b"x").is_err() {
+                let _ = hung_up_tx.send(Some(head_sent.elapsed()));
                 return;
             }
         }
+        let _ = hung_up_tx.send(None);
     });
     let script = fetch_script(&rig, &stub.url("/drip"));
-    let started = std::time::Instant::now();
     let out = rig.run_script(
         &script,
         &[
@@ -660,16 +673,20 @@ fn a_trickling_body_dies_at_the_same_deadline() {
             "15000",
         ],
     );
-    let elapsed = started.elapsed();
     assert_eq!(code(&out), 8, "stderr: {}", stderr(&out));
     assert!(
         stderr(&out).contains("deadline"),
         "stderr: {}",
         stderr(&out)
     );
+    let hung_up = hung_up_rx
+        .recv_timeout(std::time::Duration::from_secs(15))
+        .unwrap_or_else(|e| panic!("the stub never reported: {e}"))
+        .unwrap_or_else(|| panic!("the client read the whole 10 s drip"));
     assert!(
-        elapsed < std::time::Duration::from_millis(1800),
-        "the fetch must end near its 300 ms deadline, not when the body finishes; took {elapsed:?}"
+        hung_up < std::time::Duration::from_secs(2),
+        "the fetch must end near its 300 ms deadline, not when the body finishes; \
+         the client hung up {hung_up:?} after the head"
     );
 }
 
@@ -1012,12 +1029,30 @@ fn an_import_outside_the_entry_dir_is_a_capability_refusal() {
 #[test]
 fn a_missing_import_still_classifies_as_load_not_capability() {
     let (rig, app) = app_rig();
-    // Missing: canonicalize fails → the gate passes it to the loader, which
+    // Missing inside the fence: the gate passes it to the loader, which
     // reports a real Load error (3) — we do not turn absence into a refusal.
-    let script = rig.script_at(&app.join("main.js"), "import '../nope.js';\n");
+    let script = rig.script_at(&app.join("main.js"), "import './nope.js';\n");
     let out = rig.run_script(&script, &[]);
     assert_eq!(code(&out), 3, "stderr: {}", stderr(&out));
     assert!(stderr(&out).contains("nope.js"), "stderr: {}", stderr(&out));
+}
+
+#[test]
+fn a_missing_import_outside_the_fence_is_refused_like_an_existing_one() {
+    let (rig, app) = app_rig();
+    fs::write(rig.dir.path().join("there.js"), "export default 1;\n")
+        .unwrap_or_else(|e| panic!("write: {e}"));
+    // Outside the fence the answer must not depend on whether the file is
+    // there, or a script could map the host's files: both are refused (7)
+    // in the same words, before the filesystem is asked.
+    let mut refusals = Vec::new();
+    for name in ["there.js", "nope.js"] {
+        let script = rig.script_at(&app.join("main.js"), &format!("import '../{name}';\n"));
+        let out = rig.run_script(&script, &[]);
+        assert_eq!(code(&out), 7, "{name}: stderr: {}", stderr(&out));
+        refusals.push(stderr(&out).replace(name, "<asked>"));
+    }
+    assert_eq!(refusals[0], refusals[1]);
 }
 
 #[test]

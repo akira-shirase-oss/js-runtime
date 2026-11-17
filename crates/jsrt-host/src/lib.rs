@@ -19,5 +19,6 @@ pub mod serve;
 pub use capability::Capabilities;
 pub use error::HostError;
 pub use runtime::{
-    run_file, run_file_report, run_source, run_source_report, HostOptions, PendingCounts, RunReport,
+    run_file, run_file_report, run_source, run_source_report, HostOptions, PendingCounts,
+    RunReport, HEAP_TERMINATION_HEADROOM, MIN_MAX_HEAP,
 };

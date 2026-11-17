@@ -4,12 +4,12 @@ https://github.com/akira-shirase-oss/js-runtime
 
 `jsrt` is a purpose-built JavaScript host: V8 runs the script through `deno_core`, and the Rust host owns capabilities, the process lifecycle, and exit codes. Scripts see one namespace, `rt.*`. There is no ambient `Deno`, and with no manifest there is no filesystem and no network — the script can compute and print, nothing else. The M0–M7 roadmap is marked complete in the README.
 
-Written against commit `c30ac2e` (2026-11-07) and updated for the 2026-11-16 security fixes, their review follow-ups and the security verification pass; see "Changes since `c30ac2e`" below and the README's "Breaking changes" and "Security verification". The code is MIT (`LICENSE`).
+Written against commit `c30ac2e` (2026-11-07) and updated for the 2026-11-16 security fixes, their review follow-ups, the security verification pass and its review follow-up; see "Changes since `c30ac2e`" below and the README's "Breaking changes" and "Security verification". The code is MIT (`LICENSE`).
 
 ## Prerequisites
 
 - Rust via [rustup](https://rustup.rs). `rust-toolchain.toml` pins **1.99.1**, which rustup installs on first use; Homebrew's `cargo` ignores the file, and `scripts/check-toolchain.sh` fails when the `rustc` on `PATH` is not 1.99.1. Edition is 2021.
-- Optional: [cargo-deny](https://github.com/EmbarkStudios/cargo-deny) for the full gate (`cargo install --locked cargo-deny`, or `scripts/install-cargo-deny.sh <dir>`).
+- Optional: [cargo-deny](https://github.com/EmbarkStudios/cargo-deny) **0.21.0** for the full gate (`cargo install --locked cargo-deny@0.21.0`, or `scripts/install-cargo-deny.sh <dir>`); `scripts/check.sh` fails on any other release, since CI pins that one.
 - The first `cargo build` downloads about **95 MB** of prebuilt V8 (`deno_core = "=0.413.0"` → `v8 150.4.0`). `V8_FROM_SOURCE=1` builds V8 yourself (slow, usually unnecessary).
 - Optional: `curl` / `nc` for `examples/webhook/drill.sh`.
 
@@ -40,7 +40,7 @@ The usual invocation is:
 jsrt run script.js --timeout 5000 --manifest jsrt.manifest.json
 ```
 
-`--timeout` is milliseconds (default 10000; `0` means no limit). `--max-heap-mb N` caps the V8 heap (default: V8's own ceiling); reaching either ends the run with exit 6. No `--manifest` means deny-all for filesystem, network, kv, media, and serve.
+`--timeout` is milliseconds (default 10000; `0` means no limit). `--max-heap-mb N` caps the V8 heap (default: V8's own ceiling; `N` is 0 or at least 16, exit 2 otherwise); reaching either ends the run with exit 6, unless one call allocates more than 1 GiB past the heap limit before it returns (V8 can still abort then). No `--manifest` means deny-all for filesystem, network, kv, media, and serve.
 
 Example manifest shape (from the README):
 
@@ -83,7 +83,7 @@ Exit-code contract (don't collapse these):
 
 ## Changes since `c30ac2e`
 
-`cargo test --workspace --locked` now runs **140 tests** (75 lifecycle + 6 security + 28 serve + 11 supervise + 20 host), not 84. CI runs `scripts/check.sh` on ubuntu-latest and macos-latest for every push and pull request. New behaviour worth trying:
+`cargo test --workspace --locked` now runs **154 tests** (76 lifecycle + 13 security + 30 serve + 11 supervise + 24 host), not 84. CI runs `scripts/check.sh` on ubuntu-latest and macos-latest for every push and pull request. New behaviour worth trying:
 
 - `typeof Deno` and `typeof globalThis.__bootstrap` are `"undefined"`; `Deno.core.ops.op_panic(...)` is a `ReferenceError`, not a host abort.
 - A granted host that answers `302` to an ungranted one: exit **7**, and the ungranted host sees no connection.
@@ -102,6 +102,14 @@ Exit-code contract (don't collapse these):
   - A caught `rt.readText` refusal through a symlink in the grant names the path you passed, not where the link points.
   - At `max_connections` 2, a client trickling a head one byte at a time cannot get a paused download evicted; the trickler is closed instead. An 8 KiB body sent slowly is no longer cut by the rate rule (only `body_timeout_ms` applies to bodies of 64 KiB or less).
   - `jsrt run main.js` from its own directory imports `./dep.js` (it used to refuse with exit 7).
+- From the review of the verification pass:
+  - At `max_connections` 2, two clients that read a 32 MiB answer a few KiB a second no longer hold both slots: once they fall below `body_min_rate` (after `body_first_byte_ms`), a newcomer closes one. `"response_timeout_ms": N` ends any response still being written after N ms.
+  - `const a = new Array(5e7).fill(1.5)` with `--max-heap-mb 64`: exit 6, not a crash (peak RSS about 0.7 GB, since the running call gets 1 GiB to return). `--max-heap-mb 4`: exit 2.
+  - With no manifest, `rt.readText('/etc/hosts')` and `rt.readText('/etc/nope')` give the same `CapabilityError` message, and `import.meta.resolve` refuses both; a missing import outside the entry directory is exit 7, not 3.
+  - `rt.readText` on a FIFO (or a directory) inside a read grant: `read denied: … is not a regular file`.
+  - A manifest with `"max_byte"` in its `kv` object: exit 8 naming the key.
+  - A kv path that is a directory: `kv open: the store cannot be opened (CannotOpen)`, with the path only on stderr.
+  - `--net localhost:PORT`: the caught message no longer lists `127.0.0.1`/`::1`; stderr does.
 
 ## Happy-path checklist
 
@@ -125,7 +133,7 @@ Exit-code contract (don't collapse these):
 
 - A tight `--timeout` around a `while (true) {}` loop should exit **6** (terminated), not 5.
 - A stalled promise / pending timer should also be 6 (`a_stalled_promise_dies_terminated`).
-- A V8-heap bomb ends in-process as exit 6 (`--max-heap-mb` lowers the ceiling). Memory outside the V8 heap (large `ArrayBuffer`s) is *not* covered in-process — that is what `jsrt supervise --max-rss-mb ...` is for. Try a supervise run with a tight RSS or CPU budget and confirm the report records the kill.
+- A V8-heap bomb ends in-process as exit 6 (`--max-heap-mb` lowers the ceiling, to no less than 16 MiB). One call that allocates more than 1 GiB past the ceiling before it returns can still abort V8 — try it and report what you see. Memory outside the V8 heap (large `ArrayBuffer`s) is *not* covered in-process — that is what `jsrt supervise --max-rss-mb ...` is for. Try a supervise run with a tight RSS or CPU budget and confirm the report records the kill.
 
 **Classification**
 

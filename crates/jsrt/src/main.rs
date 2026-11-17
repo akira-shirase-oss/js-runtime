@@ -63,11 +63,28 @@ struct RunArgs {
     /// Per-fetch deadline in milliseconds (0 = the built-in 10s bound).
     #[arg(long, default_value_t = 0)]
     fetch_timeout: u64,
-    /// V8 heap ceiling in MiB (0 = V8's default). Reaching it, or V8's
-    /// default, ends the run with exit 6. The JavaScript heap only:
+    /// V8 heap ceiling in MiB: 0 (V8's default) or at least 16. Reaching
+    /// it ends the run with exit 6, unless the call running then allocates
+    /// more than 1 GiB past it (V8 aborts). The JavaScript heap only:
     /// ArrayBuffer memory is outside it; `supervise --max-rss-mb` bounds all.
-    #[arg(long, default_value_t = 0)]
+    #[arg(long, default_value_t = 0, value_parser = parse_max_heap_mb)]
     max_heap_mb: u64,
+}
+
+/// `--max-heap-mb`: 0 keeps V8's default; otherwise at least the floor
+/// below which V8 cannot start a script, so a typo is a usage error rather
+/// than a V8 abort.
+fn parse_max_heap_mb(raw: &str) -> Result<u64, String> {
+    let mb: u64 = raw
+        .parse()
+        .map_err(|_| format!("{raw} is not a whole number of MiB"))?;
+    let floor = (jsrt_host::MIN_MAX_HEAP / (1024 * 1024)) as u64;
+    if mb != 0 && mb < floor {
+        return Err(format!(
+            "{mb} MiB is too small for V8 to run a script: use 0 (V8's default) or at least {floor}"
+        ));
+    }
+    Ok(mb)
 }
 
 impl RunArgs {
@@ -251,10 +268,9 @@ fn merge_cli_grants(caps: Capabilities, flags: CliGrants) -> Result<Capabilities
     }
     let mut merged = caps.into_grants();
     for dir in &flags.read {
-        let resolved = std::fs::canonicalize(dir).map_err(|e| {
+        merged.add_read_root(dir).map_err(|e| {
             HostError::Host(format!("--read {} does not resolve: {e}", dir.display()))
         })?;
-        merged.read_paths.push(resolved);
     }
     merged.net_hosts.extend(flags.net);
     merged.net_private.extend(flags.net_private);

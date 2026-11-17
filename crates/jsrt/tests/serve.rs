@@ -1596,6 +1596,138 @@ fn at_the_cap_a_trickler_cannot_steer_eviction_onto_a_download_being_written() {
     assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
 }
 
+// ---- A response being written is protected only while it keeps the rate ---
+
+/// A client that asks for `path` and then reads `chunk` bytes every `gap`,
+/// for at most `hold`. Returns the bytes it read and whether the server
+/// closed the connection before `hold` ran out.
+fn slow_reader(
+    port: u16,
+    path: &'static str,
+    chunk: usize,
+    gap: Duration,
+    hold: Duration,
+) -> std::thread::JoinHandle<(usize, bool)> {
+    std::thread::spawn(move || {
+        let mut s = connect(port);
+        s.set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap_or_else(|e| panic!("timeout: {e}"));
+        s.write_all(
+            format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        )
+        .unwrap_or_else(|e| panic!("write: {e}"));
+        let started = Instant::now();
+        let mut buf = vec![0u8; chunk];
+        let mut total = 0;
+        while started.elapsed() < hold {
+            match s.read(&mut buf) {
+                Ok(0) => return (total, true),
+                Ok(n) => total += n,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(_) => return (total, true),
+            }
+            std::thread::sleep(gap);
+        }
+        (total, false)
+    })
+}
+
+#[test]
+fn at_the_cap_slow_readers_cannot_pin_every_slot() {
+    const BIG: usize = 32 * 1024 * 1024;
+    let rig = Rig::new();
+    let port = Rig::free_port();
+    // A writer is protected for 300 ms from its start and banks at most
+    // that much from the bytes its reader takes, at the default minimum
+    // rate (64 KiB/s). 32 MiB is more than loopback socket buffers hold,
+    // so both writes end up waiting on their readers.
+    let child = route_app(
+        &rig,
+        port,
+        ", \"max_connections\": 2, \"body_first_byte_ms\": 300",
+        &format!("if (req.path === '/big') return {{status: 200, body: 'd'.repeat({BIG})}};"),
+    );
+    // Both slots: readers that take 1 KiB every 250 ms (4 KiB/s). Each one
+    // makes progress, so the 30 s no-progress write timeout never fires;
+    // at this rate they would hold their slots for over two hours.
+    let readers: Vec<_> = (0..2)
+        .map(|_| {
+            slow_reader(
+                port,
+                "/big",
+                1024,
+                Duration::from_millis(250),
+                Duration::from_secs(12),
+            )
+        })
+        .collect();
+    std::thread::sleep(Duration::from_secs(2));
+    let started = Instant::now();
+    let (status, _head, body) = http(
+        port,
+        &format!("GET /new HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"),
+    );
+    let took = started.elapsed();
+    assert_eq!(
+        (status, body.as_str()),
+        (200, "ok /new"),
+        "a newcomer behind two slow readers, after {took:?}"
+    );
+    assert!(took < Duration::from_secs(2), "answered after {took:?}");
+    // The evicted reader's connection is closed, but the kernel still
+    // delivers what it had buffered, so its end is not timed here.
+    for reader in readers {
+        let _ = reader.join().unwrap_or_else(|_| panic!("reader thread"));
+    }
+    quit(port);
+    let out = child
+        .wait_with_output()
+        .unwrap_or_else(|e| panic!("wait: {e}"));
+    assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
+}
+
+#[test]
+fn a_response_timeout_ends_a_slow_download_even_below_the_rate_grace() {
+    const BIG: usize = 32 * 1024 * 1024;
+    let rig = Rig::new();
+    let port = Rig::free_port();
+    // One slot. The rate grace is a minute, so only the 1 s response
+    // deadline can free the slot within this test.
+    let child = route_app(
+        &rig,
+        port,
+        ", \"max_connections\": 1, \"body_first_byte_ms\": 60000, \"response_timeout_ms\": 1000",
+        &format!("if (req.path === '/big') return {{status: 200, body: 'd'.repeat({BIG})}};"),
+    );
+    let reader = slow_reader(
+        port,
+        "/big",
+        1024,
+        Duration::from_millis(100),
+        Duration::from_secs(10),
+    );
+    std::thread::sleep(Duration::from_millis(300));
+    let started = Instant::now();
+    let (status, _head, body) = http(
+        port,
+        &format!("GET /new HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"),
+    );
+    let took = started.elapsed();
+    assert_eq!(
+        (status, body.as_str()),
+        (200, "ok /new"),
+        "a newcomer behind a slow download, after {took:?}"
+    );
+    assert!(took < Duration::from_secs(4), "answered after {took:?}");
+    let _ = reader.join().unwrap_or_else(|_| panic!("reader thread"));
+    quit(port);
+    let out = child
+        .wait_with_output()
+        .unwrap_or_else(|e| panic!("wait: {e}"));
+    assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
+}
+
 // ---- The body rate rule applies only to bodies that hold budget ------------
 
 /// Send a POST head, then `body` in `pieces` equal parts `gap` apart, and

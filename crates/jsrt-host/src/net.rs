@@ -90,7 +90,12 @@ impl reqwest::dns::Resolve for GrantedResolver {
             let admitted = if private_ok {
                 found
             } else {
-                admit(&host, found)?
+                let shown: Vec<String> = found.iter().map(|a| a.ip().to_string()).collect();
+                admit(&host, found).inspect_err(|denied| {
+                    // The addresses are for the operator; the script's
+                    // message names only the host it asked for.
+                    eprintln!("jsrt: {denied} ({host} resolved to [{}])", shown.join(", "));
+                })?
             };
             Ok(Box::new(admitted.into_iter()) as reqwest::dns::Addrs)
         })
@@ -98,16 +103,16 @@ impl reqwest::dns::Resolve for GrantedResolver {
 }
 
 /// Keep the public addresses of a resolved name; refuse when none is left.
+/// The refusal is the script's to read, so it names the host, not the
+/// addresses it resolved to (the resolver puts those on stderr).
 pub fn admit(host: &str, found: Vec<SocketAddr>) -> Result<Vec<SocketAddr>, NetDenied> {
-    let (public, private): (Vec<SocketAddr>, Vec<SocketAddr>) =
-        found.into_iter().partition(|a| is_public(a.ip()));
+    let public: Vec<SocketAddr> = found.into_iter().filter(|a| is_public(a.ip())).collect();
     if public.is_empty() {
-        let list: Vec<String> = private.iter().map(|a| a.ip().to_string()).collect();
         return Err(NetDenied(format!(
-            "fetch denied: {host} resolves to [{}], not a public address — a name grant \
-             reaches public hosts only; opt this name in with {{\"host\": ..., \"private\": true}} \
-             or --net-private, or grant the address itself (ip:port)",
-            list.join(", ")
+            "fetch denied: {host} resolves only to addresses that are loopback, private or \
+             otherwise not a public address — a name grant reaches public hosts only; opt this \
+             name in with {{\"host\": ..., \"private\": true}} or --net-private, or grant the \
+             address itself (ip:port)"
         )));
     }
     Ok(public)
@@ -318,7 +323,10 @@ mod tests {
         let refused = admit("rebound.example", vec![meta])
             .err()
             .unwrap_or_else(|| panic!("all-private answer must refuse"));
-        assert!(refused.0.contains("169.254.169.254"), "{}", refused.0);
+        // The script reads this message: it names the host it asked for,
+        // never the addresses behind it (those go to the operator).
+        assert!(!refused.0.contains("169.254"), "{}", refused.0);
         assert!(refused.0.contains("rebound.example"), "{}", refused.0);
+        assert!(refused.0.contains("not a public address"), "{}", refused.0);
     }
 }

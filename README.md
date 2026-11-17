@@ -56,17 +56,45 @@ verification" below) changed these:
   when they get one.
 - **The V8 heap has a limit that ends the run.** Reaching it (V8's default,
   or `--max-heap-mb N`) is exit 6 with "terminated at the V8 heap limit",
-  instead of a V8 out-of-memory abort (a signal, no exit code).
+  instead of a V8 out-of-memory abort (a signal, no exit code), for the
+  cases the tests cover (see "The timeout is real" for the limits of that).
 - **Refusal messages name what the script asked for**: the path it passed
   or the import specifier it wrote, never the canonical host path or where
-  a symlink points, and a kv error says "the store" instead of its path.
-  "is outside every declared read path" now reads "resolves outside …".
+  a symlink points.
 - **`rt.serve` eviction at the connection cap** closes the connection that
   has been longest in its current phase (waiting for a head, or reading a
-  body), and never one whose response is being written. Bodies of 64 KiB or
-  less are bounded by `body_timeout_ms` only, not the minimum-rate rule.
+  body). Bodies of 64 KiB or less are bounded by `body_timeout_ms` only, not
+  the minimum-rate rule.
 - **`jsrt run main.js`** (a bare relative entry) admits its sibling
   `.js`/`.mjs` modules again; it refused them with exit 7.
+
+Then the review of that pass (also 2026-11-16) changed these:
+
+- **A response being written is protected only while its reader keeps the
+  rate.** At the connection cap, a response whose client reads below
+  `body_min_rate` (after `body_first_byte_ms`) can now be closed for a
+  newcomer; before, a response being written was never evicted, so slow
+  readers could hold every slot. New optional `response_timeout_ms`.
+- **`--max-heap-mb` is 0 or at least 16** (exit 2 otherwise); V8 aborted
+  below about 8 MiB even for hello-world.
+- **A path outside the read fence is refused before the filesystem is
+  asked.** `rt.readText` and `rt.media.put` give one message for every
+  refusal but the size cap: "read denied: X is missing or outside every
+  declared read path" (it was "does not resolve (…)" or "resolves outside
+  …"). Imports say "import denied: X is outside every declared read
+  path", and a missing import outside the fence is now exit 7 like an
+  existing one (it was 3; a missing one inside the fence is still 3). `..`
+  in a `readText` path is folded before symlinks are followed, as in a URL.
+- **Only regular files are read.** `rt.readText`, `rt.media.put` and
+  imports refuse a FIFO, a device or a directory ("is not a regular file",
+  exit 7; a directory used to be exit 8), and `readText` enforces its
+  4 MiB cap on the bytes it reads, not only on the size the metadata gave.
+- **A manifest key jsrt does not know is an error** (exit 8) naming it:
+  `max_byte` used to be ignored, leaving the 64 MiB default.
+- **Errors no longer show host details**: a kv store that cannot open says
+  "kv open: the store cannot be opened (CannotOpen)" (the full error, with
+  its path, goes to stderr), and a name that resolves only to private
+  addresses no longer lists them in `e.message` (stderr does).
 
 ## What scripts see
 
@@ -86,13 +114,13 @@ again on every deno_core upgrade.
 | `rt.hostInfo()` | `{runtime, version, engine}` | none |
 | `rt.now()` | wall-clock ms for measurements | none |
 | `rt.sleep(ms)` | async timer | deadline (run timeout) |
-| `rt.readText(path)` | read a text file | declared `read` paths only |
+| `rt.readText(path)` | read a text file | declared `read` paths only; regular files up to 4 MiB, the cap enforced on the bytes read |
 | `rt.fetch(url)` | HTTP GET → `{status, statusText, body, bytes, durationMs}` | declared `net` destinations — re-checked on every redirect hop (at most 10), never through an environment proxy — one 10 s deadline over the whole exchange (connect, redirects, headers, every body chunk), 4 MiB body cap, at most 32 exchanges in flight per run (later calls wait for a slot; the deadline starts when they get one, so bodies being read stay under 128 MiB); errors name only `scheme://host:port`, never the path, query or credentials |
 | `rt.setTimeout` `setInterval` `clearTimeout` `clearInterval` | Node-style timers, id-tracked; `unrefTimer`/`refTimer` release the loop | deadline (run timeout) |
 | `rt.pendingTimers()` | how many timers this script still owns | none |
 | `rt.kv.get/put/delete/list` | embedded SQLite store; `list` is an exact-prefix scan | declared `kv` file + `max_bytes` quota |
 | `rt.media.put/stat` | streamed content-addressed uploads (sha256 names) | declared `media` root; the source still needs a `read` grant |
-| `rt.serve(opts, handler)` | HTTP listener, pull-model dispatch; `server.close()` stops accepting and ends `server.done` even while keep-alive clients stay connected (their unanswered requests get 503); a handler that throws, returns no object, or returns an invalid status (outside 200-599) or header (a bad name, or a value that is an object, function or nested array; an array value repeats the header, as `set-cookie` needs) is a 500 plus a stderr line (only the first path segment, never the query or deeper segments, length-capped, at most 10 lines a minute with the rest counted) — not a dead host, an empty 200 or a hung client | declared `serve` host/port — loopback IP literals only — plus `max_body`, `max_connections` (default 256, at most 65,536; at the cap a new client makes the server close the connection that has been longest in its current phase — waiting for a head (idle, between keep-alive requests, or a slow head) or reading a body — but never one with a request in the script or a response being written; a trickled head ages like an idle one, so sending a byte now and then does not protect a connection; only when every connection is protected does a new client wait in the accept backlog). A request head over 16 KiB, or with more than 64 header lines, is answered 431 before the script sees it, `header_timeout_ms` (default 10 s, also bounds keep-alive idling) and `body_timeout_ms` (default 30 s, then 408) and `write_timeout_ms` (default 30 s: a response write with no progress for that long — a client that stopped reading — drops the connection and frees its slot; keep it at 5 s or more, since shorter values were seen to cut legitimate slow downloads on a loaded machine); `max_body` at most 1 GiB. Bodies are read before they queue for the script. The first 64 KiB of every body is outside the body budget, so small requests never wait on it; a larger declared `Content-Length` reserves its whole length from a 64 MiB per-listener budget before anything is read, and a chunked body takes budget per chunk past 64 KiB. When the budget is full such a request is answered 503 with `Retry-After: 1` at once — never queued, never left to time out (send large uploads with `Expect: 100-continue` to get that answer before sending the body; a client without it has the rest of its body read and discarded for up to 200 ms first, so it can usually finish writing and read the 503). A reservation has to be earned: from when a body first holds budget it gets `body_first_byte_ms` (default 5 s) to send a byte and must then average `body_min_rate` bytes a second (default 65536), or it is answered 408 and its share is released; a body that holds no budget (64 KiB or less) is bounded by `body_timeout_ms` alone; the buffer grows as bytes arrive, never to the declared size up front. What an attacker can still hold: about budget ÷ `max_body` connections (8 at the defaults) that declare `max_body` and send nothing deny other uploads over 64 KiB for 5 s at a time, and can reconnect to repeat it; connections that keep sending at the minimum rate hold their share for up to `body_timeout_ms` (30 s) at 64 KiB/s each. Bodies of 64 KiB or less are never affected. Concurrent large uploads without `Expect: 100-continue` mostly see a broken pipe rather than the 503 (24 at once in a review run: 10 answered 200, 2 read their 503, 12 broke), so large uploads should send it |
+| `rt.serve(opts, handler)` | HTTP listener, pull-model dispatch; `server.close()` stops accepting and ends `server.done` even while keep-alive clients stay connected (their unanswered requests get 503); a handler that throws, returns no object, or returns an invalid status (outside 200-599) or header (a bad name, or a value that is an object, function or nested array; an array value repeats the header, as `set-cookie` needs) is a 500 plus a stderr line (only the first path segment, never the query or deeper segments, length-capped, at most 10 lines a minute with the rest counted) — not a dead host, an empty 200 or a hung client | declared `serve` host/port — loopback IP literals only — plus `max_body`, `max_connections` (default 256, at most 65,536; at the cap a new client makes the server close the connection that has been longest in its current phase — waiting for a head (idle, between keep-alive requests, or a slow head), reading a body, or writing a response to a client that reads too slowly — but never one with a request in the script; a trickled head ages like an idle one, so sending a byte now and then does not protect a connection. A response being written is protected for `body_first_byte_ms` from its start, and each byte the client takes extends that by 1/`body_min_rate` of a second, up to `body_first_byte_ms` ahead: a reader may pause that long and must average `body_min_rate` (64 KiB/s by default) to keep its slot at the cap. The cost: at the cap a newcomer behind slow readers waits up to about `body_first_byte_ms` (5 s by default; measured 3.1 s for one that arrived 2 s after two 1 KiB/s readers), and a legitimate download slower than `body_min_rate` can be closed for a newcomer. While every connection is protected a new client waits in the accept backlog, and the server looks again every 100 ms). A request head over 16 KiB, or with more than 64 header lines, is answered 431 before the script sees it, `header_timeout_ms` (default 10 s, also bounds keep-alive idling) and `body_timeout_ms` (default 30 s, then 408) and `write_timeout_ms` (default 30 s: a response write with no progress for that long — a client that stopped reading — drops the connection and frees its slot; keep it at 5 s or more, since shorter values were seen to cut legitimate slow downloads on a loaded machine) and `response_timeout_ms` (off by default: when set, a response still being written after that long drops the connection, whatever its rate); `max_body` at most 1 GiB; an unknown key in the `serve` object is a manifest error. Bodies are read before they queue for the script. The first 64 KiB of every body is outside the body budget, so small requests never wait on it; a larger declared `Content-Length` reserves its whole length from a 64 MiB per-listener budget before anything is read, and a chunked body takes budget per chunk past 64 KiB. When the budget is full such a request is answered 503 with `Retry-After: 1` at once — never queued, never left to time out (send large uploads with `Expect: 100-continue` to get that answer before sending the body; a client without it has the rest of its body read and discarded for up to 200 ms first, so it can usually finish writing and read the 503). A reservation has to be earned: from when a body first holds budget it gets `body_first_byte_ms` (default 5 s) to send a byte and must then average `body_min_rate` bytes a second (default 65536), or it is answered 408 and its share is released; a body that holds no budget (64 KiB or less) is bounded by `body_timeout_ms` alone; the buffer grows as bytes arrive, never to the declared size up front. What an attacker can still hold: about budget ÷ `max_body` connections (8 at the defaults) that declare `max_body` and send nothing deny other uploads over 64 KiB for 5 s at a time, and can reconnect to repeat it; connections that keep sending at the minimum rate hold their share for up to `body_timeout_ms` (30 s) at 64 KiB/s each. Bodies of 64 KiB or less are never affected. Concurrent large uploads without `Expect: 100-continue` mostly see a broken pipe rather than the 503 (24 at once in a review run: 10 answered 200, 2 read their 503, 12 broke), so large uploads should send it |
 
 `console.log` also works (deno_core's minimal console). Anything not listed
 does not exist for the script — that is the point.
@@ -109,8 +137,13 @@ does not exist for the script — that is the point.
 }
 ```
 
-- Deny by default: no manifest, no filesystem and no network — the script can
-  compute and print, nothing else.
+- Deny by default: no manifest, no network and no filesystem beyond
+  importing `.js`/`.mjs` modules from the entry's own directory — the
+  script can compute and print, nothing else. A path outside the grants is
+  refused before the filesystem is asked about it, with the same message
+  whether or not anything is there, so a script cannot probe which host
+  paths exist (it can still tell which files exist under its own
+  directory, where it may import).
 - Imports come from local files only: `http:`, `https:`, `data:`, `blob:`
   and every other non-`file:` specifier is refused by jsrt's loader (exit
   7) before anything is fetched. A `net` grant is for `rt.fetch`, not a
@@ -123,8 +156,15 @@ does not exist for the script — that is the point.
   4 MiB cap. So `jsrt run ~/x.js` no longer makes every file under `~`
   importable as text, but it still exposes every `.js`/`.mjs` file under
   `~`: keep an entry script in a directory of its own.
-- Paths are canonicalized before checking (symlinks and `..` cannot escape a
-  declared directory); `host` alone allows any port, `host:port` is exact.
+- A path is first normalized by its spelling (made absolute against the
+  working directory, `.` and `..` folded) and compared with the declared
+  directories, as declared and as canonicalized (`/tmp/x` and
+  `/private/tmp/x` both work for a `/tmp/x` grant); only then is it
+  canonicalized, so symlinks and `..` cannot escape a declared directory.
+  Only regular files are read. `host` alone allows any port, `host:port`
+  is exact.
+- An unknown key anywhere in the manifest (a misspelt `max_bytes`) is an
+  error naming it, exit 8, not a silent default.
 - A *name* grant (`api.example.com`, `localhost`) connects to public
   addresses only: a DNS answer in loopback, private, link-local (cloud
   metadata), CGNAT or other non-routable ranges is refused with a
@@ -174,8 +214,16 @@ separate thread that calls V8's `IsolateHandle::terminate_execution()` on the
 deadline, which interrupts running JS *and* a stalled event loop. A tokio
 backstop covers the fully-idle case. The V8 heap gets the same treatment:
 a near-heap-limit callback terminates the isolate at V8's default heap
-ceiling, or at `--max-heap-mb N`, so a heap bomb ends as exit 6 rather than
-a V8 abort. **What this does not cover:** memory outside the V8 heap —
+ceiling, or at `--max-heap-mb N` (0 or at least 16), so a heap bomb ends as
+exit 6 rather than a V8 abort. The termination lands when the running call
+returns, so the first time the ceiling is reached V8 gets 1 GiB more for
+that call to finish: the heap can overshoot the ceiling by up to that much
+for a moment (peak RSS 0.73 GB for a 50-million-slot `fill` under
+`--max-heap-mb 64`, which ends as exit 6). What the tests prove: a loop of
+ordinary allocations and that one large `fill`, at 16 and 64 MiB. A single
+call that allocates more than 1 GiB past the ceiling before it returns can
+still make V8 abort (a signal, no exit code; `jsrt supervise` reports it
+as one). **What this does not cover:** memory outside the V8 heap —
 `ArrayBuffer` backing stores and host buffers — which needs a process
 boundary, which is what `jsrt supervise` is for (`RLIMIT_CPU` seconds, RSS polling, SIGTERM→SIGKILL,
 bounded JSONL run reports, worker stdout and stderr each capped per run by
@@ -211,12 +259,13 @@ the first build downloads ~95 MB of prebuilt V8. `rust-toolchain.toml` pins
 Rust 1.99.1 (rustup honours it; Homebrew's cargo does not, and
 `scripts/check-toolchain.sh` says so).
 
-Gate: `scripts/check.sh` runs the toolchain check, `cargo fmt --check`,
-Clippy with `-D warnings`, `cargo test --workspace --locked` (140 tests:
-75 lifecycle, 6 security, 28 serve, 11 supervise, 20 host) and the full
-`cargo deny --locked check` (advisories, licences, bans, sources). CI runs
-the same script on ubuntu-latest and macos-latest on every push and pull
-request, and daily for new advisories.
+Gate: `scripts/check.sh` runs the toolchain check, checks that cargo-deny
+is the release CI pins (0.21.0, in `scripts/install-cargo-deny.sh`), then
+`cargo fmt --check`, Clippy with `-D warnings`, `cargo test --workspace
+--locked` (154 tests: 76 lifecycle, 13 security, 30 serve, 11 supervise,
+24 host) and the full `cargo deny --locked check` (advisories, licences,
+bans, sources). CI runs the same script on ubuntu-latest and macos-latest
+on every push and pull request, and daily for new advisories.
 
 ## Security verification (2026-11-16)
 
@@ -231,17 +280,32 @@ to watch the test fail, then restored.
 | `rt.fetch` ignores `HTTP(S)_PROXY` and `ALL_PROXY` | `security.rs`: `fetch_ignores_proxy_environment_variables` |
 | At most 32 fetches in flight per run | `security.rs`: `a_thousand_parallel_fetches_keep_in_flight_under_the_cap` |
 | A heap bomb under `jsrt run` ends as exit 6, not a V8 abort | `security.rs`: `an_allocation_bomb_under_jsrt_run_ends_classified_at_the_heap_limit` |
+| One call that allocates about 700 MB past a 64 MiB limit still ends as exit 6 | `security.rs`: `one_call_that_allocates_far_past_the_heap_limit_still_ends_classified` |
+| `--max-heap-mb` below 16 is a usage error; at 16 a script runs and a bomb is exit 6 | `security.rs`: `a_heap_limit_below_the_floor_is_refused_and_the_floor_works` |
 | Caught refusals name no canonical path or symlink target | `security.rs`: `caught_refusals_do_not_reveal_canonical_paths_or_symlink_targets` |
+| With no read grant, `readText`, `media.put`, `import.meta.resolve` and `import()` answer alike for an existing and a missing host path | `security.rs`: `a_script_without_a_read_grant_cannot_tell_which_host_paths_exist`; `lifecycle.rs`: `a_missing_import_outside_the_fence_is_refused_like_an_existing_one` |
+| A kv store that cannot open does not name its path | `security.rs`: `a_kv_store_that_cannot_open_does_not_name_its_path` |
+| `readText` refuses a FIFO instead of reading past its 4 MiB cap | `security.rs`: `read_text_refuses_a_fifo_instead_of_reading_past_its_cap` |
+| A refused private name does not show the script its addresses | `security.rs`: `a_refused_private_name_does_not_show_the_script_its_addresses` |
+| A misspelt manifest key is an error naming it | `security.rs`: `a_misspelt_manifest_key_is_an_error_naming_it` |
 | At the connection cap a trickler cannot get a download evicted mid-write | `serve.rs`: `at_the_cap_a_trickler_cannot_steer_eviction_onto_a_download_being_written` |
+| At the connection cap slow readers cannot hold every slot | `serve.rs`: `at_the_cap_slow_readers_cannot_pin_every_slot` |
+| `response_timeout_ms` ends a slow download even inside the rate grace | `serve.rs`: `a_response_timeout_ends_a_slow_download_even_below_the_rate_grace` |
 | A small slow body gets `body_timeout_ms`; a large one still has to keep the rate | `serve.rs`: `a_slow_small_body_gets_the_body_timeout_not_the_rate_deadline` |
 | `unsafe` only in the supervisor, each block documented | `#![forbid(unsafe_code)]` in jsrt-host and jsrt-load; Clippy `undocumented_unsafe_blocks = "deny"` in the gate |
-| Supply chain: advisories, licences, bans, sources | `cargo deny --locked check` in the gate |
+| Supply chain: advisories, licences, bans, sources | `cargo deny --locked check` in the gate, the same pinned cargo-deny release locally and in CI |
 
 Still open: memory outside the V8 heap is bounded only by `jsrt supervise
---max-rss-mb`; output under unsupervised `jsrt run` is not capped; any
-`.js`/`.mjs` file under the entry directory is importable (keep an entry in
-a directory of its own); the M7 load numbers predate these changes (see
-ROADMAP).
+--max-rss-mb`; one call that allocates more than 1 GiB past the heap limit
+can still abort V8; output under unsupervised `jsrt run` is not capped; any
+`.js`/`.mjs` file under the entry directory is importable, and a script can
+tell which files exist there (keep an entry in a directory of its own);
+`import.meta.url` and a failed import of the script's own modules show its
+directory's canonical path, as ESM does; at the `rt.serve` connection cap
+a newcomer behind slow readers can wait up to `body_first_byte_ms`; a
+data import is checked against the 4 MiB cap by its metadata and then read
+whole by deno_core's loader, so a file that grows in between is read whole;
+the M7 load numbers predate these changes (see ROADMAP).
 
 ## License
 

@@ -29,10 +29,14 @@
 //!   unconditionally (a static load with no referrer is the root load);
 //! - a **dependency** outside its fence is a capability refusal —
 //!   `CapabilityError`, exit 7;
-//! - a dependency that doesn't resolve at all is still a *load* failure (3) —
-//!   refusing to load a file that isn't there is the loader's job, not ours.
+//! - a dependency that doesn't resolve at all is still a *load* failure (3)
+//!   when it would be inside its fence — refusing to load a file that isn't
+//!   there is the loader's job, not ours. Outside the fence it is refused
+//!   like any other path there, before the filesystem is asked, so an
+//!   import cannot tell a script which host files exist (see
+//!   [`Capabilities::locate`]).
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::rc::Rc;
 
 use deno_core::{
@@ -41,7 +45,7 @@ use deno_core::{
 };
 use deno_error::JsErrorBox;
 
-use crate::capability::Capabilities;
+use crate::capability::{Capabilities, Located};
 use crate::error::HostError;
 
 /// Host vocabulary the classifier recognizes: dynamic-import rejections lose
@@ -60,9 +64,14 @@ pub struct JsrtModuleLoader {
 }
 
 impl JsrtModuleLoader {
-    pub fn new(manifest: Capabilities, entry_dir: Option<PathBuf>) -> Self {
+    /// `entry_dir` as the operator gave it; it is kept canonicalized and as
+    /// spelled, like a declared read root. One that does not resolve adds
+    /// nothing.
+    pub fn new(manifest: Capabilities, entry_dir: Option<&Path>) -> Self {
         let mut grants = manifest.clone().into_grants();
-        grants.read_paths.extend(entry_dir);
+        if let Some(dir) = entry_dir {
+            let _ = grants.add_read_root(dir);
+        }
         Self {
             inner: FsModuleLoader,
             program: Capabilities::from_grants(grants),
@@ -75,16 +84,21 @@ fn denied(msg: String) -> JsErrorBox {
     JsErrorBox::new("CapabilityError", format!("{IMPORT_DENIED_PREFIX} {msg}"))
 }
 
-/// The canonical file path behind a `file:` specifier, or `None` when the
-/// gate should leave it to the inner loader: paths that don't resolve
-/// (missing is a Load (3), not a refusal we invented). Other schemes never
-/// get this far; [`local_only`] refuses them first.
-fn resolved_file(specifier: &ModuleSpecifier) -> Option<PathBuf> {
-    if specifier.scheme() != "file" {
-        return None;
+/// Where a `file:` specifier's path is, judged against `fence`. A file URL
+/// carries an absolute path with `.` and `..` already folded. Other schemes
+/// never get this far ([`local_only`] refuses them first); a `file:` URL
+/// that names no local path is refused too.
+fn located(fence: &Capabilities, specifier: &ModuleSpecifier) -> Located {
+    match specifier.to_file_path() {
+        Ok(path) => fence.locate(&path),
+        Err(()) => Located::Refused,
     }
-    let path = specifier.to_file_path().ok()?;
-    std::fs::canonicalize(path).ok()
+}
+
+/// The one refusal for an import outside its fence — whether or not
+/// anything is there.
+fn outside(asked: &str) -> JsErrorBox {
+    denied(format!("{asked} is outside every declared read path"))
 }
 
 /// A JavaScript module by both signals: no import attribute asked for
@@ -116,15 +130,10 @@ impl JsrtModuleLoader {
     /// show where the host's files live and where a symlink points.
     fn gate_resolve(&self, specifier: &ModuleSpecifier, asked: &str) -> Result<(), JsErrorBox> {
         local_only(specifier)?;
-        let Some(resolved) = resolved_file(specifier) else {
-            return Ok(());
-        };
-        if self.program.is_read_allowed(&resolved) {
-            Ok(())
-        } else {
-            Err(denied(format!(
-                "{asked} resolves outside every declared read path"
-            )))
+        match located(&self.program, specifier) {
+            // Missing inside the fence: the inner loader's Load (3).
+            Located::Found(_) | Located::Missing => Ok(()),
+            Located::Refused => Err(outside(asked)),
         }
     }
 
@@ -135,9 +144,6 @@ impl JsrtModuleLoader {
         requested: &RequestedModuleType,
     ) -> Result<(), JsErrorBox> {
         local_only(specifier)?;
-        let Some(resolved) = resolved_file(specifier) else {
-            return Ok(());
-        };
         // Only the URL is known here, not what the script wrote: name the
         // file alone.
         let asked = specifier
@@ -146,16 +152,37 @@ impl JsrtModuleLoader {
             .filter(|name| !name.is_empty())
             .unwrap_or("the imported module")
             .to_string();
+        let resolved = match located(&self.program, specifier) {
+            Located::Found(resolved) => resolved,
+            Located::Missing => return Ok(()),
+            Located::Refused => return Err(outside(&asked)),
+        };
         if is_js_module(&resolved, requested) {
-            return self.gate_resolve(specifier, &asked);
+            // The inner loader reads the whole file; a FIFO or a device
+            // would block it, or stream without end.
+            return if resolved.is_file() {
+                Ok(())
+            } else {
+                Err(denied(format!("{asked} is not a regular file")))
+            };
         }
-        match self.data.may_read_resolved(&resolved, &asked) {
-            Ok(()) => Ok(()),
-            Err(HostError::Capability(msg)) => Err(denied(format!(
+        let refused = |msg: String| {
+            denied(format!(
                 "{msg} (the entry directory admits .js/.mjs modules only; text, bytes, \
                  JSON and other files need a declared read path)"
+            ))
+        };
+        match located(&self.data, specifier) {
+            Located::Found(resolved) => match self.data.read_cap(&resolved, &asked) {
+                Ok(()) => Ok(()),
+                Err(HostError::Capability(msg)) => Err(refused(msg)),
+                Err(other) => Err(denied(other.to_string())),
+            },
+            // Inside the program fence, so it may know the file is there;
+            // outside the data fence, so it may not read it.
+            Located::Missing | Located::Refused => Err(refused(format!(
+                "{asked} is outside every declared read path"
             ))),
-            Err(other) => Err(denied(other.to_string())),
         }
     }
 }
@@ -205,6 +232,6 @@ impl ModuleLoader for JsrtModuleLoader {
 
 /// The loader handed to `JsRuntime` — the manifest and the entry directory
 /// are baked in at build.
-pub fn gated_loader(manifest: &Capabilities, entry_dir: Option<PathBuf>) -> Rc<dyn ModuleLoader> {
+pub fn gated_loader(manifest: &Capabilities, entry_dir: Option<&Path>) -> Rc<dyn ModuleLoader> {
     Rc::new(JsrtModuleLoader::new(manifest.clone(), entry_dir))
 }

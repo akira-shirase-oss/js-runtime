@@ -162,9 +162,14 @@ async fn op_read_text(
 ) -> Result<String, JsErrorBox> {
     let caps = capabilities(&state)?;
     let resolved = caps.may_read(std::path::Path::new(&path)).map_err(deny)?;
-    tokio::fs::read_to_string(&resolved)
-        .await
-        .map_err(|e| host_err(format!("read {path}: {e}")))
+    // The cap is enforced on the bytes read too, not only on the size the
+    // metadata reported.
+    let asked = path.clone();
+    tokio::task::spawn_blocking(move || {
+        crate::capability::read_text_capped(&resolved, &asked).map_err(deny)
+    })
+    .await
+    .map_err(|e| host_err(format!("read {path}: {e}")))?
 }
 
 /// `rt.fetch(url)` — capability-gated, deadline'd, body-capped fetch.
@@ -267,16 +272,30 @@ impl KvState {
     fn conn(&mut self) -> Result<&rusqlite::Connection, JsErrorBox> {
         if self.conn.is_none() {
             // The script never names the store's path, so its errors
-            // don't either.
+            // don't either: rusqlite puts the path in an open error, so
+            // the script gets SQLite's error code and the operator's
+            // stderr gets the whole error.
             let c = rusqlite::Connection::open(&self.grant.path)
-                .map_err(|e| host_err(format!("kv open: {e}")))?;
+                .map_err(|e| self.hide_path("kv open: the store cannot be opened", &e))?;
             c.execute_batch("CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT NOT NULL);")
-                .map_err(|e| host_err(format!("kv init: {e}")))?;
+                .map_err(|e| self.hide_path("kv init: the store cannot be set up", &e))?;
             self.conn = Some(c);
         }
         self.conn
             .as_ref()
             .ok_or_else(|| host_err("kv connection lost".into()))
+    }
+}
+
+impl KvState {
+    /// A store error for the script, `what` plus SQLite's error code; the
+    /// full error, path included, goes to stderr for the operator.
+    fn hide_path(&self, what: &str, err: &rusqlite::Error) -> JsErrorBox {
+        eprintln!("jsrt: {what}: {}: {err}", self.grant.path.display());
+        match err.sqlite_error_code() {
+            Some(code) => host_err(format!("{what} ({code:?})")),
+            None => host_err(what.to_string()),
+        }
     }
 }
 
@@ -425,6 +444,19 @@ fn media_grant(
         })
 }
 
+/// Lowercase hex, written out byte by byte. `format!("{:x}", digest)`
+/// works on sha2 0.10's `GenericArray` but not on 0.11's `Array`, which has
+/// no `LowerHex`; this works on both.
+fn lower_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut hex = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        // Writing to a String cannot fail.
+        let _ = write!(hex, "{b:02x}");
+    }
+    hex
+}
+
 #[derive(Serialize)]
 struct MediaPutResult {
     name: String,
@@ -450,25 +482,27 @@ fn op_media_put(
     let caps = capabilities(&state)?;
     let grant = media_grant(&state)?;
     // Reading requires a read grant — media never bypasses that gate. The
-    // check is is_read_allowed, NOT may_read: may_read's 4 MiB cap is a
+    // check is `locate`, NOT may_read: may_read's 4 MiB cap is a
     // materialization limit for readText, and this op never materializes.
-    let resolved = std::fs::canonicalize(&src).map_err(|e| {
-        JsErrorBox::new(
-            "CapabilityError",
-            format!("read denied: {src} does not resolve ({e})"),
-        )
-    })?;
     // Messages name `src`, the path the script gave: never the canonical
     // path, which would show where the host's files live and where a link
-    // points.
-    if !caps.is_read_allowed(&resolved) {
-        return Err(JsErrorBox::new(
-            "CapabilityError",
-            format!("read denied: {src} resolves outside every declared read path"),
-        ));
+    // points; and every refusal reads the same, so none says whether
+    // something exists outside the grant.
+    let resolved = match caps.locate(std::path::Path::new(&src)) {
+        crate::capability::Located::Found(resolved) => resolved,
+        _ => return Err(deny(crate::capability::read_refusal(&src))),
+    };
+    // A regular file only, checked before opening (opening a FIFO blocks
+    // this op, and the event loop with it) and again on what was opened.
+    let regular = |meta: std::io::Result<std::fs::Metadata>| meta.is_ok_and(|m| m.is_file());
+    if !regular(std::fs::metadata(&resolved)) {
+        return Err(deny(crate::capability::not_a_regular_file(&src)));
     }
     let mut input = std::fs::File::open(&resolved)
         .map_err(|e| host_err(format!("media put: open {src}: {e}")))?;
+    if !regular(input.metadata()) {
+        return Err(deny(crate::capability::not_a_regular_file(&src)));
+    }
 
     // Unique-enough tmp name in the same dir as the destination — rename
     // across a filesystem boundary wouldn't be atomic.
@@ -508,7 +542,7 @@ fn op_media_put(
         }
         out.sync_all()
             .map_err(|e| host_err(format!("media put: sync tmp: {e}")))?;
-        Ok((format!("{:x}", hasher.finalize()), total))
+        Ok((lower_hex(&hasher.finalize()), total))
     })();
 
     match streamed {
@@ -584,6 +618,19 @@ deno_core::extension!(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn media_names_are_the_lowercase_sha256_hex() {
+        use sha2::Digest;
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(b"abc");
+        // FIPS 180-2's known answer for "abc".
+        assert_eq!(
+            lower_hex(&hasher.finalize()),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(lower_hex(&[0x00, 0x0f, 0xa0, 0xff]), "000fa0ff");
+    }
 
     #[test]
     fn capability_errors_keep_their_name() {
