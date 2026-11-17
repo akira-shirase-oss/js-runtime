@@ -44,10 +44,14 @@ impl Rig {
     fn run_script_env(&self, script: &Path, extra: &[&str], env: &[(&str, &str)]) -> Output {
         let mut args = vec!["run", arg(script)];
         args.extend_from_slice(extra);
-        Command::new(JSRT)
-            .args(&args)
-            .envs(env.iter().copied())
-            .current_dir(self.dir.path())
+        let mut cmd = Command::new(JSRT);
+        cmd.args(&args).current_dir(self.dir.path());
+        if !env.is_empty() {
+            // An inherited NO_PROXY could exempt the destination and hide a
+            // proxy that would otherwise have been used.
+            cmd.env_remove("NO_PROXY").env_remove("no_proxy");
+        }
+        cmd.envs(env.iter().copied())
             .output()
             .unwrap_or_else(|e| panic!("spawn jsrt: {e}"))
     }
@@ -188,4 +192,51 @@ fn dynamic_remote_data_and_blob_imports_are_refused_by_jsrts_loader() {
     // The last one is not caught: a refusal, not a load failure.
     assert_eq!(code(&out), 7, "stderr: {}", stderr(&out));
     assert_eq!(stub.seen(), 0, "the loader must never connect anywhere");
+}
+
+// ---- rt.fetch never goes through an environment proxy -----------------------
+
+#[test]
+fn fetch_ignores_proxy_environment_variables() {
+    let proxy = CountingStub::start("from the proxy");
+    let target = CountingStub::start("from the target");
+    let rig = Rig::new();
+    let proxy_url = format!("http://127.0.0.1:{}", proxy.port);
+    let env: Vec<(&str, &str)> = [
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+    ]
+    .into_iter()
+    .map(|k| (k, proxy_url.as_str()))
+    .collect();
+    let script = rig.script(
+        "proxy.js",
+        &format!(
+            "const r = await rt.fetch('http://127.0.0.1:{port}/plain');\n\
+             rt.print('http: ' + r.body + '\\n');\n\
+             // The target speaks plain HTTP, so a direct https connection\n\
+             // fails its TLS handshake; through a proxy it would be a CONNECT.\n\
+             try {{ await rt.fetch('https://127.0.0.1:{port}/tls'); rt.print('https: answered\\n'); }}\n\
+             catch (e) {{ rt.print('https: ' + e.name + '\\n'); }}\n",
+            port = target.port
+        ),
+    );
+    let out = rig.run_script_env(
+        &script,
+        &["--net", &format!("127.0.0.1:{}", target.port)],
+        &env,
+    );
+    assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
+    assert_eq!(
+        stdout(&out),
+        "http: from the target\nhttps: HostError\n",
+        "stderr: {}",
+        stderr(&out)
+    );
+    assert_eq!(proxy.seen(), 0, "the proxy must never be contacted");
+    assert_eq!(target.seen(), 2, "both fetches went straight to the target");
 }
