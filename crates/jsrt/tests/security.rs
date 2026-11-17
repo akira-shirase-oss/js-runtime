@@ -653,3 +653,37 @@ fn read_text_refuses_a_fifo_instead_of_reading_past_its_cap() {
     );
     let _ = writer.join();
 }
+
+// ---- A refused private name does not show the script its addresses --------
+
+#[test]
+fn a_refused_private_name_does_not_show_the_script_its_addresses() {
+    let stub = CountingStub::start("private service");
+    let rig = Rig::new();
+    let script = rig.script(
+        "private.js",
+        &format!(
+            "try {{ await rt.fetch('http://localhost:{port}/'); rt.print('fetched\\n'); }}\n\
+             catch (e) {{ rt.print(e.name + ': ' + e.message + '\\n'); }}\n",
+            port = stub.port
+        ),
+    );
+    let out = rig.run_script(&script, &["--net", &format!("localhost:{}", stub.port)]);
+    assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
+    let seen = stdout(&out);
+    assert!(
+        seen.starts_with("CapabilityError: fetch denied: localhost")
+            && seen.contains("not a public address"),
+        "{seen}"
+    );
+    for addr in ["127.0.0.1", "::1"] {
+        assert!(!seen.contains(addr), "the script sees {addr}: {seen}");
+    }
+    // The operator still gets the addresses, on stderr.
+    assert!(
+        stderr(&out).contains("127.0.0.1") || stderr(&out).contains("::1"),
+        "stderr: {}",
+        stderr(&out)
+    );
+    assert_eq!(stub.seen(), 0, "no connection was made");
+}
