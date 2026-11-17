@@ -3,6 +3,7 @@ name = "jsrt"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish.workspace = true
 description = "jsrt CLI — a purpose-built JavaScript host."
 
 [dependencies]

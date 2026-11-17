@@ -6,6 +6,8 @@ members = ["crates/jsrt", "crates/jsrt-host", "crates/jsrt-load"]
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
+# Not published: the crates are built from this repository only.
+publish = false
 
 [workspace.dependencies]
 deno_core = "=0.413.0"
