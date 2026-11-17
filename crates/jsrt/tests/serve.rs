@@ -1804,3 +1804,72 @@ fn a_slow_small_body_gets_the_body_timeout_not_the_rate_deadline() {
         .unwrap_or_else(|e| panic!("wait: {e}"));
     assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
 }
+
+// ---- A heap bomb in a handler ends the server, it does not park it --------
+
+#[test]
+fn a_heap_bomb_in_a_handler_ends_the_server_and_closes_the_listener() {
+    let rig = Rig::new();
+    let port = Rig::free_port();
+    let manifest = rig.script(
+        "bomb.manifest.json",
+        &format!("{{ \"serve\": {{\"host\": \"127.0.0.1\", \"port\": {port}}} }}\n"),
+    );
+    let script = rig.script(
+        "bomb-server.js",
+        &format!(
+            "rt.serve({{host: '127.0.0.1', port: {port}}}, async (req) => {{\n\
+               if (req.path === '/bomb') {{ const hoard = []; while (true) {{ hoard.push(new Array(100000).fill({{ x: hoard.length }})); }} }}\n\
+               return {{status: 200, body: 'ok ' + req.path}};\n\
+             }});\n\
+             rt.print('jsrt-test: listening\\n');\n"
+        ),
+    );
+    // No run timeout, as a long-running server has: only the heap limit
+    // can end this run.
+    let mut child = rig.spawn_serve(
+        &script,
+        &[
+            "--manifest",
+            script_arg(&manifest),
+            "--timeout",
+            "0",
+            "--max-heap-mb",
+            "64",
+        ],
+    );
+    let (status, _head, body) = http(
+        port,
+        &format!("GET /before HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"),
+    );
+    assert_eq!((status, body.as_str()), (200, "ok /before"));
+    let started = Instant::now();
+    let mut bomb = connect(port);
+    bomb.set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap_or_else(|e| panic!("timeout: {e}"));
+    bomb.write_all(b"GET /bomb HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+        .unwrap_or_else(|e| panic!("write: {e}"));
+    while !child.try_wait_exited() && started.elapsed() < Duration::from_secs(20) {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let took = started.elapsed();
+    assert!(
+        child.try_wait_exited(),
+        "the server was still running {took:?} after the heap bomb"
+    );
+    let out = child
+        .wait_with_output()
+        .unwrap_or_else(|e| panic!("wait: {e}"));
+    assert_eq!(code(&out), 6, "stderr: {}", stderr(&out));
+    assert!(
+        stderr(&out).contains("heap limit"),
+        "stderr: {}",
+        stderr(&out)
+    );
+    assert!(took < Duration::from_secs(10), "ended only after {took:?}");
+    // The listener went with it: nothing accepts on the port any more.
+    assert!(
+        TcpStream::connect(("127.0.0.1", port)).is_err(),
+        "something still accepts on the server's port"
+    );
+}

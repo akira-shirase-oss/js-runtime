@@ -33,6 +33,8 @@ if [ "${found}" != "cargo-deny ${pinned}" ]; then
   echo "check.sh: FAILED: found ${found}, but the gate pins cargo-deny ${pinned}" >&2
   echo "fix: scripts/install-cargo-deny.sh <dir> (then put <dir> first on PATH)," \
     "or cargo install --locked cargo-deny@${pinned}" >&2
+  echo "note: cargo searches ~/.cargo/bin before PATH unless ~/.cargo/bin is on PATH;" \
+    "list it after <dir>" >&2
   exit 1
 fi
 echo "==> cargo-deny ${pinned} (pinned)"

@@ -43,13 +43,14 @@ pub struct HostOptions {
     /// the event loop. `None` means "until it finishes"; the CLI always sets
     /// one unless `--timeout 0` is passed explicitly.
     pub timeout: Option<Duration>,
-    /// If the watchdog fires and the run still hasn't unwound after this
-    /// grace, escalate to `process::exit` with the terminated code. This is
-    /// the in-process stand-in for the supervisor's hard kill: it exists
-    /// because a *parked* event loop (a promise that never resolves) has no
-    /// executing JS for `terminate_execution` to interrupt. CLI-only —
-    /// library embedders keep graceful semantics and handle stalls in their
-    /// own supervisor.
+    /// If the watchdog fires, or the V8 heap limit is reached, and the run
+    /// still hasn't unwound after this grace, escalate to `process::exit`
+    /// with the terminated code. This is the in-process stand-in for the
+    /// supervisor's hard kill: it exists because a *parked* event loop (a
+    /// promise that never resolves) has no executing JS for
+    /// `terminate_execution` to interrupt. The heap grace runs whether or
+    /// not there is a `timeout`. CLI-only — library embedders keep graceful
+    /// semantics and handle stalls in their own supervisor.
     pub terminate_grace: Option<Duration>,
     /// Per-fetch deadline. `None` uses the built-in 10s bound — a script may
     /// never hold a network op open longer than this.
@@ -85,11 +86,51 @@ pub struct RunReport {
 }
 
 /// Why the host stopped the isolate, if it did — set by the watchdog
-/// thread or the heap callback, read by [`classify`].
+/// thread or the heap callback, read by [`classify`] and [`drive`].
 #[derive(Debug, Default)]
 pub(crate) struct Stopped {
     by_timeout: AtomicBool,
     by_heap: AtomicBool,
+    /// The run is over: the watchdog and grace threads stand down.
+    done: AtomicBool,
+    /// Woken when the host stops the isolate. After V8 terminates a
+    /// callback (a timer, a microtask, an `rt.serve` handler), deno_core
+    /// 0.413 counts it as no work: its event loop can park for good, or
+    /// finish as if nothing happened. `drive` waits on this as well, so a
+    /// stopped run ends as `Terminated` whatever the event loop does.
+    wake: tokio::sync::Notify,
+}
+
+impl Stopped {
+    /// The ending the host imposed, if it stopped the isolate.
+    fn reason(&self) -> Option<HostError> {
+        if self.by_heap.load(Ordering::SeqCst) {
+            Some(HostError::Terminated(
+                "execution terminated at the V8 heap limit".into(),
+            ))
+        } else if self.by_timeout.load(Ordering::SeqCst) {
+            Some(HostError::Terminated(
+                "execution terminated by timeout watchdog".into(),
+            ))
+        } else {
+            None
+        }
+    }
+}
+
+/// If the run has not ended `grace` after the host stopped the isolate
+/// (because of `cause`), exit the process with the terminated code: the
+/// in-process stand-in for the supervisor's kill. Blocks the calling
+/// thread for `grace`.
+fn exit_unless_done(stopped: &Stopped, grace: Duration, cause: &str) {
+    std::thread::sleep(grace);
+    if !stopped.done.load(Ordering::SeqCst) {
+        eprintln!(
+            "jsrt: terminated: run did not unwind {}ms after {cause}",
+            grace.as_millis()
+        );
+        std::process::exit(HostError::Terminated(String::new()).exit_code());
+    }
 }
 
 /// The smallest V8 heap ceiling a run gets. Below about 8 MiB V8 aborts
@@ -159,16 +200,28 @@ fn build_runtime(options: &HostOptions, entry_dir: Option<&Path>) -> (JsRuntime,
         ..Default::default()
     });
     let stopped = Arc::new(Stopped::default());
-    // At the heap ceiling: terminate the isolate, and give the call that
-    // is running room to return so the termination can land. V8 calls this
+    // At the heap ceiling: terminate the isolate, wake `drive` so the run
+    // ends even if the event loop parks, start the grace (CLI) after which
+    // the process exits regardless of `timeout`, and give the call that is
+    // running room to return so the termination can land. V8 calls this
     // again if the unwinding allocates up to the new limit; after
     // HEAP_UNWIND_GRANTS more the limit stays and V8 aborts.
     let handle = runtime.v8_isolate().thread_safe_handle();
     let heap_stop = Arc::clone(&stopped);
+    let grace = options.terminate_grace;
     let mut grants = 0u32;
     runtime.add_near_heap_limit_callback(move |current, _initial| {
         if !heap_stop.by_heap.swap(true, Ordering::SeqCst) {
             handle.terminate_execution();
+            heap_stop.wake.notify_one();
+            if let Some(grace) = grace {
+                let stopped = Arc::clone(&heap_stop);
+                // A thread that cannot start leaves `drive`'s wake-up, and
+                // the run timeout if there is one, to end the run.
+                let _ = std::thread::Builder::new()
+                    .name("jsrt-heap-grace".into())
+                    .spawn(move || exit_unless_done(&stopped, grace, "the V8 heap limit"));
+            }
             return current.saturating_add(HEAP_TERMINATION_HEADROOM);
         }
         if grants >= HEAP_UNWIND_GRANTS {
@@ -249,12 +302,10 @@ pub async fn run_file_report(entry: &Path, options: &HostOptions) -> RunReport {
         dir => dir,
     };
     let (mut runtime, stopped) = build_runtime(options, entry_dir);
-    let done = Arc::new(AtomicBool::new(false));
     spawn_watchdog(
         &mut runtime,
         options.timeout,
         options.terminate_grace,
-        Arc::clone(&done),
         Arc::clone(&stopped),
     );
 
@@ -269,7 +320,7 @@ pub async fn run_file_report(entry: &Path, options: &HostOptions) -> RunReport {
     .await;
     // Whatever the outcome, the run is over — the watchdog must not fire into
     // a dropped isolate or escalate against a finished process.
-    done.store(true, Ordering::SeqCst);
+    stopped.done.store(true, Ordering::SeqCst);
     // The script may have died before its listener closed; the host still
     // reports the serve log lines it held back.
     crate::serve::flush_serve_log(&mut runtime.op_state().borrow_mut());
@@ -298,12 +349,10 @@ pub async fn run_source_report(name: &str, source: &str, options: &HostOptions) 
     // An embedded run is "as if" run from cwd — same entry-dir convention.
     let cwd = std::env::current_dir().unwrap_or_else(|_| Path::new(".").to_path_buf());
     let (mut runtime, stopped) = build_runtime(options, Some(cwd.as_path()));
-    let done = Arc::new(AtomicBool::new(false));
     spawn_watchdog(
         &mut runtime,
         options.timeout,
         options.terminate_grace,
-        Arc::clone(&done),
         Arc::clone(&stopped),
     );
     let result = async {
@@ -315,7 +364,7 @@ pub async fn run_source_report(name: &str, source: &str, options: &HostOptions) 
         drive(&mut runtime, evaluation, options.timeout, &stopped).await
     }
     .await;
-    done.store(true, Ordering::SeqCst);
+    stopped.done.store(true, Ordering::SeqCst);
     // The script may have died before its listener closed; the host still
     // reports the serve log lines it held back.
     crate::serve::flush_serve_log(&mut runtime.op_state().borrow_mut());
@@ -326,35 +375,29 @@ pub async fn run_source_report(name: &str, source: &str, options: &HostOptions) 
 /// Spawn the termination watchdog; it records in `stopped` when it fires.
 /// `terminate_execution` is the only mechanism that stops JS *while it runs
 /// on this isolate* — a `select!`-style cancel can never see a `while(1){}`.
-/// Stage two, when `terminate_grace` is set: a parked event loop has no JS to
-/// interrupt, so if the run still hasn't finished after the grace the watchdog
-/// exits the process itself — same ending the supervisor will enforce with a
-/// signal, minus the process boundary.
+/// It also wakes `drive`, which then ends the run however the event loop is
+/// doing. Stage two, when `terminate_grace` is set: if the run still hasn't
+/// finished after the grace the watchdog exits the process itself — same
+/// ending the supervisor will enforce with a signal, minus the process
+/// boundary.
 fn spawn_watchdog(
     runtime: &mut JsRuntime,
     timeout: Option<Duration>,
     terminate_grace: Option<Duration>,
-    done: Arc<AtomicBool>,
     stopped: Arc<Stopped>,
 ) {
     if let Some(deadline) = timeout {
         let handle = runtime.v8_isolate().thread_safe_handle();
         std::thread::spawn(move || {
             std::thread::sleep(deadline);
-            if done.load(Ordering::SeqCst) {
+            if stopped.done.load(Ordering::SeqCst) {
                 return;
             }
             stopped.by_timeout.store(true, Ordering::SeqCst);
             handle.terminate_execution();
+            stopped.wake.notify_one();
             if let Some(grace) = terminate_grace {
-                std::thread::sleep(grace);
-                if !done.load(Ordering::SeqCst) {
-                    eprintln!(
-                        "jsrt: terminated: run did not unwind {}ms after termination",
-                        grace.as_millis()
-                    );
-                    std::process::exit(HostError::Terminated(String::new()).exit_code());
-                }
+                exit_unless_done(&stopped, grace, "termination");
             }
         });
     }
@@ -362,6 +405,10 @@ fn spawn_watchdog(
 
 /// Drive the event loop and the evaluation future to settlement, with a
 /// tokio-side backstop for a fully idle loop the terminator can't reach.
+/// Once the host has stopped the isolate (heap limit or timeout), the run
+/// is over: `drive` returns `Terminated` as soon as it is woken, without
+/// waiting for an event loop that may never settle after a terminated
+/// callback, and never reports success for a stopped run.
 async fn drive(
     runtime: &mut JsRuntime,
     evaluation: impl std::future::Future<Output = Result<(), deno_core::error::CoreError>>,
@@ -370,17 +417,31 @@ async fn drive(
 ) -> Result<(), HostError> {
     let deadline = timeout.map(|t| t + Duration::from_secs(2));
     let options = PollEventLoopOptions::default();
-    let loop_result = match deadline {
-        Some(d) => match tokio::time::timeout(d, runtime.run_event_loop(options)).await {
-            Ok(r) => r.map_err(|e| classify(&e, stopped)),
-            Err(_) => Err(HostError::Terminated(
-                "event loop did not settle within deadline".into(),
-            )),
-        },
-        None => runtime
-            .run_event_loop(options)
-            .await
-            .map_err(|e| classify(&e, stopped)),
+    let event_loop = async {
+        match deadline {
+            Some(d) => match tokio::time::timeout(d, runtime.run_event_loop(options)).await {
+                Ok(r) => r.map_err(|e| classify(&e, stopped)),
+                Err(_) => Err(HostError::Terminated(
+                    "event loop did not settle within deadline".into(),
+                )),
+            },
+            None => runtime
+                .run_event_loop(options)
+                .await
+                .map_err(|e| classify(&e, stopped)),
+        }
+    };
+    let loop_result = tokio::select! {
+        biased;
+        () = stopped.wake.notified() => None,
+        result = event_loop => Some(result),
+    };
+    if let Some(stop) = stopped.reason() {
+        return Err(stop);
+    }
+    let Some(loop_result) = loop_result else {
+        // Only a stop wakes `wake`, and a stop sets its reason first.
+        return Err(HostError::Terminated("execution terminated".into()));
     };
     let eval_result = evaluation.await.map_err(|e| classify(&e, stopped));
     match (loop_result, eval_result) {
@@ -396,11 +457,8 @@ async fn drive(
 /// The classifier every host error flows through. Order matters: an isolate
 /// that was terminated reports its own death first.
 fn classify(err: &deno_core::error::CoreError, stopped: &Stopped) -> HostError {
-    if stopped.by_heap.load(Ordering::SeqCst) {
-        return HostError::Terminated("execution terminated at the V8 heap limit".into());
-    }
-    if stopped.by_timeout.load(Ordering::SeqCst) {
-        return HostError::Terminated("execution terminated by timeout watchdog".into());
+    if let Some(stop) = stopped.reason() {
+        return stop;
     }
     match err.as_kind() {
         CoreErrorKind::ExecutionTerminated => HostError::Terminated("execution terminated".into()),

@@ -4,20 +4,23 @@
 # GitHub records for the release asset before anything is extracted.
 # `version` is the one pin: scripts/check.sh fails when the cargo-deny it
 # finds is any other release, so the local gate and CI run the same one.
+# A release is pinned only once it is at least two weeks old: 0.20.2 was
+# published 2026-07-09. 0.21.0 (2026-11-16) can replace it on or after
+# 2026-11-30, as a reviewed change.
 set -euo pipefail
 
-version="0.21.0"
+version="0.20.2"
 dest="${1:?usage: scripts/install-cargo-deny.sh <install-dir>}"
 
-# 0.21.0 publishes no x86_64-apple-darwin build; build that one with
-# `cargo install --locked cargo-deny@${version}`.
 case "$(uname -s)-$(uname -m)" in
   Linux-x86_64) target="x86_64-unknown-linux-musl"
-    sha256="a2170b854ff697e79e39c4c538981c9c1bdd803addbae6719a4cb66b4585a903" ;;
+    sha256="9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f" ;;
   Linux-aarch64) target="aarch64-unknown-linux-musl"
-    sha256="47cc5d88d43cd568028080fece02d729f56f0ff8e6c168563ce6589e3c0f4738" ;;
+    sha256="995c82be0defc7a025cae49a2aa2644ce8245c9a3318fc4103907c6a285e8c7d" ;;
   Darwin-arm64) target="aarch64-apple-darwin"
-    sha256="c99a789160775ada8cb54aed72cfdae5a9b72e27434f8868d17c9634c3f52425" ;;
+    sha256="fe67d82a10d8597a3549364cb733a3f9cc1bfff9031b7ae46384a9f2a72090c3" ;;
+  Darwin-x86_64) target="x86_64-apple-darwin"
+    sha256="248da7f581724e470071990c088ffc55c811981715f4cbdb258621fb79f8b7a6" ;;
   *) echo "install-cargo-deny: no pinned build for $(uname -s)-$(uname -m);" \
        "use cargo install --locked cargo-deny@${version}" >&2; exit 1 ;;
 esac

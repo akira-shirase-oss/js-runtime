@@ -9,7 +9,7 @@ Written against commit `c30ac2e` (2026-11-07) and updated for the 2026-11-16 sec
 ## Prerequisites
 
 - Rust via [rustup](https://rustup.rs). `rust-toolchain.toml` pins **1.99.1**, which rustup installs on first use; Homebrew's `cargo` ignores the file, and `scripts/check-toolchain.sh` fails when the `rustc` on `PATH` is not 1.99.1. Edition is 2021.
-- Optional: [cargo-deny](https://github.com/EmbarkStudios/cargo-deny) **0.21.0** for the full gate (`cargo install --locked cargo-deny@0.21.0`, or `scripts/install-cargo-deny.sh <dir>`); `scripts/check.sh` fails on any other release, since CI pins that one.
+- Optional: [cargo-deny](https://github.com/EmbarkStudios/cargo-deny) **0.20.2** for the full gate (`cargo install --locked cargo-deny@0.20.2`, or `scripts/install-cargo-deny.sh <dir>`); `scripts/check.sh` fails on any other release, since CI pins that one.
 - The first `cargo build` downloads about **95 MB** of prebuilt V8 (`deno_core = "=0.413.0"` → `v8 150.4.0`). `V8_FROM_SOURCE=1` builds V8 yourself (slow, usually unnecessary).
 - Optional: `curl` / `nc` for `examples/webhook/drill.sh`.
 
@@ -83,7 +83,7 @@ Exit-code contract (don't collapse these):
 
 ## Changes since `c30ac2e`
 
-`cargo test --workspace --locked` now runs **154 tests** (76 lifecycle + 13 security + 30 serve + 11 supervise + 24 host), not 84. CI runs `scripts/check.sh` on ubuntu-latest and macos-latest for every push and pull request. New behaviour worth trying:
+`cargo test --workspace --locked` now runs **156 tests** (76 lifecycle + 14 security + 31 serve + 11 supervise + 24 host), not 84. CI runs `scripts/check.sh` on ubuntu-latest and macos-latest for every push and pull request. New behaviour worth trying:
 
 - `typeof Deno` and `typeof globalThis.__bootstrap` are `"undefined"`; `Deno.core.ops.op_panic(...)` is a `ReferenceError`, not a host abort.
 - A granted host that answers `302` to an ungranted one: exit **7**, and the ungranted host sees no connection.
@@ -110,6 +110,7 @@ Exit-code contract (don't collapse these):
   - A manifest with `"max_byte"` in its `kv` object: exit 8 naming the key.
   - A kv path that is a directory: `kv open: the store cannot be opened (CannotOpen)`, with the path only on stderr.
   - `--net localhost:PORT`: the caught message no longer lists `127.0.0.1`/`::1`; stderr does.
+  - A heap bomb inside `queueMicrotask`, a `.then`, a `setTimeout`, code after an `await`, or an `rt.serve` handler, with `--max-heap-mb 64 --timeout 0`: exit 6 with "heap limit" in well under a second here, not a parked process (the server's port closes too).
 
 ## Happy-path checklist
 
