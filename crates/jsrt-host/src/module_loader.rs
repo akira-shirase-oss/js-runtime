@@ -110,8 +110,11 @@ fn local_only(specifier: &ModuleSpecifier) -> Result<(), JsErrorBox> {
 
 impl JsrtModuleLoader {
     /// The resolve-time check: the type is not known yet, so only the wider
-    /// program fence applies; `load` narrows it.
-    fn gate_resolve(&self, specifier: &ModuleSpecifier) -> Result<(), JsErrorBox> {
+    /// program fence applies; `load` narrows it. A refusal names `asked`:
+    /// the script can read the message (a caught dynamic import), so it
+    /// gets back what it asked for, never the canonical path, which would
+    /// show where the host's files live and where a symlink points.
+    fn gate_resolve(&self, specifier: &ModuleSpecifier, asked: &str) -> Result<(), JsErrorBox> {
         local_only(specifier)?;
         let Some(resolved) = resolved_file(specifier) else {
             return Ok(());
@@ -120,8 +123,7 @@ impl JsrtModuleLoader {
             Ok(())
         } else {
             Err(denied(format!(
-                "{} is outside every declared read path",
-                resolved.display()
+                "{asked} resolves outside every declared read path"
             )))
         }
     }
@@ -136,10 +138,18 @@ impl JsrtModuleLoader {
         let Some(resolved) = resolved_file(specifier) else {
             return Ok(());
         };
+        // Only the URL is known here, not what the script wrote: name the
+        // file alone.
+        let asked = specifier
+            .path_segments()
+            .and_then(|mut segments| segments.next_back())
+            .filter(|name| !name.is_empty())
+            .unwrap_or("the imported module")
+            .to_string();
         if is_js_module(&resolved, requested) {
-            return self.gate_resolve(specifier);
+            return self.gate_resolve(specifier, &asked);
         }
-        match self.data.may_read_resolved(&resolved) {
+        match self.data.may_read_resolved(&resolved, &asked) {
             Ok(()) => Ok(()),
             Err(HostError::Capability(msg)) => Err(denied(format!(
                 "{msg} (the entry directory admits .js/.mjs modules only; text, bytes, \
@@ -163,7 +173,7 @@ impl ModuleLoader for JsrtModuleLoader {
         // Only the operator's entry is ungated; every import a *script*
         // makes (static or dynamic) must stay inside the fence.
         if !matches!(kind, ResolutionKind::MainModule) {
-            self.gate_resolve(&resolved)?;
+            self.gate_resolve(&resolved, specifier)?;
         }
         Ok(resolved)
     }

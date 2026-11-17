@@ -164,7 +164,7 @@ async fn op_read_text(
     let resolved = caps.may_read(std::path::Path::new(&path)).map_err(deny)?;
     tokio::fs::read_to_string(&resolved)
         .await
-        .map_err(|e| host_err(format!("read {}: {e}", resolved.display())))
+        .map_err(|e| host_err(format!("read {path}: {e}")))
 }
 
 /// `rt.fetch(url)` — capability-gated, deadline'd, body-capped fetch.
@@ -266,8 +266,10 @@ impl KvState {
 
     fn conn(&mut self) -> Result<&rusqlite::Connection, JsErrorBox> {
         if self.conn.is_none() {
+            // The script never names the store's path, so its errors
+            // don't either.
             let c = rusqlite::Connection::open(&self.grant.path)
-                .map_err(|e| host_err(format!("kv open {}: {e}", self.grant.path.display())))?;
+                .map_err(|e| host_err(format!("kv open: {e}")))?;
             c.execute_batch("CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT NOT NULL);")
                 .map_err(|e| host_err(format!("kv init: {e}")))?;
             self.conn = Some(c);
@@ -330,8 +332,7 @@ fn op_kv_put(
         return Err(JsErrorBox::new(
             "CapabilityError",
             format!(
-                "kv quota exceeded: {} is {file_bytes}B; this write projects {projected}B over the {}B grant",
-                kv.grant.path.display(),
+                "kv quota exceeded: the store is {file_bytes}B; this write projects {projected}B over the {}B grant",
                 kv.grant.max_bytes
             ),
         ));
@@ -457,17 +458,17 @@ fn op_media_put(
             format!("read denied: {src} does not resolve ({e})"),
         )
     })?;
+    // Messages name `src`, the path the script gave: never the canonical
+    // path, which would show where the host's files live and where a link
+    // points.
     if !caps.is_read_allowed(&resolved) {
         return Err(JsErrorBox::new(
             "CapabilityError",
-            format!(
-                "read denied: {} is outside every declared read path",
-                resolved.display()
-            ),
+            format!("read denied: {src} resolves outside every declared read path"),
         ));
     }
     let mut input = std::fs::File::open(&resolved)
-        .map_err(|e| host_err(format!("media put: open {}: {e}", resolved.display())))?;
+        .map_err(|e| host_err(format!("media put: open {src}: {e}")))?;
 
     // Unique-enough tmp name in the same dir as the destination — rename
     // across a filesystem boundary wouldn't be atomic.
@@ -496,8 +497,7 @@ fn op_media_put(
                 return Err(JsErrorBox::new(
                     "CapabilityError",
                     format!(
-                        "media put: {} exceeds the {}-byte grant",
-                        resolved.display(),
+                        "media put: {src} exceeds the {}-byte grant",
                         grant.max_bytes
                     ),
                 ));

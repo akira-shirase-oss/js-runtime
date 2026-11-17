@@ -333,3 +333,72 @@ fn an_allocation_bomb_under_jsrt_run_ends_classified_at_the_heap_limit() {
         "the heap limit, not the run timeout, ended it: {took:?}"
     );
 }
+
+// ---- Refusals a script can read name what it asked for, not host paths ----
+
+#[test]
+fn caught_refusals_do_not_reveal_canonical_paths_or_symlink_targets() {
+    let rig = Rig::new();
+    // Outside the program and every grant: a directory whose name the
+    // script never sees, except where it asks for a file in it by name.
+    let outside = rig.path("outside-HIDDENTARGET");
+    // The program, with its grants beside it: links inside the read grant
+    // that point out, and a file over the 4 MiB read cap.
+    let app = rig.path("app");
+    let (data, media) = (app.join("data"), app.join("media"));
+    for d in [&outside, &app, &data, &media] {
+        fs::create_dir(d).unwrap_or_else(|e| panic!("mkdir {}: {e}", d.display()));
+    }
+    fs::write(outside.join("secret.txt"), "secret").unwrap_or_else(|e| panic!("write: {e}"));
+    fs::write(outside.join("secret.js"), "export default 1;\n")
+        .unwrap_or_else(|e| panic!("write: {e}"));
+    for (link, target) in [("link.txt", "secret.txt"), ("link.js", "secret.js")] {
+        std::os::unix::fs::symlink(outside.join(target), data.join(link))
+            .unwrap_or_else(|e| panic!("symlink: {e}"));
+    }
+    fs::write(data.join("big.txt"), vec![b'b'; 4 * 1024 * 1024 + 1])
+        .unwrap_or_else(|e| panic!("write: {e}"));
+    let manifest = rig.script(
+        "app/m.manifest.json",
+        "{ \"read\": [\"./data\"],\n\
+           \"kv\": { \"path\": \"data/app.kv\", \"max_bytes\": 1024 },\n\
+           \"media\": { \"backend\": \"local\", \"root\": \"media/\", \"max_bytes\": 1048576 } }\n",
+    );
+    // readText and media paths are relative to the working directory (the
+    // rig); import specifiers to the module.
+    let script = rig.script(
+        "app/probe.js",
+        "const probes = [\n\
+           ['readText via a link', () => rt.readText('app/data/link.txt')],\n\
+           ['readText outside', () => rt.readText('outside-HIDDENTARGET/secret.txt')],\n\
+           ['readText over the cap', () => rt.readText('app/data/big.txt')],\n\
+           ['media via a link', () => rt.media.put('app/data/link.txt')],\n\
+           ['import via a link', () => import('./data/link.js')],\n\
+           ['text import over the cap', () => import('./data/big.txt', { with: { type: 'text' } })],\n\
+           ['kv over quota', () => rt.kv.put('k', 'v'.repeat(4096))],\n\
+         ];\n\
+         for (const [name, probe] of probes) {\n\
+           try { await probe(); rt.print(name + ' => allowed\\n'); }\n\
+           catch (e) { rt.print(name + ' => ' + e.name + ': ' + e.message + '\\n'); }\n\
+         }\n",
+    );
+    let out = rig.run_script(&script, &["--manifest", arg(&manifest)]);
+    assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
+    let seen = stdout(&out);
+    let root = fs::canonicalize(rig.dir.path()).unwrap_or_else(|e| panic!("canonicalize: {e}"));
+    let root = root.to_string_lossy();
+    for line in seen.lines() {
+        assert!(!line.contains("allowed"), "{line}");
+        assert!(
+            !line.contains(root.as_ref()),
+            "a refusal names the host path {root}: {line}"
+        );
+        if !line.starts_with("readText outside") {
+            assert!(
+                !line.contains("HIDDENTARGET"),
+                "a refusal names a link's target: {line}"
+            );
+        }
+    }
+    assert_eq!(seen.lines().count(), 7, "{seen}");
+}

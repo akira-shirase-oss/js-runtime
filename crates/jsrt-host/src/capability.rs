@@ -466,26 +466,26 @@ impl Capabilities {
                 path.display()
             ))
         })?;
-        self.may_read_resolved(&resolved)?;
+        self.may_read_resolved(&resolved, &path.display().to_string())?;
         Ok(resolved)
     }
 
     /// `may_read`'s allowlist and size cap on an already-canonical path —
     /// the module loader's door for text/bytes/JSON imports, which must not
-    /// be wider than `readText`'s.
-    pub fn may_read_resolved(&self, resolved: &Path) -> Result<(), HostError> {
+    /// be wider than `readText`'s. A refusal names `asked`, what the script
+    /// asked for: the script can read the message, and the canonical path
+    /// would tell it where the host's files live and where a link points.
+    pub fn may_read_resolved(&self, resolved: &Path, asked: &str) -> Result<(), HostError> {
         if !self.is_read_allowed(resolved) {
             return Err(HostError::Capability(format!(
-                "read denied: {} is outside every declared read path",
-                resolved.display()
+                "read denied: {asked} resolves outside every declared read path"
             )));
         }
         if resolved.is_file() {
             let len = fs::metadata(resolved).map_or(0, |m| m.len());
             if len > MAX_READ_BYTES {
                 return Err(HostError::Capability(format!(
-                    "read denied: {} is {len} bytes (limit {MAX_READ_BYTES})",
-                    resolved.display()
+                    "read denied: {asked} is {len} bytes (limit {MAX_READ_BYTES})"
                 )));
             }
         }

@@ -1118,8 +1118,10 @@ fn a_symlink_inside_the_fence_cannot_point_out() {
     let script = rig.script_at(&app.join("main.js"), "import './link.js';\n");
     let out = rig.run_script(&script, &[]);
     assert_eq!(code(&out), 7, "stderr: {}", stderr(&out));
+    // The refusal names what the script asked for, never where the link
+    // points: a script can catch and read it.
     assert!(
-        stderr(&out).contains("target.js"),
+        stderr(&out).contains("./link.js") && !stderr(&out).contains("target.js"),
         "stderr: {}",
         stderr(&out)
     );
