@@ -91,6 +91,10 @@ pub struct ServeGrant {
     /// connection, and its slot, are dropped. Keep it at 5 s or more: a
     /// review run saw 1 s cut legitimate slow downloads under load.
     pub write_timeout: std::time::Duration,
+    /// Longest one response may take to write, progress or not; `None`
+    /// (the default) leaves it to `write_timeout` and, at the connection
+    /// cap, the minimum-rate eviction rule.
+    pub response_timeout: Option<std::time::Duration>,
 }
 
 impl ServeGrant {
@@ -105,6 +109,7 @@ impl ServeGrant {
             body_first_byte: DEFAULT_SERVE_BODY_FIRST_BYTE,
             body_min_rate: DEFAULT_SERVE_BODY_MIN_RATE,
             write_timeout: DEFAULT_SERVE_WRITE_TIMEOUT,
+            response_timeout: None,
         }
     }
 }
@@ -224,6 +229,8 @@ struct ManifestServe {
     body_timeout_ms: Option<u64>,
     #[serde(default)]
     write_timeout_ms: Option<u64>,
+    #[serde(default)]
+    response_timeout_ms: Option<u64>,
     #[serde(default)]
     body_first_byte_ms: Option<u64>,
     #[serde(default)]
@@ -419,6 +426,12 @@ impl Capabilities {
             if let Some(ms) = serve.write_timeout_ms {
                 grant.write_timeout =
                     std::time::Duration::from_millis(positive("write_timeout_ms", ms)?);
+            }
+            if let Some(ms) = serve.response_timeout_ms {
+                grant.response_timeout = Some(std::time::Duration::from_millis(positive(
+                    "response_timeout_ms",
+                    ms,
+                )?));
             }
             caps.serve = Some(grant);
         }

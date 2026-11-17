@@ -53,8 +53,24 @@
 //! ones are unaffected.
 //!
 //! At the connection cap a newcomer closes the connection that has been
-//! in its current phase longest — waiting for a head, or reading a body —
-//! never one with a request in the script or a response being written.
+//! in its current phase longest — waiting for a head, reading a body, or
+//! writing a response to a client that reads too slowly — never one with
+//! a request in the script. A response being written is protected only
+//! while it earns it, with the body rule's two numbers: it is protected
+//! for `body_first_byte` from when the write starts, and every byte the
+//! socket takes extends that by 1/`body_min_rate` of a second, but never
+//! to more than `body_first_byte` ahead. So a reader may pause for at most
+//! that long and must average `body_min_rate`; below it the connection can
+//! be closed for a newcomer, at or above it it keeps its slot. The credit
+//! is capped, not averaged from the start, because kernel socket buffers
+//! take the first megabytes at the host's speed whatever the client does
+//! (on macOS loopback, 2-3 MB were taken after the first write had to
+//! wait, which an average would have turned into most of a minute of
+//! protection for a client reading 4 KiB a second).
+//! While a newcomer waits at the cap, the accept loop looks again every
+//! [`ROOM_RETRY`], since writers fall behind and requests finish without
+//! freeing a slot. An optional `response_timeout` bounds a whole response
+//! write regardless of rate.
 
 use std::borrow::Cow;
 use std::cell::RefCell;
@@ -100,6 +116,9 @@ const BUSY_RETRY_AFTER_SECS: &str = "1";
 /// refusal is sent, so a client without `Expect: 100-continue` finishes
 /// writing and reads the answer instead of hitting a reset.
 const REFUSAL_DRAIN: Duration = Duration::from_millis(200);
+/// How often a newcomer waiting at the connection cap looks again for a
+/// connection that has become evictable.
+const ROOM_RETRY: Duration = Duration::from_millis(100);
 
 type PendingResponse = oneshot::Sender<Response<Full<Bytes>>>;
 
@@ -277,7 +296,15 @@ fn op_serve_listen(
         )),
     };
     let header_timeout = grant.header_timeout;
-    let write_timeout = grant.write_timeout;
+    let rule = WriteRule {
+        grace: grant.body_first_byte,
+        min_rate: grant.body_min_rate,
+    };
+    let writes = WriteLimits {
+        stall: grant.write_timeout,
+        response: grant.response_timeout,
+        rule,
+    };
     let slots = Arc::new(Semaphore::new(grant.max_connections));
     let task_resource = resource.clone();
     let task = deno_core::unsync::spawn(async move {
@@ -286,20 +313,23 @@ fn op_serve_listen(
             // Below the cap: a slot first, then accept. At the cap: wait for
             // a client to actually arrive, then close the connection that
             // has spent longest in its current phase (waiting for a head,
-            // or reading a body) to make room — never one the script is
-            // handling or whose response is being written. Without that,
+            // reading a body, or writing to a reader below the minimum
+            // rate) to make room — never one the script is handling, nor
+            // a response whose reader keeps the rate. Without that,
             // max_connections idle or slow sockets held every slot for the
             // header/body timeouts and the attacker just reconnected. If
-            // every connection is protected, the newcomer waits for a slot
-            // as before.
+            // every connection is protected, the newcomer waits, and the
+            // loop looks again until one is not or a slot frees.
             let (slot, accepted) = match Arc::clone(&slots).try_acquire_owned() {
                 Ok(slot) => (slot, listener.accept().await),
                 Err(_) => {
                     let accepted = listener.accept().await;
-                    if accepted.is_ok() {
-                        conns.evict_longest_in_phase();
-                    }
-                    let Ok(slot) = Arc::clone(&slots).acquire_owned().await else {
+                    let slot = if accepted.is_ok() {
+                        conns.make_room(&slots).await
+                    } else {
+                        Arc::clone(&slots).acquire_owned().await.ok()
+                    };
+                    let Some(slot) = slot else {
                         return;
                     };
                     (slot, accepted)
@@ -328,15 +358,16 @@ fn op_serve_listen(
                             async move {
                                 let answer = answer.await;
                                 // hyper writes the answer next; until that
-                                // write is flushed the connection is not
-                                // evictable (StallGuard::poll_flush clears
-                                // it, write_timeout bounds it).
-                                track.writing.set(true);
+                                // write is flushed the connection is
+                                // protected while its reader keeps the
+                                // rate (StallGuard counts the bytes and
+                                // clears it on flush; write_timeout and
+                                // response_timeout bound it).
+                                track.start_writing(rule);
                                 answer
                             }
                         });
-                        let io =
-                            TokioIo::new(StallGuard::new(stream, write_timeout, Rc::clone(&track)));
+                        let io = TokioIo::new(StallGuard::new(stream, writes, Rc::clone(&track)));
                         let serving = hyper::server::conn::http1::Builder::new()
                             .max_buf_size(HEAD_BUF_MAX)
                             .timer(TokioTimer::new())
@@ -367,25 +398,99 @@ fn op_serve_listen(
     Ok(rid)
 }
 
+/// The rate a reader must keep for the response being written to it to
+/// stay protected from eviction — the body rule's numbers, applied to
+/// writes as a capped credit (see the module docs).
+#[derive(Clone, Copy)]
+struct WriteRule {
+    /// Protection when a write starts, and the most it can bank.
+    grace: Duration,
+    /// Bytes a second the socket must take, on average, to keep it.
+    min_rate: u64,
+}
+
+/// A response being written: when it began, and until when it is
+/// protected from eviction.
+#[derive(Clone, Copy)]
+struct Writing {
+    started: tokio::time::Instant,
+    /// `None` when the grace is too long to add to an `Instant`: then the
+    /// writer is protected for good, as the operator asked.
+    protected_until: Option<tokio::time::Instant>,
+}
+
 /// What the accept loop knows about one live connection.
 struct ConnTrack {
     id: u64,
     /// When the connection's current phase began: it connected, or a
     /// response finished and it is waiting for the next head, or a head
-    /// arrived and its body is being read. A head or a body should arrive
-    /// in one burst, so time spent in a phase is what a client holding a
-    /// slot cannot hide; the time of its last byte is not, since a
-    /// trickler sends one byte at a time to look busy.
+    /// arrived and its body is being read, or its response began to be
+    /// written. A head or a body should arrive in one burst, so time spent
+    /// in a phase is what a client holding a slot cannot hide; the time of
+    /// its last byte is not, since a trickler sends one byte at a time to
+    /// look busy.
     phase_since: std::cell::Cell<tokio::time::Instant>,
     /// Requests on this connection the script is handling right now —
     /// such a connection is never evicted.
     in_script: std::cell::Cell<u32>,
-    /// A response is being written and is not yet flushed — such a
-    /// connection is not evicted either (a client that stops reading is
-    /// dropped by `write_timeout` instead).
-    writing: std::cell::Cell<bool>,
+    /// The response being written and not yet flushed, if any. It is
+    /// protected while its reader keeps the [`WriteRule`] (a client that
+    /// stops reading is dropped by `write_timeout`).
+    writing: std::cell::Cell<Option<Writing>>,
     /// Fired to close the connection when it is evicted.
     evict: RefCell<Option<oneshot::Sender<()>>>,
+}
+
+impl ConnTrack {
+    /// The script's answer is built; hyper writes it next.
+    fn start_writing(&self, rule: WriteRule) {
+        let now = tokio::time::Instant::now();
+        self.writing.set(Some(Writing {
+            started: now,
+            protected_until: now.checked_add(rule.grace),
+        }));
+        self.phase_since.set(now);
+    }
+
+    /// The socket took `n` bytes of the response: they extend the
+    /// protection by `n / min_rate` seconds, to at most `grace` from now.
+    fn wrote(&self, n: usize, rule: WriteRule) {
+        let Some(mut w) = self.writing.get() else {
+            return;
+        };
+        let Some(until) = w.protected_until else {
+            return;
+        };
+        let now = tokio::time::Instant::now();
+        let credit = Duration::try_from_secs_f64(n as f64 / rule.min_rate as f64)
+            .unwrap_or(rule.grace)
+            .min(rule.grace);
+        let ceiling = now.checked_add(rule.grace);
+        w.protected_until = until
+            .max(now)
+            .checked_add(credit)
+            .zip(ceiling)
+            .map(|(extended, ceiling)| extended.min(ceiling));
+        self.writing.set(Some(w));
+    }
+
+    /// The response is out: the connection waits for its next head.
+    fn finish_writing(&self) {
+        if self.writing.take().is_some() {
+            self.phase_since.set(tokio::time::Instant::now());
+        }
+    }
+
+    /// Whether a newcomer at the cap may close this connection.
+    fn evictable(&self, now: tokio::time::Instant) -> bool {
+        if self.in_script.get() > 0 || self.evict.borrow().is_none() {
+            return false;
+        }
+        match self.writing.get() {
+            None => true,
+            Some(w) => w.protected_until.is_some_and(|until| now >= until),
+        }
+    }
 }
 
 /// Live connections of one listener, for eviction at the cap. Single
@@ -405,7 +510,7 @@ impl Connections {
             id,
             phase_since: std::cell::Cell::new(tokio::time::Instant::now()),
             in_script: std::cell::Cell::new(0),
-            writing: std::cell::Cell::new(false),
+            writing: std::cell::Cell::new(None),
             evict: RefCell::new(Some(tx)),
         });
         self.live.borrow_mut().insert(id, Rc::clone(&track));
@@ -416,25 +521,42 @@ impl Connections {
         self.live.borrow_mut().remove(&id);
     }
 
-    /// Close the connection that has been in its current phase longest,
-    /// among those with no request in the script and no response being
-    /// written. Returns whether one was found.
-    fn evict_longest_in_phase(&self) -> bool {
+    /// Close the evictable connection that has been in its current phase
+    /// longest. Returns its id, if there was one.
+    fn evict_longest_in_phase(&self) -> Option<u64> {
+        let now = tokio::time::Instant::now();
         let victim = self
             .live
             .borrow()
             .values()
-            .filter(|c| c.in_script.get() == 0 && !c.writing.get() && c.evict.borrow().is_some())
+            .filter(|c| c.evictable(now))
             .min_by_key(|c| c.phase_since.get())
-            .cloned();
-        match victim {
-            Some(conn) => {
-                if let Some(tx) = conn.evict.borrow_mut().take() {
-                    let _ = tx.send(());
-                }
-                true
+            .cloned()?;
+        if let Some(tx) = victim.evict.borrow_mut().take() {
+            let _ = tx.send(());
+        }
+        Some(victim.id)
+    }
+
+    /// A slot for a newcomer at the cap. Closes one evictable connection
+    /// at a time, and while none is, looks again every [`ROOM_RETRY`]:
+    /// a writer can fall below the rate, and a request can finish and go
+    /// idle, without a slot coming free. `None` when the semaphore closed.
+    async fn make_room(&self, slots: &Arc<Semaphore>) -> Option<OwnedSemaphorePermit> {
+        let acquire = Arc::clone(slots).acquire_owned();
+        tokio::pin!(acquire);
+        let mut closing: Option<u64> = None;
+        loop {
+            // One eviction in flight at a time: the one already asked to
+            // close is about to give its slot back.
+            if closing.is_none_or(|id| !self.live.borrow().contains_key(&id)) {
+                closing = self.evict_longest_in_phase();
             }
-            None => false,
+            tokio::select! {
+                biased;
+                slot = &mut acquire => return slot.ok(),
+                () = tokio::time::sleep(ROOM_RETRY) => {}
+            }
         }
     }
 }
@@ -457,31 +579,75 @@ impl Drop for InScript {
     }
 }
 
+/// The bounds on writing a response.
+#[derive(Clone, Copy)]
+struct WriteLimits {
+    /// Longest a write may make no progress.
+    stall: Duration,
+    /// Longest one response may take to write, if bounded.
+    response: Option<Duration>,
+    /// The rate that keeps a response protected from eviction.
+    rule: WriteRule,
+}
+
 /// A socket whose writes give up when they make no progress for `limit`.
 /// hyper's header timer only runs while it reads a head; once a response
 /// is being written, a peer that stops reading would park the write (and
 /// the connection's slot) forever. The clock starts at the first write
-/// that cannot proceed and resets whenever bytes move.
+/// that cannot proceed and resets whenever bytes move. It also credits the
+/// bytes the socket takes to the eviction rule, and ends a response that
+/// is still being written past the optional response deadline.
 struct StallGuard<T> {
     inner: T,
     limit: Duration,
     stalled: Option<Pin<Box<tokio::time::Sleep>>>,
+    response_limit: Option<Duration>,
+    /// The response deadline, armed for the response that started at the
+    /// instant it is keyed by.
+    response_timer: Option<(tokio::time::Instant, Pin<Box<tokio::time::Sleep>>)>,
+    rule: WriteRule,
     /// A completed flush ends a response's write: the connection is
     /// evictable again and starts waiting for its next head.
     track: Rc<ConnTrack>,
 }
 
 impl<T> StallGuard<T> {
-    fn new(inner: T, limit: Duration, track: Rc<ConnTrack>) -> Self {
+    fn new(inner: T, limits: WriteLimits, track: Rc<ConnTrack>) -> Self {
         Self {
             inner,
-            limit,
+            limit: limits.stall,
             stalled: None,
+            response_limit: limits.response,
+            response_timer: None,
+            rule: limits.rule,
             track,
         }
     }
 
-    /// Map a pending write-side poll onto the stall clock.
+    /// Whether the response being written is past its deadline. Polls the
+    /// deadline's timer, so a waiting write is woken when it passes.
+    fn response_overdue(&mut self, cx: &mut Context<'_>) -> bool {
+        let (Some(limit), Some(writing)) = (self.response_limit, self.track.writing.get()) else {
+            return false;
+        };
+        let Some(deadline) = writing.started.checked_add(limit) else {
+            return false;
+        };
+        let timer = match &mut self.response_timer {
+            Some((started, timer)) if *started == writing.started => timer,
+            slot => {
+                let (_, timer) = slot.insert((
+                    writing.started,
+                    Box::pin(tokio::time::sleep_until(deadline)),
+                ));
+                timer
+            }
+        };
+        timer.as_mut().poll(cx).is_ready()
+    }
+
+    /// Map a pending write-side poll onto the stall clock, the rate clock
+    /// and the response deadline.
     fn watch<R>(&mut self, cx: &mut Context<'_>, poll: Poll<io::Result<R>>) -> Poll<io::Result<R>> {
         match poll {
             Poll::Ready(r) => {
@@ -489,6 +655,13 @@ impl<T> StallGuard<T> {
                 Poll::Ready(r)
             }
             Poll::Pending => {
+                if self.response_overdue(cx) {
+                    self.response_timer = None;
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "response not written within the response timeout",
+                    )));
+                }
                 let limit = self.limit;
                 let timer = self
                     .stalled
@@ -524,6 +697,9 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for StallGuard<T> {
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         let poll = Pin::new(&mut self.inner).poll_write(cx, buf);
+        if let Poll::Ready(Ok(n)) = poll {
+            self.track.wrote(n, self.rule);
+        }
         self.watch(cx, poll)
     }
 
@@ -533,6 +709,9 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for StallGuard<T> {
         bufs: &[io::IoSlice<'_>],
     ) -> Poll<io::Result<usize>> {
         let poll = Pin::new(&mut self.inner).poll_write_vectored(cx, bufs);
+        if let Poll::Ready(Ok(n)) = poll {
+            self.track.wrote(n, self.rule);
+        }
         self.watch(cx, poll)
     }
 
@@ -544,8 +723,9 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for StallGuard<T> {
         let poll = Pin::new(&mut self.inner).poll_flush(cx);
         // hyper flushes the socket only once its own write buffer is empty,
         // so a completed flush means the response is out.
-        if matches!(poll, Poll::Ready(Ok(()))) && self.track.writing.replace(false) {
-            self.track.phase_since.set(tokio::time::Instant::now());
+        if matches!(poll, Poll::Ready(Ok(()))) {
+            self.track.finish_writing();
+            self.response_timer = None;
         }
         self.watch(cx, poll)
     }
