@@ -10,6 +10,8 @@
 //! Output is one JSON object on stdout — machine-readable so
 //! perf/results/ artifacts carry the numbers, not a screenshot.
 
+#![forbid(unsafe_code)]
+
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
