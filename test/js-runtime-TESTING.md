@@ -142,7 +142,7 @@ Exit-code contract (don't collapse these):
 
 ## How to report a bug
 
-Send Vinay (`akira-shirase-oss` / @404humandev) a note, or open a GitHub issue, including:
+Send a note to `akira-shirase-oss` (@404humandev), or open a GitHub issue, including:
 
 - Commit SHA (`git rev-parse HEAD`) and `jsrt --version` if it printed one.
 - OS, `rustc --version`.
