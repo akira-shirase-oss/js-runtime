@@ -63,6 +63,11 @@ struct RunArgs {
     /// Per-fetch deadline in milliseconds (0 = the built-in 10s bound).
     #[arg(long, default_value_t = 0)]
     fetch_timeout: u64,
+    /// V8 heap ceiling in MiB (0 = V8's default). Reaching it, or V8's
+    /// default, ends the run with exit 6. The JavaScript heap only:
+    /// ArrayBuffer memory is outside it; `supervise --max-rss-mb` bounds all.
+    #[arg(long, default_value_t = 0)]
+    max_heap_mb: u64,
 }
 
 impl RunArgs {
@@ -95,6 +100,7 @@ impl RunArgs {
             v.extend(["--serve".into(), serve.clone()]);
         }
         v.extend(["--fetch-timeout".into(), self.fetch_timeout.to_string()]);
+        v.extend(["--max-heap-mb".into(), self.max_heap_mb.to_string()]);
         v
     }
 }
@@ -210,6 +216,12 @@ async fn execute(run: RunArgs) -> Result<(), HostError> {
         // doesn't unwind in 2s the process exits with the same code.
         terminate_grace: (run.timeout > 0).then(|| Duration::from_secs(2)),
         fetch_deadline: (run.fetch_timeout > 0).then(|| Duration::from_millis(run.fetch_timeout)),
+        max_heap: (run.max_heap_mb > 0)
+            .then(|| usize::try_from(run.max_heap_mb.saturating_mul(1024 * 1024)))
+            .transpose()
+            .map_err(|_| {
+                HostError::Host(format!("--max-heap-mb {} is too large", run.max_heap_mb))
+            })?,
     };
     jsrt_host::run_file(&run.file, &options).await
 }

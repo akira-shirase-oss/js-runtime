@@ -300,3 +300,36 @@ fn a_thousand_parallel_fetches_keep_in_flight_under_the_cap() {
         "{peak} requests were in flight at once; the cap is {FETCH_MAX_IN_FLIGHT}"
     );
 }
+
+// ---- Memory: the V8 heap has a limit that ends a run, not the process ------
+
+#[test]
+fn an_allocation_bomb_under_jsrt_run_ends_classified_at_the_heap_limit() {
+    let rig = Rig::new();
+    let script = rig.script(
+        "bomb.js",
+        "const hoard = [];\n\
+         while (true) { hoard.push(new Array(100000).fill({ x: hoard.length })); }\n",
+    );
+    let started = std::time::Instant::now();
+    let out = rig.run_script(&script, &["--max-heap-mb", "64", "--timeout", "60000"]);
+    let took = started.elapsed();
+    // A V8 out-of-memory abort is a signal (SIGTRAP or SIGABRT), not an
+    // exit code; the host must end the run itself and say why.
+    assert_eq!(
+        out.status.code(),
+        Some(6),
+        "status {:?} after {took:?}, stderr: {}",
+        out.status,
+        stderr(&out)
+    );
+    assert!(
+        stderr(&out).contains("heap limit"),
+        "stderr: {}",
+        stderr(&out)
+    );
+    assert!(
+        took < std::time::Duration::from_secs(30),
+        "the heap limit, not the run timeout, ended it: {took:?}"
+    );
+}

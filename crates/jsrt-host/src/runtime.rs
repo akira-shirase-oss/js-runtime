@@ -5,9 +5,15 @@
 //! CPU-bound script — the executor thread is blocked inside the poll. The
 //! watchdog instead calls `IsolateHandle::terminate_execution()` from a
 //! separate thread, which interrupts running JS *and* stalls the event loop.
-//! A second `tokio::timeout` backstops a fully-idle loop. Memory bombs need a
-//! process boundary — that's the supervisor milestone, documented in ROADMAP,
-//! not claimed here.
+//! A second `tokio::timeout` backstops a fully-idle loop.
+//!
+//! The V8 heap gets the same treatment: a near-heap-limit callback
+//! terminates the isolate when the heap reaches its ceiling (`max_heap`, or
+//! V8's default), so a runaway allocation ends the run as `Terminated`
+//! instead of a V8 out-of-memory abort (a signal, no exit code). That
+//! bounds the JavaScript heap only; `ArrayBuffer` backing stores and host
+//! buffers are outside it, so memory as a whole is still a process-boundary
+//! problem — the supervisor's RSS budget, documented in ROADMAP.
 
 use std::path::Path;
 use std::rc::Rc;
@@ -44,6 +50,13 @@ pub struct HostOptions {
     /// Per-fetch deadline. `None` uses the built-in 10s bound — a script may
     /// never hold a network op open longer than this.
     pub fetch_deadline: Option<Duration>,
+    /// Ceiling for the V8 heap in bytes. `None` keeps V8's own default.
+    /// Either way, reaching it ends the run as `Terminated` (exit 6)
+    /// instead of letting V8 abort the process. It bounds the JavaScript
+    /// heap only: `ArrayBuffer` backing stores and host-side buffers live
+    /// outside it, which is why `jsrt supervise --max-rss-mb` stays the
+    /// memory boundary.
+    pub max_heap: Option<usize>,
 }
 
 /// What a run left behind when it ended, counted from the activity tracker
@@ -63,6 +76,21 @@ pub struct RunReport {
     pub result: Result<(), HostError>,
     pub pending: PendingCounts,
 }
+
+/// Why the host stopped the isolate, if it did — set by the watchdog
+/// thread or the heap callback, read by [`classify`].
+#[derive(Debug, Default)]
+pub(crate) struct Stopped {
+    by_timeout: AtomicBool,
+    by_heap: AtomicBool,
+}
+
+/// Heap granted past the limit, each time V8 reaches it after the
+/// isolate was told to terminate, so the unwinding has room to finish.
+const HEAP_UNWIND_HEADROOM: usize = 32 * 1024 * 1024;
+/// How many times that headroom is granted. Past it V8 is left to abort:
+/// a run that cannot unwind after this much has nothing left to save.
+const HEAP_UNWIND_GRANTS: u32 = 4;
 
 /// Count pending JS-visible activity just before the isolate drops.
 fn pending_counts(runtime: &JsRuntime) -> PendingCounts {
@@ -89,6 +117,7 @@ impl Default for HostOptions {
             timeout: Some(Duration::from_secs(10)),
             terminate_grace: None,
             fetch_deadline: None,
+            max_heap: None,
         }
     }
 }
@@ -99,15 +128,35 @@ impl Default for HostOptions {
 /// *JavaScript modules only* for the loader. The operator chose this
 /// program, so its local module graph is program-space; text/bytes/JSON
 /// imports and every op still see only the manifest's grants.
-fn build_runtime(options: &HostOptions, entry_dir: Option<&Path>) -> JsRuntime {
+fn build_runtime(options: &HostOptions, entry_dir: Option<&Path>) -> (JsRuntime, Arc<Stopped>) {
     let entry_dir = entry_dir.and_then(|d| d.canonicalize().ok());
-    let runtime = JsRuntime::new(RuntimeOptions {
+    let mut runtime = JsRuntime::new(RuntimeOptions {
         module_loader: Some(crate::module_loader::gated_loader(
             &options.capabilities,
             entry_dir,
         )),
         extensions: vec![jsrt_core::init(), crate::serve::jsrt_serve::init()],
+        create_params: options
+            .max_heap
+            .map(|max| deno_core::v8::CreateParams::default().heap_limits(0, max)),
         ..Default::default()
+    });
+    let stopped = Arc::new(Stopped::default());
+    // At the heap ceiling: terminate the isolate and give it a little room
+    // to unwind. V8 calls this again if the unwinding allocates up to the
+    // new limit; after HEAP_UNWIND_GRANTS the limit stays and V8 aborts.
+    let handle = runtime.v8_isolate().thread_safe_handle();
+    let heap_stop = Arc::clone(&stopped);
+    let mut grants = 0u32;
+    runtime.add_near_heap_limit_callback(move |current, _initial| {
+        if !heap_stop.by_heap.swap(true, Ordering::SeqCst) {
+            handle.terminate_execution();
+        }
+        if grants >= HEAP_UNWIND_GRANTS {
+            return current;
+        }
+        grants += 1;
+        current.saturating_add(HEAP_UNWIND_HEADROOM)
     });
     let state = runtime.op_state();
     {
@@ -139,7 +188,7 @@ fn build_runtime(options: &HostOptions, entry_dir: Option<&Path>) -> JsRuntime {
             state.put(Rc::new(grant));
         }
     }
-    runtime
+    (runtime, stopped)
 }
 
 /// Run an ES module file to completion: evaluate it, drive the event loop
@@ -173,22 +222,23 @@ pub async fn run_file_report(entry: &Path, options: &HostOptions) -> RunReport {
         }
     };
 
-    let mut runtime = build_runtime(options, entry.parent());
+    let (mut runtime, stopped) = build_runtime(options, entry.parent());
     let done = Arc::new(AtomicBool::new(false));
-    let terminated = spawn_watchdog(
+    spawn_watchdog(
         &mut runtime,
         options.timeout,
         options.terminate_grace,
         Arc::clone(&done),
+        Arc::clone(&stopped),
     );
 
     let result = async {
         let module_id = runtime
             .load_main_es_module(&specifier)
             .await
-            .map_err(|e| classify(&e, &terminated))?;
+            .map_err(|e| classify(&e, &stopped))?;
         let evaluation = runtime.mod_evaluate(module_id);
-        drive(&mut runtime, evaluation, options.timeout, terminated).await
+        drive(&mut runtime, evaluation, options.timeout, &stopped).await
     }
     .await;
     // Whatever the outcome, the run is over — the watchdog must not fire into
@@ -221,21 +271,22 @@ pub async fn run_source_report(name: &str, source: &str, options: &HostOptions) 
     };
     // An embedded run is "as if" run from cwd — same entry-dir convention.
     let cwd = std::env::current_dir().unwrap_or_else(|_| Path::new(".").to_path_buf());
-    let mut runtime = build_runtime(options, Some(cwd.as_path()));
+    let (mut runtime, stopped) = build_runtime(options, Some(cwd.as_path()));
     let done = Arc::new(AtomicBool::new(false));
-    let terminated = spawn_watchdog(
+    spawn_watchdog(
         &mut runtime,
         options.timeout,
         options.terminate_grace,
         Arc::clone(&done),
+        Arc::clone(&stopped),
     );
     let result = async {
         let module_id = runtime
             .load_main_es_module_from_code(&specifier, source.to_string())
             .await
-            .map_err(|e| classify(&e, &terminated))?;
+            .map_err(|e| classify(&e, &stopped))?;
         let evaluation = runtime.mod_evaluate(module_id);
-        drive(&mut runtime, evaluation, options.timeout, terminated).await
+        drive(&mut runtime, evaluation, options.timeout, &stopped).await
     }
     .await;
     done.store(true, Ordering::SeqCst);
@@ -246,7 +297,7 @@ pub async fn run_source_report(name: &str, source: &str, options: &HostOptions) 
     RunReport { result, pending }
 }
 
-/// Spawn the termination watchdog and return the flag it sets when it fires.
+/// Spawn the termination watchdog; it records in `stopped` when it fires.
 /// `terminate_execution` is the only mechanism that stops JS *while it runs
 /// on this isolate* — a `select!`-style cancel can never see a `while(1){}`.
 /// Stage two, when `terminate_grace` is set: a parked event loop has no JS to
@@ -258,17 +309,16 @@ fn spawn_watchdog(
     timeout: Option<Duration>,
     terminate_grace: Option<Duration>,
     done: Arc<AtomicBool>,
-) -> Arc<AtomicBool> {
-    let fired = Arc::new(AtomicBool::new(false));
+    stopped: Arc<Stopped>,
+) {
     if let Some(deadline) = timeout {
         let handle = runtime.v8_isolate().thread_safe_handle();
-        let fired_thread = Arc::clone(&fired);
         std::thread::spawn(move || {
             std::thread::sleep(deadline);
             if done.load(Ordering::SeqCst) {
                 return;
             }
-            fired_thread.store(true, Ordering::SeqCst);
+            stopped.by_timeout.store(true, Ordering::SeqCst);
             handle.terminate_execution();
             if let Some(grace) = terminate_grace {
                 std::thread::sleep(grace);
@@ -282,7 +332,6 @@ fn spawn_watchdog(
             }
         });
     }
-    fired
 }
 
 /// Drive the event loop and the evaluation future to settlement, with a
@@ -291,13 +340,13 @@ async fn drive(
     runtime: &mut JsRuntime,
     evaluation: impl std::future::Future<Output = Result<(), deno_core::error::CoreError>>,
     timeout: Option<Duration>,
-    terminated: Arc<AtomicBool>,
+    stopped: &Stopped,
 ) -> Result<(), HostError> {
     let deadline = timeout.map(|t| t + Duration::from_secs(2));
     let options = PollEventLoopOptions::default();
     let loop_result = match deadline {
         Some(d) => match tokio::time::timeout(d, runtime.run_event_loop(options)).await {
-            Ok(r) => r.map_err(|e| classify(&e, &terminated)),
+            Ok(r) => r.map_err(|e| classify(&e, stopped)),
             Err(_) => Err(HostError::Terminated(
                 "event loop did not settle within deadline".into(),
             )),
@@ -305,9 +354,9 @@ async fn drive(
         None => runtime
             .run_event_loop(options)
             .await
-            .map_err(|e| classify(&e, &terminated)),
+            .map_err(|e| classify(&e, stopped)),
     };
-    let eval_result = evaluation.await.map_err(|e| classify(&e, &terminated));
+    let eval_result = evaluation.await.map_err(|e| classify(&e, stopped));
     match (loop_result, eval_result) {
         // Termination beats whatever the script was doing when it died.
         (Err(HostError::Terminated(m)), _) | (_, Err(HostError::Terminated(m))) => {
@@ -320,8 +369,11 @@ async fn drive(
 
 /// The classifier every host error flows through. Order matters: an isolate
 /// that was terminated reports its own death first.
-fn classify(err: &deno_core::error::CoreError, terminated: &AtomicBool) -> HostError {
-    if terminated.load(Ordering::SeqCst) {
+fn classify(err: &deno_core::error::CoreError, stopped: &Stopped) -> HostError {
+    if stopped.by_heap.load(Ordering::SeqCst) {
+        return HostError::Terminated("execution terminated at the V8 heap limit".into());
+    }
+    if stopped.by_timeout.load(Ordering::SeqCst) {
         return HostError::Terminated("execution terminated by timeout watchdog".into());
     }
     match err.as_kind() {
@@ -388,12 +440,12 @@ mod tests {
         let options = super::HostOptions::default();
         let specifier = ModuleSpecifier::from_file_path(dir.path().join("main.js"))
             .unwrap_or_else(|e| panic!("specifier: {e:?}"));
-        let mut runtime = super::build_runtime(&options, Some(dir.path()));
+        let (mut runtime, stopped) = super::build_runtime(&options, Some(dir.path()));
         let err = match runtime.load_main_es_module(&specifier).await {
             Err(e) => e,
             Ok(_) => panic!("must fail"),
         };
-        let classified = super::classify(&err, &std::sync::atomic::AtomicBool::new(false));
+        let classified = super::classify(&err, &stopped);
         assert!(
             matches!(classified, super::HostError::Syntax(_)),
             "expected Syntax, got {classified:?}"
@@ -419,7 +471,7 @@ mod tests {
             capabilities,
             ..Default::default()
         };
-        let mut runtime = super::build_runtime(&options, None);
+        let (mut runtime, _stopped) = super::build_runtime(&options, None);
         let first = (1u64 << 32) + 5;
         runtime
             .op_state()
