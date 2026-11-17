@@ -1012,12 +1012,30 @@ fn an_import_outside_the_entry_dir_is_a_capability_refusal() {
 #[test]
 fn a_missing_import_still_classifies_as_load_not_capability() {
     let (rig, app) = app_rig();
-    // Missing: canonicalize fails → the gate passes it to the loader, which
+    // Missing inside the fence: the gate passes it to the loader, which
     // reports a real Load error (3) — we do not turn absence into a refusal.
-    let script = rig.script_at(&app.join("main.js"), "import '../nope.js';\n");
+    let script = rig.script_at(&app.join("main.js"), "import './nope.js';\n");
     let out = rig.run_script(&script, &[]);
     assert_eq!(code(&out), 3, "stderr: {}", stderr(&out));
     assert!(stderr(&out).contains("nope.js"), "stderr: {}", stderr(&out));
+}
+
+#[test]
+fn a_missing_import_outside_the_fence_is_refused_like_an_existing_one() {
+    let (rig, app) = app_rig();
+    fs::write(rig.dir.path().join("there.js"), "export default 1;\n")
+        .unwrap_or_else(|e| panic!("write: {e}"));
+    // Outside the fence the answer must not depend on whether the file is
+    // there, or a script could map the host's files: both are refused (7)
+    // in the same words, before the filesystem is asked.
+    let mut refusals = Vec::new();
+    for name in ["there.js", "nope.js"] {
+        let script = rig.script_at(&app.join("main.js"), &format!("import '../{name}';\n"));
+        let out = rig.run_script(&script, &[]);
+        assert_eq!(code(&out), 7, "{name}: stderr: {}", stderr(&out));
+        refusals.push(stderr(&out).replace(name, "<asked>"));
+    }
+    assert_eq!(refusals[0], refusals[1]);
 }
 
 #[test]

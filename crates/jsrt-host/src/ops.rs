@@ -450,23 +450,16 @@ fn op_media_put(
     let caps = capabilities(&state)?;
     let grant = media_grant(&state)?;
     // Reading requires a read grant — media never bypasses that gate. The
-    // check is is_read_allowed, NOT may_read: may_read's 4 MiB cap is a
+    // check is `locate`, NOT may_read: may_read's 4 MiB cap is a
     // materialization limit for readText, and this op never materializes.
-    let resolved = std::fs::canonicalize(&src).map_err(|e| {
-        JsErrorBox::new(
-            "CapabilityError",
-            format!("read denied: {src} does not resolve ({e})"),
-        )
-    })?;
     // Messages name `src`, the path the script gave: never the canonical
     // path, which would show where the host's files live and where a link
-    // points.
-    if !caps.is_read_allowed(&resolved) {
-        return Err(JsErrorBox::new(
-            "CapabilityError",
-            format!("read denied: {src} resolves outside every declared read path"),
-        ));
-    }
+    // points; and every refusal reads the same, so none says whether
+    // something exists outside the grant.
+    let resolved = match caps.locate(std::path::Path::new(&src)) {
+        crate::capability::Located::Found(resolved) => resolved,
+        _ => return Err(deny(crate::capability::read_refusal(&src))),
+    };
     let mut input = std::fs::File::open(&resolved)
         .map_err(|e| host_err(format!("media put: open {src}: {e}")))?;
 

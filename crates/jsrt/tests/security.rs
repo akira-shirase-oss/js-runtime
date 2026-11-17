@@ -468,3 +468,87 @@ fn a_heap_limit_below_the_floor_is_refused_and_the_floor_works() {
         stderr(&out).lines().take(5).collect::<Vec<_>>().join("\n")
     );
 }
+
+// ---- A script without a grant cannot tell which host paths exist ----------
+
+#[test]
+fn a_script_without_a_read_grant_cannot_tell_which_host_paths_exist() {
+    let rig = Rig::new();
+    let outside = rig.path("outside");
+    let app = rig.path("app");
+    for d in [&outside, &app, &app.join("media")] {
+        fs::create_dir(d).unwrap_or_else(|e| panic!("mkdir {}: {e}", d.display()));
+    }
+    fs::write(outside.join("present.txt"), "here").unwrap_or_else(|e| panic!("write: {e}"));
+    fs::write(outside.join("present.js"), "export default 1;\n")
+        .unwrap_or_else(|e| panic!("write: {e}"));
+    // A media store but no read grant: media.put has to refuse its source.
+    let manifest = rig.script(
+        "app/m.manifest.json",
+        "{ \"media\": { \"backend\": \"local\", \"root\": \"media/\" } }\n",
+    );
+    let outside = outside.to_string_lossy().into_owned();
+    // Pairs that differ only in whether the path exists: a file this test
+    // made and its missing sibling, a relative spelling of both, and a
+    // system file next to a name that is not there.
+    let pairs = [
+        (
+            format!("{outside}/present.txt"),
+            format!("{outside}/absent.txt"),
+        ),
+        (
+            format!("{outside}/present.js"),
+            format!("{outside}/absent.js"),
+        ),
+        (
+            "../outside/present.js".to_string(),
+            "../outside/absent.js".to_string(),
+        ),
+        (
+            "/etc/hosts".to_string(),
+            "/etc/jsrt-no-such-file".to_string(),
+        ),
+    ];
+    let list = pairs
+        .iter()
+        .map(|(a, b)| format!("[{a:?}, {b:?}]"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    rig.script(
+        "app/oracle.js",
+        &format!(
+            "const probes = [\n\
+               ['readText', (p) => rt.readText(p)],\n\
+               ['media.put', (p) => rt.media.put(p)],\n\
+               ['resolve', (p) => import.meta.resolve(p)],\n\
+               ['import', (p) => import(p)],\n\
+             ];\n\
+             const outcome = async (probe, p) => {{\n\
+               try {{ await probe(p); return 'allowed'; }}\n\
+               catch (e) {{ return e.name + ': ' + String(e.message).replaceAll(p, '<asked>'); }}\n\
+             }};\n\
+             for (const [present, absent] of [{list}]) {{\n\
+               for (const [name, probe] of probes) {{\n\
+                 const a = await outcome(probe, present);\n\
+                 const b = await outcome(probe, absent);\n\
+                 rt.print((a === b ? 'same ' : 'DIFFERENT ') + name + ' ' + present + ' => ' + a + ' | ' + b + '\\n');\n\
+               }}\n\
+             }}\n"
+        ),
+    );
+    // Relative readText and media paths resolve against the working
+    // directory, imports against the module: run from app/ so that
+    // `../outside/...` names the same files for both.
+    let out = Command::new(JSRT)
+        .args(["run", "oracle.js", "--manifest", arg(&manifest)])
+        .current_dir(&app)
+        .output()
+        .unwrap_or_else(|e| panic!("spawn jsrt: {e}"));
+    assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
+    let seen = stdout(&out);
+    assert_eq!(seen.lines().count(), pairs.len() * 4, "{seen}");
+    for line in seen.lines() {
+        assert!(line.starts_with("same "), "an existence oracle: {line}");
+        assert!(!line.contains("allowed"), "{line}");
+    }
+}

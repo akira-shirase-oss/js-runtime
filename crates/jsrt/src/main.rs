@@ -268,10 +268,9 @@ fn merge_cli_grants(caps: Capabilities, flags: CliGrants) -> Result<Capabilities
     }
     let mut merged = caps.into_grants();
     for dir in &flags.read {
-        let resolved = std::fs::canonicalize(dir).map_err(|e| {
+        merged.add_read_root(dir).map_err(|e| {
             HostError::Host(format!("--read {} does not resolve: {e}", dir.display()))
         })?;
-        merged.read_paths.push(resolved);
     }
     merged.net_hosts.extend(flags.net);
     merged.net_private.extend(flags.net_private);

@@ -147,7 +147,6 @@ impl Default for HostOptions {
 /// program, so its local module graph is program-space; text/bytes/JSON
 /// imports and every op still see only the manifest's grants.
 fn build_runtime(options: &HostOptions, entry_dir: Option<&Path>) -> (JsRuntime, Arc<Stopped>) {
-    let entry_dir = entry_dir.and_then(|d| d.canonicalize().ok());
     let mut runtime = JsRuntime::new(RuntimeOptions {
         module_loader: Some(crate::module_loader::gated_loader(
             &options.capabilities,
