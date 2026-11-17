@@ -20,11 +20,16 @@ RESULTS = ROOT / "perf" / "results"
 
 DURATION_S = int(sys.argv[2]) if len(sys.argv) > 2 else 3600
 SAMPLE_EVERY_S = 60
-SERVE_PORT = 9410
+SERVE_PORT = 47410  # jsrt's laptop band is 47400-47499; soak.js carries the same literal
 
 
 def sysctl(key):
     return subprocess.run(["sysctl", "-n", key], capture_output=True, text=True).stdout.strip()
+
+
+def loadavg() -> list[float]:
+    raw = subprocess.run(["sysctl", "-n", "vm.loadavg"], capture_output=True, text=True).stdout
+    return [float(x) for x in raw.strip().strip("{}").split()]
 
 
 def rss_bytes(pid: int) -> int | None:
@@ -41,6 +46,7 @@ def main() -> None:
                             capture_output=True, text=True, cwd=ROOT).stdout.strip()
     if not BIN.exists():
         sys.exit("release binary missing — cargo build --release -p jsrt")
+    load_before = loadavg()
 
     serve = subprocess.Popen(
         [str(BIN), "run", str(SCRIPTS / "serve-load.js"),
@@ -81,6 +87,7 @@ def main() -> None:
                 "soak_rss": rss_bytes(soak.pid),
                 "serve_rss": rss_bytes(serve.pid),
                 "soak_alive": soak.poll() is None,
+                "loadavg": loadavg(),
             })
             if soak.poll() is not None:
                 break
@@ -120,6 +127,8 @@ def main() -> None:
         "status_reports": reports,
         "last_status": reports[-1] if reports else None,
         "soak_exit": soak.returncode,
+        "loadavg_before": load_before,
+        "loadavg_after": loadavg(),
         "caveats": [
             "RSS sampled via ps once/min — coarse, drift is the signal not the level",
             "interval churn reschedules continuously; a cancel-path leak shows as pending growth in last_status",

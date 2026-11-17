@@ -46,7 +46,7 @@ async function tick() {
 		try {
 			// rt.fetch returns {status, body, bytes, ...} — the body is
 			// already the capped, materialized string.
-			const r = await rt.fetch("http://127.0.0.1:9410/");
+			const r = await rt.fetch("http://127.0.0.1:47410/");
 			if (r.status !== 200) fetchErrors++; else fetches++;
 		} catch (e) {
 			fetchErrors++;

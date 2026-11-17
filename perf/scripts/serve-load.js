@@ -2,7 +2,7 @@
 // The handler is deliberately trivial: a fixed 200 + short body, so the
 // measurement is the serve path (wire -> dispatch -> respond), not app
 // work. KV and friends are measured separately.
-const server = rt.serve({ host: "127.0.0.1", port: 9410 }, async () => {
+const server = rt.serve({ host: "127.0.0.1", port: 47410 }, async () => {
 	return { status: 200, body: "ok" };
 });
 
