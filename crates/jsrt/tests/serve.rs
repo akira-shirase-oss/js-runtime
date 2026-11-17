@@ -1595,3 +1595,80 @@ fn at_the_cap_a_trickler_cannot_steer_eviction_onto_a_download_being_written() {
         .unwrap_or_else(|e| panic!("wait: {e}"));
     assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
 }
+
+// ---- The body rate rule applies only to bodies that hold budget ------------
+
+/// Send a POST head, then `body` in `pieces` equal parts `gap` apart, and
+/// read the answer's status and body.
+fn slow_post(port: u16, chunked: bool, body: &[u8], pieces: usize, gap: Duration) -> (u16, String) {
+    let mut s = connect(port);
+    s.set_read_timeout(Some(Duration::from_secs(15)))
+        .unwrap_or_else(|e| panic!("timeout: {e}"));
+    let framing = if chunked {
+        "Transfer-Encoding: chunked".to_string()
+    } else {
+        format!("Content-Length: {}", body.len())
+    };
+    s.write_all(
+        format!(
+            "POST /up HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{framing}\r\nConnection: close\r\n\r\n"
+        )
+        .as_bytes(),
+    )
+    .unwrap_or_else(|e| panic!("write head: {e}"));
+    for piece in body.chunks(body.len().div_ceil(pieces)) {
+        std::thread::sleep(gap);
+        let sent = if chunked {
+            let mut frame = format!("{:x}\r\n", piece.len()).into_bytes();
+            frame.extend_from_slice(piece);
+            frame.extend_from_slice(b"\r\n");
+            s.write_all(&frame)
+        } else {
+            s.write_all(piece)
+        };
+        if sent.is_err() {
+            break; // answered early; read what it said
+        }
+    }
+    if chunked {
+        let _ = s.write_all(b"0\r\n\r\n");
+    }
+    read_response(&mut s).unwrap_or((0, String::new()))
+}
+
+#[test]
+fn a_slow_small_body_gets_the_body_timeout_not_the_rate_deadline() {
+    let rig = Rig::new();
+    let port = Rig::free_port();
+    let child = route_app(
+        &rig,
+        port,
+        ", \"body_first_byte_ms\": 300, \"body_timeout_ms\": 10000",
+        "if (req.path === '/up') return {status: 200, body: 'got ' + req.body.length};",
+    );
+    let gap = Duration::from_millis(250);
+    // 8 KiB in eight pieces over 2 s: inside the free 64 KiB, so it holds
+    // no budget and only body_timeout (10 s) applies. The rate rule (300 ms
+    // plus 8 KiB at 64 KiB/s) would have cut it at about half a second.
+    let small = vec![b's'; 8 * 1024];
+    assert_eq!(
+        slow_post(port, false, &small, 8, gap),
+        (200, "got 8192".to_string()),
+        "declared length"
+    );
+    assert_eq!(
+        slow_post(port, true, &small, 8, gap),
+        (200, "got 8192".to_string()),
+        "chunked"
+    );
+    // A body that reserves budget still has to earn it: 1 MiB declared,
+    // sent in pieces 250 ms apart, falls behind 64 KiB/s and gets 408.
+    let large = vec![b'l'; 1024 * 1024];
+    let (status, _) = slow_post(port, false, &large, 64, gap);
+    assert_eq!(status, 408, "a slow 1 MiB body");
+    quit(port);
+    let out = child
+        .wait_with_output()
+        .unwrap_or_else(|e| panic!("wait: {e}"));
+    assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
+}

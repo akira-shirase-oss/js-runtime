@@ -43,10 +43,18 @@
 //!   without waiting; when none is left it lets go of what it holds and
 //!   is answered 503 with `Retry-After`.
 //!
-//! The cost: a client can hold up to `max_body` of the budget per
-//! connection by declaring a length and sending slowly, until
+//! A body that holds budget has to earn it: from the moment it takes
+//! some, it gets `body_first_byte` to send a byte and must then average
+//! `body_min_rate`, or it is answered 408 and lets go. A body inside the
+//! free share holds no budget, only its connection slot, so only
+//! `body_timeout` bounds it. The cost: a client sending at the minimum
+//! rate keeps up to `max_body` of the budget per connection until
 //! `body_timeout`. Other large uploads get fast 503s meanwhile; small
 //! ones are unaffected.
+//!
+//! At the connection cap a newcomer closes the connection that has been
+//! in its current phase longest — waiting for a head, or reading a body —
+//! never one with a request in the script or a response being written.
 
 use std::borrow::Cow;
 use std::cell::RefCell;
@@ -598,17 +606,29 @@ async fn read_body(
     let mut buf = Vec::with_capacity(
         usize::try_from(declared.map_or(0, |n| n.min(FREE_BODY_BYTES))).unwrap_or(0),
     );
-    // A reservation has to be earned: the first byte within the first-byte
-    // allowance, then on average at least `body_min_rate` bytes a second.
-    // Falling behind is a 408, and dropping `held` gives the budget back.
-    let started = tokio::time::Instant::now();
+    // A reservation has to be earned: from when the body first holds
+    // budget, the first byte within the first-byte allowance, then on
+    // average at least `body_min_rate` bytes a second. Falling behind is a
+    // 408, and dropping `held` gives the budget back. A body that holds no
+    // budget (within the free share) costs only its connection slot, which
+    // eviction can reclaim, so only `body_timeout` (the caller's) bounds it.
+    // The clock: when the budget was taken, and the bytes held by then.
+    let mut rate_clock = held.as_ref().map(|_| (tokio::time::Instant::now(), 0usize));
     loop {
-        let earned = Duration::try_from_secs_f64(buf.len() as f64 / limits.body_min_rate as f64)
-            .unwrap_or(Duration::MAX);
-        let deadline = started
-            .checked_add(limits.body_first_byte.saturating_add(earned))
-            .unwrap_or_else(|| started + limits.body_timeout);
-        let frame = match tokio::time::timeout_at(deadline, body.frame()).await {
+        let next = match rate_clock {
+            Some((since, base)) => {
+                let earned = Duration::try_from_secs_f64(
+                    (buf.len() - base) as f64 / limits.body_min_rate as f64,
+                )
+                .unwrap_or(Duration::MAX);
+                let deadline = since
+                    .checked_add(limits.body_first_byte.saturating_add(earned))
+                    .unwrap_or_else(|| since + limits.body_timeout);
+                tokio::time::timeout_at(deadline, body.frame()).await
+            }
+            None => Ok(body.frame().await),
+        };
+        let frame = match next {
             Err(_) => return Err(BodyFailure::TooSlow),
             Ok(None) => break,
             Ok(Some(frame)) => frame,
@@ -633,7 +653,10 @@ async fn read_body(
                 let more = take_budget(budget, needed - have)?;
                 match &mut held {
                     Some(h) => h.merge(more),
-                    None => held = Some(more),
+                    None => {
+                        held = Some(more);
+                        rate_clock = Some((tokio::time::Instant::now(), buf.len()));
+                    }
                 }
             }
         }
