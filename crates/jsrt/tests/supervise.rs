@@ -116,10 +116,13 @@ fn the_cpu_budget_is_enforced_by_the_kernel() {
 fn the_rss_budget_kills_a_memory_bomb() {
     let rig = Rig::new();
     // 8 MiB chunks in a loop — the footprint climbs past the budget while
-    // the in-process watchdog can only watch.
+    // the in-process watchdog can only watch. Each chunk is written: a
+    // fresh Uint8Array is zero pages nobody has touched, which Linux does
+    // not count as resident, so an unwritten bomb stayed under the budget
+    // on Linux until the worker's own timeout ended it.
     let script = rig.script(
         "bomb.js",
-        "const c = [];\nfor (;;) c.push(new Uint8Array(8 * 1024 * 1024));\n",
+        "const c = [];\nfor (;;) c.push(new Uint8Array(8 * 1024 * 1024).fill(1));\n",
     );
     let out = rig.supervise(
         &script,
