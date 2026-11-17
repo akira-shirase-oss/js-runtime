@@ -1,0 +1,19 @@
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      cargo:
+        patterns: ["*"]
+        # deno_core is pinned exactly and pins V8; an upgrade needs the
+        # sandbox re-check in the README, so it arrives as its own PR.
+        exclude-patterns: ["deno_core"]
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      github-actions:
+        patterns: ["*"]

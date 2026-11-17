@@ -1118,11 +1118,28 @@ fn a_symlink_inside_the_fence_cannot_point_out() {
     let script = rig.script_at(&app.join("main.js"), "import './link.js';\n");
     let out = rig.run_script(&script, &[]);
     assert_eq!(code(&out), 7, "stderr: {}", stderr(&out));
+    // The refusal names what the script asked for, never where the link
+    // points: a script can catch and read it.
     assert!(
-        stderr(&out).contains("target.js"),
+        stderr(&out).contains("./link.js") && !stderr(&out).contains("target.js"),
         "stderr: {}",
         stderr(&out)
     );
+}
+
+#[test]
+fn a_bare_relative_entry_keeps_its_directory_as_program_space() {
+    // `jsrt run main.js`, as the README shows it: the entry's parent is
+    // the empty path, which is the working directory, not "no directory".
+    let rig = Rig::new();
+    rig.script("dep.js", "export const x = 41;\n");
+    rig.script(
+        "main.js",
+        "import { x } from './dep.js';\nrt.print(String(x + 1) + '\\n');\n",
+    );
+    let out = rig.run(&["run", "main.js"]);
+    assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
 }
 
 #[test]

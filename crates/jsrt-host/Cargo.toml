@@ -3,6 +3,7 @@ name = "jsrt-host"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish.workspace = true
 description = "The Rust host behind jsrt: deno_core/V8 execution, capability-gated ops, bounded lifecycle."
 
 [dependencies]

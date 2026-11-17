@@ -184,6 +184,10 @@ pub fn supervise(plan: &SupervisePlan) -> Result<i32, HostError> {
     // moment the poll loop starts. The only uncovered window left is the
     // process's own startup, which no design removes.
     OPERATOR_TERM.store(false, Ordering::SeqCst);
+    // SAFETY: `on_operator_term` is an `extern "C" fn(c_int)`, the handler
+    // type `signal` expects, and it only stores to an AtomicBool, which is
+    // async-signal-safe. Replacing the default SIGTERM/SIGINT disposition
+    // breaks no invariant the rest of the program relies on.
     unsafe {
         if libc::signal(
             libc::SIGTERM,
@@ -231,6 +235,10 @@ pub fn supervise(plan: &SupervisePlan) -> Result<i32, HostError> {
     // the child, so the child cannot decline it. Only CPU is rlimit-able —
     // RLIMIT_AS would stop V8's pointer-cage reservation before boot.
     if let Some(cpu) = plan.max_cpu_secs {
+        // SAFETY: the closure runs in the forked child before exec, where
+        // only async-signal-safe calls are allowed. It builds an `rlimit`
+        // on the stack and calls `setrlimit` (async-signal-safe); the error
+        // path wraps errno without allocating. No locks, no allocation.
         unsafe {
             cmd.pre_exec(move || {
                 let lim = libc::rlimit {
@@ -294,6 +302,10 @@ pub fn supervise(plan: &SupervisePlan) -> Result<i32, HostError> {
             if let Some(budget) = plan.max_rss_bytes {
                 if rss > budget && sigterm_at.is_none() {
                     killed_by = Some(KILLED_BY_RSS);
+                    // SAFETY: `kill` takes plain integers and touches none of our
+                    // memory. `pid` is our own child, not reaped yet (wait4
+                    // reported it running this iteration), so even if it has
+                    // exited it is a zombie and its pid cannot be reused.
                     unsafe { libc::kill(pid, libc::SIGTERM) };
                     sigterm_at = Some(Instant::now());
                 }
@@ -303,6 +315,8 @@ pub fn supervise(plan: &SupervisePlan) -> Result<i32, HostError> {
         if let Some(wall) = plan.wall {
             if started.elapsed() > wall && sigterm_at.is_none() {
                 killed_by = Some(KILLED_BY_WALL);
+                // SAFETY: as for the RSS kill above: plain integers, and
+                // `pid` is our unreaped child.
                 unsafe { libc::kill(pid, libc::SIGTERM) };
                 sigterm_at = Some(Instant::now());
             }
@@ -312,6 +326,8 @@ pub fn supervise(plan: &SupervisePlan) -> Result<i32, HostError> {
         // same path the budgets take.
         if OPERATOR_TERM.load(Ordering::SeqCst) && sigterm_at.is_none() {
             killed_by = Some("operator-sigterm");
+            // SAFETY: as for the RSS kill above: plain integers, and `pid`
+            // is our unreaped child.
             unsafe { libc::kill(pid, libc::SIGTERM) };
             sigterm_at = Some(Instant::now());
         }
@@ -321,6 +337,8 @@ pub fn supervise(plan: &SupervisePlan) -> Result<i32, HostError> {
             if let Some(at) = sigterm_at {
                 if at.elapsed() > plan.kill_grace {
                     sigkill_sent = true;
+                    // SAFETY: as for the RSS kill above: plain integers,
+                    // and `pid` is our unreaped child.
                     unsafe { libc::kill(pid, libc::SIGKILL) };
                 }
             }
@@ -477,7 +495,11 @@ enum Reap {
 /// and the child's peak resource usage.
 fn reap(pid: libc::pid_t) -> Reap {
     let mut status: libc::c_int = 0;
+    // SAFETY: `rusage` is a C struct of integers and `timeval`s, for which
+    // all-zero bytes are a valid value.
     let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    // SAFETY: `status` and `usage` are live, writable locals of exactly the
+    // types `wait4` writes, valid for the whole call.
     let ret = unsafe { libc::wait4(pid, &mut status, libc::WNOHANG, &mut usage) };
     if ret == 0 {
         Reap::Running
@@ -492,7 +514,11 @@ fn reap(pid: libc::pid_t) -> Reap {
 /// Darwin — the same number Activity Monitor shows, not a VM accounting.
 #[cfg(target_os = "macos")]
 fn resident_bytes(pid: libc::pid_t) -> Option<u64> {
+    // SAFETY: `rusage_info_v4` is a C struct of integers, for which
+    // all-zero bytes are a valid value.
     let mut info: libc::rusage_info_v4 = unsafe { std::mem::zeroed() };
+    // SAFETY: `info` is a live, writable `rusage_info_v4`, the struct that
+    // RUSAGE_INFO_V4 asks the kernel to fill, so it writes within it.
     let ret = unsafe {
         libc::proc_pid_rusage(
             pid,

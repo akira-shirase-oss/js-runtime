@@ -21,6 +21,12 @@ use crate::error::HostError;
 pub const FETCH_DEADLINE: Duration = Duration::from_secs(10);
 /// Largest response body `rt.fetch` will materialize.
 pub const FETCH_MAX_BODY: u64 = 4 * 1024 * 1024;
+/// Most fetch exchanges one run has in flight. Later calls wait for a
+/// slot, first come first served, so `Promise.all` over a thousand URLs
+/// still works; what it can no longer do is open a thousand connections
+/// and buffer a thousand bodies at once. Bodies being read are bounded by
+/// this times [`FETCH_MAX_BODY`] (128 MiB at the defaults).
+pub const FETCH_MAX_IN_FLIGHT: usize = 32;
 
 /// Operation budgets a run carries in `OpState` — the knobs a host may tune
 /// without touching the capability law itself.
@@ -75,6 +81,24 @@ fn http_client(state: &Rc<RefCell<OpState>>) -> Result<Rc<reqwest::Client>, JsEr
             None => "http client not installed".into(),
         },
     ))
+}
+
+/// The run's fetch slots, one per exchange in flight; see
+/// [`FETCH_MAX_IN_FLIGHT`].
+pub struct FetchSlots(pub tokio::sync::Semaphore);
+
+impl Default for FetchSlots {
+    fn default() -> Self {
+        Self(tokio::sync::Semaphore::new(FETCH_MAX_IN_FLIGHT))
+    }
+}
+
+fn fetch_slots(state: &Rc<RefCell<OpState>>) -> Result<Rc<FetchSlots>, JsErrorBox> {
+    state
+        .borrow()
+        .try_borrow::<Rc<FetchSlots>>()
+        .cloned()
+        .ok_or_else(|| host_err("fetch slots not installed".into()))
 }
 
 fn budgets(state: &Rc<RefCell<OpState>>) -> OpBudgets {
@@ -140,7 +164,7 @@ async fn op_read_text(
     let resolved = caps.may_read(std::path::Path::new(&path)).map_err(deny)?;
     tokio::fs::read_to_string(&resolved)
         .await
-        .map_err(|e| host_err(format!("read {}: {e}", resolved.display())))
+        .map_err(|e| host_err(format!("read {path}: {e}")))
 }
 
 /// `rt.fetch(url)` — capability-gated, deadline'd, body-capped fetch.
@@ -164,12 +188,21 @@ async fn op_fetch(
     let caps = capabilities(&state)?;
     let client = http_client(&state)?;
     let budgets = budgets(&state);
+    let slots = fetch_slots(&state)?;
     caps.may_net(&url).map_err(deny)?;
     // Every message below names the destination without its userinfo or
     // query string — the places credentials and tokens ride in a URL.
     let shown = crate::net::redact_url(&url);
     let deadline = budgets.fetch_deadline;
     let max_body = budgets.fetch_max_body;
+    // A slot first, held until the body is in hand or the exchange fails.
+    // Waiting for one is not part of the exchange, so the deadline starts
+    // when the slot is granted; the run timeout bounds the wait.
+    let _slot = slots
+        .0
+        .acquire()
+        .await
+        .map_err(|_| host_err("fetch slots closed".into()))?;
     let started = std::time::Instant::now();
     // One deadline over the whole exchange — connect, redirects, headers
     // and every body chunk. A deadline on send() alone let a server that
@@ -233,8 +266,10 @@ impl KvState {
 
     fn conn(&mut self) -> Result<&rusqlite::Connection, JsErrorBox> {
         if self.conn.is_none() {
+            // The script never names the store's path, so its errors
+            // don't either.
             let c = rusqlite::Connection::open(&self.grant.path)
-                .map_err(|e| host_err(format!("kv open {}: {e}", self.grant.path.display())))?;
+                .map_err(|e| host_err(format!("kv open: {e}")))?;
             c.execute_batch("CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT NOT NULL);")
                 .map_err(|e| host_err(format!("kv init: {e}")))?;
             self.conn = Some(c);
@@ -297,8 +332,7 @@ fn op_kv_put(
         return Err(JsErrorBox::new(
             "CapabilityError",
             format!(
-                "kv quota exceeded: {} is {file_bytes}B; this write projects {projected}B over the {}B grant",
-                kv.grant.path.display(),
+                "kv quota exceeded: the store is {file_bytes}B; this write projects {projected}B over the {}B grant",
                 kv.grant.max_bytes
             ),
         ));
@@ -424,17 +458,17 @@ fn op_media_put(
             format!("read denied: {src} does not resolve ({e})"),
         )
     })?;
+    // Messages name `src`, the path the script gave: never the canonical
+    // path, which would show where the host's files live and where a link
+    // points.
     if !caps.is_read_allowed(&resolved) {
         return Err(JsErrorBox::new(
             "CapabilityError",
-            format!(
-                "read denied: {} is outside every declared read path",
-                resolved.display()
-            ),
+            format!("read denied: {src} resolves outside every declared read path"),
         ));
     }
     let mut input = std::fs::File::open(&resolved)
-        .map_err(|e| host_err(format!("media put: open {}: {e}", resolved.display())))?;
+        .map_err(|e| host_err(format!("media put: open {src}: {e}")))?;
 
     // Unique-enough tmp name in the same dir as the destination — rename
     // across a filesystem boundary wouldn't be atomic.
@@ -463,8 +497,7 @@ fn op_media_put(
                 return Err(JsErrorBox::new(
                     "CapabilityError",
                     format!(
-                        "media put: {} exceeds the {}-byte grant",
-                        resolved.display(),
+                        "media put: {src} exceeds the {}-byte grant",
                         grant.max_bytes
                     ),
                 ));

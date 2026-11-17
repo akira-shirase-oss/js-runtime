@@ -25,8 +25,12 @@ the portfolio may depend on it until it is proven.**
 6. **`JsRuntime` is `!Send`** — current-thread executor everywhere (CLI and
    tests). CPU-bound termination goes through `terminate_execution` on a
    watchdog thread; a tokio timeout alone cannot preempt running JS.
-7. **Memory is an OS problem.** In-process flags can't stop allocation bombs
-   — that's what the M4 supervisor is for; don't pretend otherwise.
+7. **Memory is an OS problem.** The near-heap-limit callback ends a V8-heap
+   bomb as exit 6, but `ArrayBuffer` and host memory are outside the V8
+   heap — the M4 supervisor is the memory boundary; don't pretend otherwise.
+8. **Modules are local files.** The loader refuses every non-`file:`
+   specifier; refusal messages a script can read name what it asked for,
+   never canonical host paths.
 
 ## Conventions
 
@@ -53,10 +57,17 @@ the portfolio may depend on it until it is proven.**
 ## Verification gate (run before every commit)
 
 ```
-cargo fmt --all --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
+scripts/check.sh
 ```
+
+It runs, stopping at the first failure: `scripts/check-toolchain.sh`
+(rustc must be the pinned 1.99.1), `cargo fmt --all -- --check`,
+`cargo clippy --workspace --all-targets --locked -- -D warnings`,
+`cargo test --workspace --locked` and `cargo deny --locked check`. CI
+(`.github/workflows/ci.yml`) runs the same script on ubuntu-latest and
+macos-latest. New security behaviour gets its regression test in
+`crates/jsrt/tests/security.rs` (or `serve.rs` for the listener), shown
+failing without the defence before it lands.
 
 Plus, when the CLI changed: the exit-code spot check —
 `jsrt run scripts/hello.js` → 0; missing → 3; bad syntax → 4; thrower → 5.

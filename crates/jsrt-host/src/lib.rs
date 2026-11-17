@@ -6,6 +6,8 @@
 //! real. The `rt.*` namespace scripts see is a thin shim over these ops —
 //! the host is the contract.
 
+#![forbid(unsafe_code)]
+
 pub mod capability;
 pub mod error;
 pub mod module_loader;

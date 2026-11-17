@@ -1,0 +1,7 @@
+# The one Rust toolchain for this repository. Only rustup's proxies honour
+# this file; Homebrew's `cargo` ignores it, so scripts/check-toolchain.sh
+# fails when the compiler on PATH doesn't match.
+[toolchain]
+channel = "1.99.1"
+components = ["clippy", "rustfmt"]
+profile = "minimal"
