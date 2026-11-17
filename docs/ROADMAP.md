@@ -90,6 +90,30 @@ reader keeps the minimum rate, and the accept loop re-checks every 100 ms
 at the cap), the heap callback (1 GiB of headroom the first time) and the
 read-path checks.
 
+**Re-run on the current build (2026-11-17, `f83f39d`).** Every M7 run above
+was repeated at `main` after the security fixes and their review passes,
+release build on the same Apple M2 Pro (12 cores, 32 GB), with the load
+average recorded before and after each run. `f83f39d` is `5ce7564` plus a
+harness-only commit: the load ports moved into jsrt's laptop band
+(47410/47411) and the saturation and webhook runs became scenarios in
+`perf/load.py`. All passed, nothing was rerun.
+
+| Run | `ecbc7dd`/`e2a0099` (2026-11-06) | `f83f39d` (2026-11-17) | Load (1/5/15 min) before → after |
+|---|---|---|---|
+| 7.1 cold start, 1,000 spawns | p50 10.8 / p95 14.4 / p99 28.5 ms, max 138 ms | **p50 9.28 / p95 10.51 / p99 11.35 ms, max 16.4 ms**, 0 failures, peak child RSS 21.4 MB | 4.81/4.88/5.87 → 4.46/4.81/5.83 |
+| 7.2a op boundary, 1,000,000 `rt.now()` | 28.4 ns/call, ~35.2M calls/s | **27.8 ns/call (22.2 ns after the 5.6 ns loop baseline), 35.9M calls/s** | 4.46/4.81/5.83 → same |
+| 7.2b serve 1M @32 conns | 90,251 rps, p50 346 / p95 430 / p99 608 µs | **1,000,000/1,000,000 ok, 86,620 rps, p50 367 / p95 439 / p99 467 µs, max 3.4 ms**, zero errors/refused/timeouts | 4.46/4.81/5.83 → 4.45/4.79/5.81 |
+| 7.2b saturation 1M @128 conns | 90,347 rps, p50 1,485 µs | **1,000,000 ok, 85,875 rps, p50 1,602 / p95 1,702 / p99 1,780 µs, max 5.3 ms**, zero errors: still flat throughput, latency queues | 4.45/4.79/5.81 → 4.54/4.80/5.80 |
+| 7.2b webhook 1M composed (POST dedup path) | 52,203 rps, p50 635 / p99 804 µs | **1,000,000 ok, 50,629 rps, p50 638 / p95 761 / p99 813 µs, max 7.6 ms**, zero errors; one key stored after the million (`dedup_held: true`) | 4.54/4.80/5.80 → 4.94/4.88/5.80 |
+| 7.3 soak, 1 h | 1,558,920 iterations, 389,730 fetches, 0 errors, pending 9 → 9 | **1,439,460 iterations, 359,865 fetches, 0 errors, pending 9 → 9.** Soak RSS climbed 31.5 → 41 MB over the first 16 min, stepped to ~89 MB at minutes 17–18, then held at 88.1–89.4 MB for the last 42 min (no slope after the step) | 4.57/4.79/5.75 → 1.14/1.66/1.98 (max 1-min 5.15 mid-run) |
+
+Serve throughput is 3–5% below the 2026-11-06 numbers and the soak did 8%
+fewer iterations (its fetch now goes through the checked client). The old
+runs did not record the load average, so the difference is not attributed
+to the code; the 15-minute load was 5.8–5.9 at the start of these runs.
+Artifacts: `perf/results/m7-*-f83f39d.json`. Still owed from the list
+above: the webhook drill (`examples/webhook/drill.sh`) on the current build.
+
 ## Security verification (2026-11-16)
 
 Each defence below got a regression test that fails without it; a

@@ -320,7 +320,7 @@ directory's canonical path, as ESM does; at the `rt.serve` connection cap
 a newcomer behind slow readers can wait up to `body_first_byte_ms`; a
 data import is checked against the 4 MiB cap by its metadata and then read
 whole by deno_core's loader, so a file that grows in between is read whole;
-the M7 load numbers predate these changes (see ROADMAP).
+the M7 load runs were repeated on the current build on 2026-11-17 (`f83f39d`, all passed; see ROADMAP), and the webhook drill is still owed a re-run.
 
 ## License
 
