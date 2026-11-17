@@ -277,17 +277,19 @@ fn op_serve_listen(
         loop {
             // Below the cap: a slot first, then accept. At the cap: wait for
             // a client to actually arrive, then close the connection that
-            // has been idle longest (never one the script is handling) to
-            // make room. Without that, max_connections idle or slow
-            // sockets held every slot for the header/body timeouts and the
-            // attacker just reconnected. If every connection is busy in
-            // the script, the newcomer waits for a slot as before.
+            // has spent longest in its current phase (waiting for a head,
+            // or reading a body) to make room — never one the script is
+            // handling or whose response is being written. Without that,
+            // max_connections idle or slow sockets held every slot for the
+            // header/body timeouts and the attacker just reconnected. If
+            // every connection is protected, the newcomer waits for a slot
+            // as before.
             let (slot, accepted) = match Arc::clone(&slots).try_acquire_owned() {
                 Ok(slot) => (slot, listener.accept().await),
                 Err(_) => {
                     let accepted = listener.accept().await;
                     if accepted.is_ok() {
-                        conns.evict_longest_idle();
+                        conns.evict_longest_in_phase();
                     }
                     let Ok(slot) = Arc::clone(&slots).acquire_owned().await else {
                         return;
@@ -307,13 +309,23 @@ fn op_serve_listen(
                         let _slot = slot;
                         let svc_track = Rc::clone(&track);
                         let svc = service_fn(move |req: Request<Incoming>| {
-                            dispatch(
+                            let track = Rc::clone(&svc_track);
+                            let answer = dispatch(
                                 req,
                                 tx.clone(),
                                 res.clone(),
                                 limits.clone(),
                                 Rc::clone(&svc_track),
-                            )
+                            );
+                            async move {
+                                let answer = answer.await;
+                                // hyper writes the answer next; until that
+                                // write is flushed the connection is not
+                                // evictable (StallGuard::poll_flush clears
+                                // it, write_timeout bounds it).
+                                track.writing.set(true);
+                                answer
+                            }
                         });
                         let io =
                             TokioIo::new(StallGuard::new(stream, write_timeout, Rc::clone(&track)));
@@ -350,11 +362,20 @@ fn op_serve_listen(
 /// What the accept loop knows about one live connection.
 struct ConnTrack {
     id: u64,
-    /// When a byte last moved on the socket, either way.
-    last_io: std::cell::Cell<tokio::time::Instant>,
+    /// When the connection's current phase began: it connected, or a
+    /// response finished and it is waiting for the next head, or a head
+    /// arrived and its body is being read. A head or a body should arrive
+    /// in one burst, so time spent in a phase is what a client holding a
+    /// slot cannot hide; the time of its last byte is not, since a
+    /// trickler sends one byte at a time to look busy.
+    phase_since: std::cell::Cell<tokio::time::Instant>,
     /// Requests on this connection the script is handling right now —
     /// such a connection is never evicted.
     in_script: std::cell::Cell<u32>,
+    /// A response is being written and is not yet flushed — such a
+    /// connection is not evicted either (a client that stops reading is
+    /// dropped by `write_timeout` instead).
+    writing: std::cell::Cell<bool>,
     /// Fired to close the connection when it is evicted.
     evict: RefCell<Option<oneshot::Sender<()>>>,
 }
@@ -374,8 +395,9 @@ impl Connections {
         self.next_id.set(id + 1);
         let track = Rc::new(ConnTrack {
             id,
-            last_io: std::cell::Cell::new(tokio::time::Instant::now()),
+            phase_since: std::cell::Cell::new(tokio::time::Instant::now()),
             in_script: std::cell::Cell::new(0),
+            writing: std::cell::Cell::new(false),
             evict: RefCell::new(Some(tx)),
         });
         self.live.borrow_mut().insert(id, Rc::clone(&track));
@@ -386,15 +408,16 @@ impl Connections {
         self.live.borrow_mut().remove(&id);
     }
 
-    /// Close the connection that has moved no bytes for longest and has no
-    /// request in the script. Returns whether one was found.
-    fn evict_longest_idle(&self) -> bool {
+    /// Close the connection that has been in its current phase longest,
+    /// among those with no request in the script and no response being
+    /// written. Returns whether one was found.
+    fn evict_longest_in_phase(&self) -> bool {
         let victim = self
             .live
             .borrow()
             .values()
-            .filter(|c| c.in_script.get() == 0 && c.evict.borrow().is_some())
-            .min_by_key(|c| c.last_io.get())
+            .filter(|c| c.in_script.get() == 0 && !c.writing.get() && c.evict.borrow().is_some())
+            .min_by_key(|c| c.phase_since.get())
             .cloned();
         match victim {
             Some(conn) => {
@@ -435,7 +458,8 @@ struct StallGuard<T> {
     inner: T,
     limit: Duration,
     stalled: Option<Pin<Box<tokio::time::Sleep>>>,
-    /// Every byte that moves refreshes the connection's idle clock.
+    /// A completed flush ends a response's write: the connection is
+    /// evictable again and starts waiting for its next head.
     track: Rc<ConnTrack>,
 }
 
@@ -447,10 +471,6 @@ impl<T> StallGuard<T> {
             stalled: None,
             track,
         }
-    }
-
-    fn moved(&self) {
-        self.track.last_io.set(tokio::time::Instant::now());
     }
 
     /// Map a pending write-side poll onto the stall clock.
@@ -485,12 +505,7 @@ impl<T: AsyncRead + Unpin> AsyncRead for StallGuard<T> {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        let before = buf.filled().len();
-        let poll = Pin::new(&mut self.inner).poll_read(cx, buf);
-        if matches!(poll, Poll::Ready(Ok(()))) && buf.filled().len() > before {
-            self.moved();
-        }
-        poll
+        Pin::new(&mut self.inner).poll_read(cx, buf)
     }
 }
 
@@ -501,9 +516,6 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for StallGuard<T> {
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         let poll = Pin::new(&mut self.inner).poll_write(cx, buf);
-        if matches!(poll, Poll::Ready(Ok(n)) if n > 0) {
-            self.moved();
-        }
         self.watch(cx, poll)
     }
 
@@ -513,9 +525,6 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for StallGuard<T> {
         bufs: &[io::IoSlice<'_>],
     ) -> Poll<io::Result<usize>> {
         let poll = Pin::new(&mut self.inner).poll_write_vectored(cx, bufs);
-        if matches!(poll, Poll::Ready(Ok(n)) if n > 0) {
-            self.moved();
-        }
         self.watch(cx, poll)
     }
 
@@ -525,6 +534,11 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for StallGuard<T> {
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let poll = Pin::new(&mut self.inner).poll_flush(cx);
+        // hyper flushes the socket only once its own write buffer is empty,
+        // so a completed flush means the response is out.
+        if matches!(poll, Poll::Ready(Ok(()))) && self.track.writing.replace(false) {
+            self.track.phase_since.set(tokio::time::Instant::now());
+        }
         self.watch(cx, poll)
     }
 
@@ -675,6 +689,8 @@ async fn dispatch(
             .unwrap_or_else(|_| Response::new(Full::new(Bytes::new())))
     }
 
+    // A head arrived: the connection's body phase starts now.
+    track.phase_since.set(tokio::time::Instant::now());
     let (parts, mut body) = req.into_parts();
     let expects_continue = parts
         .headers

@@ -1508,3 +1508,90 @@ fn an_oversized_head_or_too_many_headers_is_refused_and_the_listener_keeps_servi
         .unwrap_or_else(|e| panic!("wait: {e}"));
     assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
 }
+
+// ---- Eviction at the cap picks the stalled head, not honest work ----------
+
+#[test]
+fn at_the_cap_a_trickler_cannot_steer_eviction_onto_a_download_being_written() {
+    const BIG: usize = 16 * 1024 * 1024;
+    let rig = Rig::new();
+    let port = Rig::free_port();
+    let child = route_app(
+        &rig,
+        port,
+        ", \"max_connections\": 2",
+        &format!("if (req.path === '/big') return {{status: 200, body: 'd'.repeat({BIG})}};"),
+    );
+    // Slot 1: an honest download that reads a little, then pauses for
+    // 1.5 s, long enough for the server's write to stall on it.
+    let download = std::thread::spawn(move || {
+        let mut s = connect(port);
+        s.set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap_or_else(|e| panic!("timeout: {e}"));
+        s.write_all(
+            format!("GET /big HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        )
+        .unwrap_or_else(|e| panic!("write: {e}"));
+        let mut got = vec![0u8; 64 * 1024];
+        let mut total = s.read(&mut got).unwrap_or(0);
+        std::thread::sleep(Duration::from_millis(1500));
+        let mut buf = vec![0u8; 256 * 1024];
+        loop {
+            match s.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => total += n,
+            }
+        }
+        total
+    });
+    std::thread::sleep(Duration::from_millis(300));
+    // Slot 2: a head that trickles one byte every 200 ms, so its last
+    // byte is always fresher than the paused download's.
+    let mut trickler = connect(port);
+    trickler
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap_or_else(|e| panic!("timeout: {e}"));
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let feeder = {
+        let mut t = trickler
+            .try_clone()
+            .unwrap_or_else(|e| panic!("clone: {e}"));
+        let stop = std::sync::Arc::clone(&stop);
+        std::thread::spawn(move || {
+            for b in b"GET /slow HTTP/1.1\r\nHost: x\r\nX-Pad: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" {
+                if stop.load(std::sync::atomic::Ordering::SeqCst) || t.write_all(&[*b]).is_err() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        })
+    };
+    std::thread::sleep(Duration::from_millis(600));
+    // A newcomer at the cap: the server must close the trickler, not the
+    // download it is in the middle of writing.
+    let (status, _head, body) = http(
+        port,
+        &format!("GET /new HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"),
+    );
+    assert_eq!((status, body.as_str()), (200, "ok /new"));
+    let total = download
+        .join()
+        .unwrap_or_else(|_| panic!("download thread"));
+    assert!(
+        total > BIG,
+        "the download was cut off after {total} of {BIG} body bytes"
+    );
+    let closed = time_until_closed(&mut trickler, Instant::now());
+    assert!(
+        closed < Duration::from_secs(2),
+        "the trickler stayed {closed:?}"
+    );
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    let _ = feeder.join();
+    quit(port);
+    let out = child
+        .wait_with_output()
+        .unwrap_or_else(|e| panic!("wait: {e}"));
+    assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
+}
