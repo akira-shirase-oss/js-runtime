@@ -16,6 +16,14 @@
 //!   declared read paths only, under the same size cap. Without this,
 //!   `jsrt run ~/x.js` would make every file under `~` importable as text.
 //!
+//! Modules come from local files only. Every specifier that is not
+//! `file:` (`http:`, `https:`, `data:`, `blob:`, `node:`, `npm:`, a script
+//! asking for `ext:`) is refused here, at `resolve` and again at `load`,
+//! before anything is fetched or evaluated: a `net` grant is for
+//! `rt.fetch`, not a source of code. Without this gate the only thing
+//! stopping a remote import was `FsModuleLoader` failing to turn the URL
+//! into a path, which is upstream behaviour, not a promise.
+//!
 //! The split that keeps the taxonomy honest:
 //! - the **entry** module is the operator's choice — it resolves and loads
 //!   unconditionally (a static load with no referrer is the root load);
@@ -68,8 +76,9 @@ fn denied(msg: String) -> JsErrorBox {
 }
 
 /// The canonical file path behind a `file:` specifier, or `None` when the
-/// gate should leave it to the inner loader: other schemes, and paths that
-/// don't resolve (missing is a Load (3), not a refusal we invented).
+/// gate should leave it to the inner loader: paths that don't resolve
+/// (missing is a Load (3), not a refusal we invented). Other schemes never
+/// get this far; [`local_only`] refuses them first.
 fn resolved_file(specifier: &ModuleSpecifier) -> Option<PathBuf> {
     if specifier.scheme() != "file" {
         return None;
@@ -88,10 +97,22 @@ fn is_js_module(resolved: &Path, requested: &RequestedModuleType) -> bool {
             .is_some_and(|e| e.eq_ignore_ascii_case("js") || e.eq_ignore_ascii_case("mjs"))
 }
 
+/// Refuse any module source that is not a local file.
+fn local_only(specifier: &ModuleSpecifier) -> Result<(), JsErrorBox> {
+    if specifier.scheme() == "file" {
+        return Ok(());
+    }
+    Err(denied(format!(
+        "{}: imports are not supported; modules load from local files only",
+        specifier.scheme()
+    )))
+}
+
 impl JsrtModuleLoader {
     /// The resolve-time check: the type is not known yet, so only the wider
     /// program fence applies; `load` narrows it.
     fn gate_resolve(&self, specifier: &ModuleSpecifier) -> Result<(), JsErrorBox> {
+        local_only(specifier)?;
         let Some(resolved) = resolved_file(specifier) else {
             return Ok(());
         };
@@ -111,6 +132,7 @@ impl JsrtModuleLoader {
         specifier: &ModuleSpecifier,
         requested: &RequestedModuleType,
     ) -> Result<(), JsErrorBox> {
+        local_only(specifier)?;
         let Some(resolved) = resolved_file(specifier) else {
             return Ok(());
         };
@@ -136,6 +158,8 @@ impl ModuleLoader for JsrtModuleLoader {
         kind: ResolutionKind,
     ) -> ModuleResolveResponse {
         let resolved = self.inner.resolve(specifier, referrer, kind)?;
+        // Only a local file is ever a module, the entry included.
+        local_only(&resolved)?;
         // Only the operator's entry is ungated; every import a *script*
         // makes (static or dynamic) must stay inside the fence.
         if !matches!(kind, ResolutionKind::MainModule) {
@@ -155,6 +179,11 @@ impl ModuleLoader for JsrtModuleLoader {
         // is why `is_dynamic_import` is part of the test: a script's
         // `import()` is never the entry.
         let is_entry = maybe_referrer.is_none() && !options.is_dynamic_import;
+        // Checked again here, for any specifier that reached `load` without
+        // going through `resolve` above.
+        if let Err(e) = local_only(module_specifier) {
+            return ModuleLoadResponse::Sync(Err(e));
+        }
         if !is_entry {
             if let Err(e) = self.gate_load(module_specifier, &options.requested_module_type) {
                 return ModuleLoadResponse::Sync(Err(e));

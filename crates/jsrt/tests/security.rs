@@ -1,0 +1,191 @@
+//! Security regression tests: each one proves a defence holds, against the
+//! real binary, and fails when that defence is removed.
+//!
+//! Listeners these tests start take ports from 30000-31999: below the
+//! ephemeral ranges of macOS (49152+) and Linux (32768+), so a client
+//! socket elsewhere in the run never holds one, and apart from the
+//! 20000-29999 range the serve tests use.
+
+use std::fs;
+use std::io::{Read as _, Write as _};
+use std::net::TcpListener;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+
+const JSRT: &str = env!("CARGO_BIN_EXE_jsrt");
+
+struct Rig {
+    dir: tempfile::TempDir,
+}
+
+impl Rig {
+    fn new() -> Self {
+        Self {
+            dir: tempfile::tempdir().unwrap_or_else(|e| panic!("tempdir: {e}")),
+        }
+    }
+
+    fn path(&self, name: &str) -> PathBuf {
+        self.dir.path().join(name)
+    }
+
+    fn script(&self, name: &str, source: &str) -> PathBuf {
+        let path = self.path(name);
+        fs::write(&path, source).unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
+        path
+    }
+
+    fn run_script(&self, script: &Path, extra: &[&str]) -> Output {
+        self.run_script_env(script, extra, &[])
+    }
+
+    fn run_script_env(&self, script: &Path, extra: &[&str], env: &[(&str, &str)]) -> Output {
+        let mut args = vec!["run", arg(script)];
+        args.extend_from_slice(extra);
+        Command::new(JSRT)
+            .args(&args)
+            .envs(env.iter().copied())
+            .current_dir(self.dir.path())
+            .output()
+            .unwrap_or_else(|e| panic!("spawn jsrt: {e}"))
+    }
+}
+
+fn arg(path: &Path) -> &str {
+    path.to_str().unwrap_or_else(|| panic!("utf8 path"))
+}
+
+fn code(out: &Output) -> i32 {
+    out.status
+        .code()
+        .unwrap_or_else(|| panic!("jsrt killed by signal: {:?}", out.status))
+}
+
+fn stdout(out: &Output) -> String {
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+fn stderr(out: &Output) -> String {
+    String::from_utf8_lossy(&out.stderr).into_owned()
+}
+
+/// A loopback listener on a port from 30000-31999 that is free right now.
+fn listener() -> TcpListener {
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let start = std::process::id() as usize % 2_000;
+    loop {
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        assert!(n < 2_000, "no free test port in 30000-31999");
+        let port = 30_000 + ((start + n) % 2_000) as u16;
+        if let Ok(l) = TcpListener::bind(("127.0.0.1", port)) {
+            return l;
+        }
+    }
+}
+
+/// An HTTP stub that counts every connection it accepts and answers each
+/// with `body` (a JavaScript module, so a loader that did fetch it would
+/// run it). One thread per connection.
+struct CountingStub {
+    port: u16,
+    connections: Arc<AtomicUsize>,
+}
+
+impl CountingStub {
+    fn start(body: &'static str) -> Self {
+        let listener = listener();
+        let port = listener
+            .local_addr()
+            .unwrap_or_else(|e| panic!("addr: {e}"))
+            .port();
+        let connections = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&connections);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { return };
+                seen.fetch_add(1, Ordering::SeqCst);
+                std::thread::spawn(move || {
+                    let mut buf = [0u8; 4096];
+                    let _ = s.read(&mut buf);
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/javascript\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = s.write_all(head.as_bytes());
+                    let _ = s.write_all(body.as_bytes());
+                });
+            }
+        });
+        Self { port, connections }
+    }
+
+    fn seen(&self) -> usize {
+        self.connections.load(Ordering::SeqCst)
+    }
+}
+
+// ---- Imports: only local files are modules ---------------------------------
+
+/// What a remote module would print if it were ever loaded and run.
+const REMOTE_MODULE: &str = "rt.print('REMOTE CODE RAN\\n');\nexport default 1;\n";
+
+#[test]
+fn static_remote_and_data_imports_are_refused_by_jsrts_loader() {
+    let stub = CountingStub::start(REMOTE_MODULE);
+    let rig = Rig::new();
+    let specifiers = [
+        format!("http://127.0.0.1:{}/m.js", stub.port),
+        format!("https://127.0.0.1:{}/m.js", stub.port),
+        "data:text/javascript,rt.print(\"DATA CODE RAN\")".to_string(),
+    ];
+    for (i, spec) in specifiers.iter().enumerate() {
+        let script = rig.script(&format!("static{i}.js"), &format!("import '{spec}';\n"));
+        // Even a grant for the stub's address does not make it a module
+        // source: `net` is for rt.fetch, not for code.
+        let out = rig.run_script(&script, &["--net", &format!("127.0.0.1:{}", stub.port)]);
+        assert_eq!(code(&out), 7, "{spec}: stderr: {}", stderr(&out));
+        assert!(
+            stderr(&out).contains("import denied:"),
+            "{spec}: jsrt's own loader refuses it; stderr: {}",
+            stderr(&out)
+        );
+        assert!(!stdout(&out).contains("RAN"), "{spec}: {}", stdout(&out));
+    }
+    assert_eq!(stub.seen(), 0, "the loader must never connect anywhere");
+}
+
+#[test]
+fn dynamic_remote_data_and_blob_imports_are_refused_by_jsrts_loader() {
+    let stub = CountingStub::start(REMOTE_MODULE);
+    let rig = Rig::new();
+    let specs = format!(
+        "['http://127.0.0.1:{port}/m.js', 'https://127.0.0.1:{port}/m.js', \
+          'data:text/javascript,rt.print(\"DATA CODE RAN\")', \
+          'blob:http://127.0.0.1:{port}/0d3f']",
+        port = stub.port
+    );
+    let script = rig.script(
+        "dynamic.js",
+        &format!(
+            "for (const spec of {specs}) {{\n\
+               try {{ await import(spec); rt.print('loaded ' + spec + '\\n'); }}\n\
+               catch (e) {{ rt.print((String(e.message).includes('import denied:') ? 'refused' : 'other: ' + e.message) + '\\n'); }}\n\
+             }}\n\
+             await import('http://127.0.0.1:{port}/uncaught.js');\n",
+            port = stub.port
+        ),
+    );
+    let out = rig.run_script(&script, &["--net", &format!("127.0.0.1:{}", stub.port)]);
+    assert_eq!(
+        stdout(&out),
+        "refused\nrefused\nrefused\nrefused\n",
+        "stderr: {}",
+        stderr(&out)
+    );
+    // The last one is not caught: a refusal, not a load failure.
+    assert_eq!(code(&out), 7, "stderr: {}", stderr(&out));
+    assert_eq!(stub.seen(), 0, "the loader must never connect anywhere");
+}
