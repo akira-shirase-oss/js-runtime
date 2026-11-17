@@ -687,3 +687,44 @@ fn a_refused_private_name_does_not_show_the_script_its_addresses() {
     );
     assert_eq!(stub.seen(), 0, "no connection was made");
 }
+
+// ---- A misspelt manifest key is an error, not a silent default -------------
+
+#[test]
+fn a_misspelt_manifest_key_is_an_error_naming_it() {
+    let rig = Rig::new();
+    let script = rig.script("ran.js", "rt.print('ran\\n');\n");
+    // Each would have been ignored, leaving the default in its place: a
+    // 64 MiB kv quota for `max_byte`, no read grant for `reads`.
+    for (key, manifest) in [
+        (
+            "max_byte",
+            "{ \"kv\": { \"path\": \"app.kv\", \"max_byte\": 1024 } }",
+        ),
+        ("reads", "{ \"reads\": [\".\"] }"),
+        (
+            "max_conections",
+            "{ \"serve\": { \"host\": \"127.0.0.1\", \"port\": 9, \"max_conections\": 2 } }",
+        ),
+        (
+            "maxbytes",
+            "{ \"media\": { \"backend\": \"local\", \"root\": \".\", \"maxbytes\": 1 } }",
+        ),
+    ] {
+        let path = rig.script("typo.manifest.json", manifest);
+        let out = rig.run_script(&script, &["--manifest", arg(&path)]);
+        assert_eq!(
+            code(&out),
+            8,
+            "{key}: stdout {:?}, stderr: {}",
+            stdout(&out),
+            stderr(&out)
+        );
+        assert!(
+            stderr(&out).contains(key),
+            "{key}: stderr: {}",
+            stderr(&out)
+        );
+        assert_eq!(stdout(&out), "", "{key}: the script must not run");
+    }
+}

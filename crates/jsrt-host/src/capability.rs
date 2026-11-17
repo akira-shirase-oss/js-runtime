@@ -146,8 +146,11 @@ pub struct Capabilities {
     serve: Option<ServeGrant>,
 }
 
-/// The manifest file format (`jsrt.manifest.json`).
+/// The manifest file format (`jsrt.manifest.json`). Unknown keys, here and
+/// in every grant object, are an error that names the key: a misspelt
+/// bound (`max_byte`) must not quietly become the default.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Manifest {
     /// Directories (resolved relative to the manifest file) the script may
     /// read beneath. Symlinks are resolved before checking.
@@ -210,6 +213,7 @@ struct ManifestNetDetailed {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ManifestKv {
     path: PathBuf,
     #[serde(default)]
@@ -217,6 +221,7 @@ struct ManifestKv {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ManifestMedia {
     /// Only "local" ships today — anything else is a manifest error, not a
     /// silent fallback.
@@ -227,6 +232,7 @@ struct ManifestMedia {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ManifestServe {
     /// Must parse as an IP literal and be loopback — v1 does not bind
     /// public addresses, and "localhost" DNS games don't get a say.
