@@ -2,21 +2,24 @@
 # Installs the pinned cargo-deny release binary into the directory given
 # as $1 (CI adds it to PATH). The archive is checked against the SHA-256
 # GitHub records for the release asset before anything is extracted.
+# `version` is the one pin: scripts/check.sh fails when the cargo-deny it
+# finds is any other release, so the local gate and CI run the same one.
 set -euo pipefail
 
-version="0.19.4"
+version="0.21.0"
 dest="${1:?usage: scripts/install-cargo-deny.sh <install-dir>}"
 
+# 0.21.0 publishes no x86_64-apple-darwin build; build that one with
+# `cargo install --locked cargo-deny@${version}`.
 case "$(uname -s)-$(uname -m)" in
   Linux-x86_64) target="x86_64-unknown-linux-musl"
-    sha256="3bd58b784e83715b86ddbc9deac591890372ec77fda5741bb0826970b958506f" ;;
+    sha256="a2170b854ff697e79e39c4c538981c9c1bdd803addbae6719a4cb66b4585a903" ;;
   Linux-aarch64) target="aarch64-unknown-linux-musl"
-    sha256="c32ded194b38b48e0b44a838a0d85c856120801e1253fc7febf6f2e48ccb84d8" ;;
+    sha256="47cc5d88d43cd568028080fece02d729f56f0ff8e6c168563ce6589e3c0f4738" ;;
   Darwin-arm64) target="aarch64-apple-darwin"
-    sha256="2437a51d904b29abe2d3aa9ea87e353c86cff108d519ba1e5fb495bb28e7fbaf" ;;
-  Darwin-x86_64) target="x86_64-apple-darwin"
-    sha256="90fb22528daae11d0ce68cd968ea1f8e4d852b33510d0243d8c6666fc1dbea16" ;;
-  *) echo "install-cargo-deny: no pinned build for $(uname -s)-$(uname -m)" >&2; exit 1 ;;
+    sha256="c99a789160775ada8cb54aed72cfdae5a9b72e27434f8868d17c9634c3f52425" ;;
+  *) echo "install-cargo-deny: no pinned build for $(uname -s)-$(uname -m);" \
+       "use cargo install --locked cargo-deny@${version}" >&2; exit 1 ;;
 esac
 
 name="cargo-deny-${version}-${target}"
