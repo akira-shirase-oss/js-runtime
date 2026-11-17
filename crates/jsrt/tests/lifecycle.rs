@@ -641,8 +641,9 @@ fn a_trickling_body_dies_at_the_same_deadline() {
     // each read makes progress, so only a deadline over the whole exchange
     // -- not just send() -- can end it. The stub times the hang-up itself,
     // from the moment its head went out, so process start, V8 boot and
-    // teardown are outside the measurement (they took up to 0.25 s cold
-    // on a loaded machine, more inside a parallel test run).
+    // teardown are outside the measurement (a first cold start of the
+    // debug binary took 121 ms here at a load average of 35-44, and runs
+    // slower inside a parallel test run).
     let (hung_up_tx, hung_up_rx) = std::sync::mpsc::channel();
     let stub = Stub::start(move |s| {
         let mut buf = [0u8; 2048];
