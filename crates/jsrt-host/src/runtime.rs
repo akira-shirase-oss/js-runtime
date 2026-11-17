@@ -10,10 +10,14 @@
 //! The V8 heap gets the same treatment: a near-heap-limit callback
 //! terminates the isolate when the heap reaches its ceiling (`max_heap`, or
 //! V8's default), so a runaway allocation ends the run as `Terminated`
-//! instead of a V8 out-of-memory abort (a signal, no exit code). That
-//! bounds the JavaScript heap only; `ArrayBuffer` backing stores and host
-//! buffers are outside it, so memory as a whole is still a process-boundary
-//! problem — the supervisor's RSS budget, documented in ROADMAP.
+//! instead of a V8 out-of-memory abort (a signal, no exit code). The
+//! termination lands only when the running call returns, so the first time
+//! the ceiling is reached V8 gets [`HEAP_TERMINATION_HEADROOM`] (1 GiB) more
+//! for that call to finish; a call that allocates more than that past the
+//! ceiling still aborts V8. That bounds the JavaScript heap only;
+//! `ArrayBuffer` backing stores and host buffers are outside it, so memory
+//! as a whole is still a process-boundary problem — the supervisor's RSS
+//! budget, documented in ROADMAP.
 
 use std::path::Path;
 use std::rc::Rc;
@@ -50,12 +54,15 @@ pub struct HostOptions {
     /// Per-fetch deadline. `None` uses the built-in 10s bound — a script may
     /// never hold a network op open longer than this.
     pub fetch_deadline: Option<Duration>,
-    /// Ceiling for the V8 heap in bytes. `None` keeps V8's own default.
-    /// Either way, reaching it ends the run as `Terminated` (exit 6)
-    /// instead of letting V8 abort the process. It bounds the JavaScript
-    /// heap only: `ArrayBuffer` backing stores and host-side buffers live
-    /// outside it, which is why `jsrt supervise --max-rss-mb` stays the
-    /// memory boundary.
+    /// Ceiling for the V8 heap in bytes. `None` keeps V8's own default;
+    /// a value below [`MIN_MAX_HEAP`] is raised to it, since V8 cannot start
+    /// a script in less. Either way, reaching it ends the run as
+    /// `Terminated` (exit 6) instead of letting V8 abort the process, as
+    /// long as the call running at that moment allocates no more than
+    /// [`HEAP_TERMINATION_HEADROOM`] past it before returning. It bounds the
+    /// JavaScript heap only: `ArrayBuffer` backing stores and host-side
+    /// buffers live outside it, which is why `jsrt supervise --max-rss-mb`
+    /// stays the memory boundary.
     pub max_heap: Option<usize>,
 }
 
@@ -85,8 +92,19 @@ pub(crate) struct Stopped {
     by_heap: AtomicBool,
 }
 
-/// Heap granted past the limit, each time V8 reaches it after the
-/// isolate was told to terminate, so the unwinding has room to finish.
+/// The smallest V8 heap ceiling a run gets. Below about 8 MiB V8 aborts
+/// while it starts even a one-line script (measured: 6 MiB aborted, 8 MiB
+/// ran); 16 MiB leaves room for the termination to unwind.
+pub const MIN_MAX_HEAP: usize = 16 * 1024 * 1024;
+/// Heap granted on top of the limit the first time V8 reaches it. The
+/// isolate is told to terminate then, but termination lands only when the
+/// running call returns: one large array, or a builtin such as `fill`
+/// that allocates as it goes, needs room to finish first (a 50-million
+/// slot `fill` took about 700 MB). 1 GiB also covers V8's largest single
+/// object. The overshoot is transient: the run is already ending.
+pub const HEAP_TERMINATION_HEADROOM: usize = 1024 * 1024 * 1024;
+/// Heap granted past the limit, each later time V8 reaches it, so the
+/// unwinding has room to finish.
 const HEAP_UNWIND_HEADROOM: usize = 32 * 1024 * 1024;
 /// How many times that headroom is granted. Past it V8 is left to abort:
 /// a run that cannot unwind after this much has nothing left to save.
@@ -136,21 +154,23 @@ fn build_runtime(options: &HostOptions, entry_dir: Option<&Path>) -> (JsRuntime,
             entry_dir,
         )),
         extensions: vec![jsrt_core::init(), crate::serve::jsrt_serve::init()],
-        create_params: options
-            .max_heap
-            .map(|max| deno_core::v8::CreateParams::default().heap_limits(0, max)),
+        create_params: options.max_heap.map(|max| {
+            deno_core::v8::CreateParams::default().heap_limits(0, max.max(MIN_MAX_HEAP))
+        }),
         ..Default::default()
     });
     let stopped = Arc::new(Stopped::default());
-    // At the heap ceiling: terminate the isolate and give it a little room
-    // to unwind. V8 calls this again if the unwinding allocates up to the
-    // new limit; after HEAP_UNWIND_GRANTS the limit stays and V8 aborts.
+    // At the heap ceiling: terminate the isolate, and give the call that
+    // is running room to return so the termination can land. V8 calls this
+    // again if the unwinding allocates up to the new limit; after
+    // HEAP_UNWIND_GRANTS more the limit stays and V8 aborts.
     let handle = runtime.v8_isolate().thread_safe_handle();
     let heap_stop = Arc::clone(&stopped);
     let mut grants = 0u32;
     runtime.add_near_heap_limit_callback(move |current, _initial| {
         if !heap_stop.by_heap.swap(true, Ordering::SeqCst) {
             handle.terminate_execution();
+            return current.saturating_add(HEAP_TERMINATION_HEADROOM);
         }
         if grants >= HEAP_UNWIND_GRANTS {
             return current;

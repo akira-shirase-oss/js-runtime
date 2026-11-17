@@ -402,3 +402,69 @@ fn caught_refusals_do_not_reveal_canonical_paths_or_symlink_targets() {
     }
     assert_eq!(seen.lines().count(), 7, "{seen}");
 }
+
+#[test]
+fn one_call_that_allocates_far_past_the_heap_limit_still_ends_classified() {
+    let rig = Rig::new();
+    // A single `fill` over 50 million slots: about 700 MB of heap in one
+    // builtin call, which returns only once it is done, so the termination
+    // the limit asks for cannot land before then.
+    let script = rig.script(
+        "huge.js",
+        "const a = new Array(5e7).fill(1.5);\nrt.print('survived ' + a.length + '\\n');\n",
+    );
+    let out = rig.run_script(&script, &["--max-heap-mb", "64", "--timeout", "60000"]);
+    assert_eq!(
+        out.status.code(),
+        Some(6),
+        "status {:?}, stderr: {}",
+        out.status,
+        stderr(&out).lines().take(5).collect::<Vec<_>>().join("\n")
+    );
+    assert!(
+        stderr(&out).contains("heap limit"),
+        "stderr: {}",
+        stderr(&out)
+    );
+    assert!(!stdout(&out).contains("survived"), "{}", stdout(&out));
+}
+
+#[test]
+fn a_heap_limit_below_the_floor_is_refused_and_the_floor_works() {
+    let rig = Rig::new();
+    let hello = rig.script("hello.js", "rt.print('hello\\n');\n");
+    // Below the floor V8 cannot even start a script; that is a usage
+    // error, not a crash.
+    for mb in ["1", "4", "15"] {
+        let out = rig.run_script(&hello, &["--max-heap-mb", mb]);
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "--max-heap-mb {mb}: status {:?}, stderr: {}",
+            out.status,
+            stderr(&out).lines().take(3).collect::<Vec<_>>().join("\n")
+        );
+        assert!(
+            stderr(&out).contains("at least 16"),
+            "--max-heap-mb {mb}: {}",
+            stderr(&out)
+        );
+    }
+    // At the floor a script runs, and a heap bomb still ends as exit 6.
+    let out = rig.run_script(&hello, &["--max-heap-mb", "16"]);
+    assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
+    assert_eq!(stdout(&out), "hello\n");
+    let bomb = rig.script(
+        "bomb.js",
+        "const hoard = [];\n\
+         while (true) { hoard.push(new Array(100000).fill({ x: hoard.length })); }\n",
+    );
+    let out = rig.run_script(&bomb, &["--max-heap-mb", "16", "--timeout", "60000"]);
+    assert_eq!(
+        out.status.code(),
+        Some(6),
+        "status {:?}, stderr: {}",
+        out.status,
+        stderr(&out).lines().take(5).collect::<Vec<_>>().join("\n")
+    );
+}
