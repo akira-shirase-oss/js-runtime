@@ -536,19 +536,24 @@ impl Capabilities {
         }
     }
 
-    /// `may_read`'s size cap on a path [`Capabilities::locate`] found — the
-    /// module loader's door for text/bytes/JSON imports, which must not be
-    /// wider than `readText`'s. A refusal names `asked`, what the script
-    /// asked for: the script can read the message, and the canonical path
-    /// would tell it where the host's files live and where a link points.
+    /// `may_read`'s file checks on a path [`Capabilities::locate`] found:
+    /// a regular file (a FIFO or a device has no size to check, and opening
+    /// one can block), within the size cap — the module loader's door for
+    /// text/bytes/JSON imports, which must not be wider than `readText`'s.
+    /// A refusal names `asked`, what the script asked for: the script can
+    /// read the message, and the canonical path would tell it where the
+    /// host's files live and where a link points. The size is checked
+    /// again as the file is read ([`read_text_capped`]).
     pub fn read_cap(&self, resolved: &Path, asked: &str) -> Result<(), HostError> {
-        if resolved.is_file() {
-            let len = fs::metadata(resolved).map_or(0, |m| m.len());
-            if len > MAX_READ_BYTES {
-                return Err(HostError::Capability(format!(
-                    "read denied: {asked} is {len} bytes (limit {MAX_READ_BYTES})"
-                )));
-            }
+        let meta = fs::metadata(resolved).map_err(|_| read_refusal(asked))?;
+        if !meta.is_file() {
+            return Err(not_a_regular_file(asked));
+        }
+        if meta.len() > MAX_READ_BYTES {
+            return Err(HostError::Capability(format!(
+                "read denied: {asked} is {} bytes (limit {MAX_READ_BYTES})",
+                meta.len()
+            )));
         }
         Ok(())
     }
@@ -657,6 +662,40 @@ pub fn read_refusal(asked: &str) -> HostError {
     HostError::Capability(format!(
         "read denied: {asked} is missing or outside every declared read path"
     ))
+}
+
+/// The refusal for a path inside the fence that is not a regular file.
+pub fn not_a_regular_file(asked: &str) -> HostError {
+    HostError::Capability(format!("read denied: {asked} is not a regular file"))
+}
+
+/// Read a file [`Capabilities::may_read`] allowed as text, bounded by the
+/// read cap whatever its metadata said: what is opened must be a regular
+/// file, and at most the cap plus one byte is read, so a file that grew
+/// after the check is refused rather than read whole. Blocking: run it off
+/// the event loop.
+pub fn read_text_capped(resolved: &Path, asked: &str) -> Result<String, HostError> {
+    read_text_bounded(resolved, asked, MAX_READ_BYTES)
+}
+
+fn read_text_bounded(resolved: &Path, asked: &str, cap: u64) -> Result<String, HostError> {
+    use std::io::Read as _;
+    let io = |e: std::io::Error| HostError::Host(format!("read {asked}: {e}"));
+    let file = fs::File::open(resolved).map_err(io)?;
+    if !file.metadata().map_err(io)?.is_file() {
+        return Err(not_a_regular_file(asked));
+    }
+    let mut bytes = Vec::new();
+    file.take(cap.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(io)?;
+    if bytes.len() as u64 > cap {
+        return Err(HostError::Capability(format!(
+            "read denied: {asked} is more than {cap} bytes (limit {cap})"
+        )));
+    }
+    String::from_utf8(bytes)
+        .map_err(|_| HostError::Host(format!("read {asked}: stream did not contain valid UTF-8")))
 }
 
 /// `path` made absolute against the working directory, with `.` dropped
@@ -904,6 +943,28 @@ mod tests {
                 refused.display()
             );
         }
+    }
+
+    #[test]
+    fn a_capped_read_stops_at_the_cap_not_at_the_metadata() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("tempdir: {e}"));
+        let file = dir.path().join("f.txt");
+        std::fs::write(&file, "0123456789abcdef").unwrap_or_else(|e| panic!("write: {e}"));
+        assert_eq!(
+            read_text_bounded(&file, "f.txt", 16).ok().as_deref(),
+            Some("0123456789abcdef")
+        );
+        let err = read_text_bounded(&file, "f.txt", 15)
+            .err()
+            .unwrap_or_else(|| panic!("over the cap must refuse"));
+        assert!(
+            matches!(&err, HostError::Capability(m) if m.contains("more than 15 bytes")),
+            "{err}"
+        );
+        let err = read_text_bounded(dir.path(), "dir", 15)
+            .err()
+            .unwrap_or_else(|| panic!("a directory must refuse"));
+        assert!(err.to_string().contains("not a regular file"), "{err}");
     }
 
     #[test]

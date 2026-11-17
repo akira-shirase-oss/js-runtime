@@ -584,3 +584,72 @@ fn a_kv_store_that_cannot_open_does_not_name_its_path() {
         );
     }
 }
+
+// ---- readText's 4 MiB cap holds for what is read, not what metadata says ---
+
+#[test]
+fn read_text_refuses_a_fifo_instead_of_reading_past_its_cap() {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let rig = Rig::new();
+    let data = rig.path("data");
+    fs::create_dir(&data).unwrap_or_else(|e| panic!("mkdir: {e}"));
+    let fifo = data.join("pipe");
+    let made = Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .unwrap_or_else(|e| panic!("mkfifo: {e}"));
+    assert!(made.success(), "mkfifo failed");
+    // A writer with 8 MiB for the pipe, twice the cap. Its size in the
+    // metadata is 0, so a metadata-only cap lets the whole stream through.
+    // Non-blocking, so a host that refuses to open the pipe leaves it
+    // waiting for a reader that never comes, not hung.
+    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writer = {
+        let fifo = fifo.clone();
+        let done = Arc::clone(&done);
+        std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let going = || !done.load(Ordering::SeqCst) && std::time::Instant::now() < deadline;
+            let mut pipe = loop {
+                match fs::OpenOptions::new()
+                    .write(true)
+                    .custom_flags(libc::O_NONBLOCK)
+                    .open(&fifo)
+                {
+                    Ok(pipe) => break pipe,
+                    Err(_) if going() => {
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                    }
+                    Err(_) => return 0,
+                }
+            };
+            let chunk = vec![b'f'; 64 * 1024];
+            let mut sent = 0usize;
+            while sent < 8 * 1024 * 1024 && going() {
+                match pipe.write(&chunk) {
+                    Ok(n) => sent += n,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                    Err(_) => break,
+                }
+            }
+            sent
+        })
+    };
+    let script = rig.script(
+        "fifo.js",
+        "try { const t = await rt.readText('data/pipe'); rt.print('read ' + t.length + '\\n'); }\n\
+         catch (e) { rt.print(e.name + ': ' + e.message + '\\n'); }\n",
+    );
+    let out = rig.run_script(&script, &["--read", arg(&data), "--timeout", "20000"]);
+    done.store(true, Ordering::SeqCst);
+    assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
+    assert_eq!(
+        stdout(&out),
+        "CapabilityError: read denied: data/pipe is not a regular file\n",
+        "stderr: {}",
+        stderr(&out)
+    );
+    let _ = writer.join();
+}

@@ -162,9 +162,14 @@ async fn op_read_text(
 ) -> Result<String, JsErrorBox> {
     let caps = capabilities(&state)?;
     let resolved = caps.may_read(std::path::Path::new(&path)).map_err(deny)?;
-    tokio::fs::read_to_string(&resolved)
-        .await
-        .map_err(|e| host_err(format!("read {path}: {e}")))
+    // The cap is enforced on the bytes read too, not only on the size the
+    // metadata reported.
+    let asked = path.clone();
+    tokio::task::spawn_blocking(move || {
+        crate::capability::read_text_capped(&resolved, &asked).map_err(deny)
+    })
+    .await
+    .map_err(|e| host_err(format!("read {path}: {e}")))?
 }
 
 /// `rt.fetch(url)` — capability-gated, deadline'd, body-capped fetch.
@@ -474,8 +479,17 @@ fn op_media_put(
         crate::capability::Located::Found(resolved) => resolved,
         _ => return Err(deny(crate::capability::read_refusal(&src))),
     };
+    // A regular file only, checked before opening (opening a FIFO blocks
+    // this op, and the event loop with it) and again on what was opened.
+    let regular = |meta: std::io::Result<std::fs::Metadata>| meta.is_ok_and(|m| m.is_file());
+    if !regular(std::fs::metadata(&resolved)) {
+        return Err(deny(crate::capability::not_a_regular_file(&src)));
+    }
     let mut input = std::fs::File::open(&resolved)
         .map_err(|e| host_err(format!("media put: open {src}: {e}")))?;
+    if !regular(input.metadata()) {
+        return Err(deny(crate::capability::not_a_regular_file(&src)));
+    }
 
     // Unique-enough tmp name in the same dir as the destination — rename
     // across a filesystem boundary wouldn't be atomic.

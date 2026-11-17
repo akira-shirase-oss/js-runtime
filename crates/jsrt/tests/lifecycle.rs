@@ -247,9 +247,13 @@ fn a_host_side_failure_exits_eight() {
     let data = rig.dir.path().join("data");
     fs::create_dir(&data).unwrap_or_else(|e| panic!("mkdir: {e}"));
     let manifest = rig.script("m.manifest.json", "{ \"read\": [\"data\"] }\n");
-    // `data` is granted and canonicalizes, but reading a directory fails at
-    // the host — a HostError (8), not a refusal (7) or a script error (5).
-    let script = rig.script("read.js", "await rt.readText('data');\n");
+    // `data/bad.txt` is granted and a regular file, but it is not UTF-8, so
+    // reading it as text fails at the host — a HostError (8), not a refusal
+    // (7) or a script error (5). (A directory used to be the example; it
+    // is now refused as not a regular file.)
+    fs::write(data.join("bad.txt"), [0xff, 0xfe, 0x00, 0xc3])
+        .unwrap_or_else(|e| panic!("write: {e}"));
+    let script = rig.script("read.js", "await rt.readText('data/bad.txt');\n");
     let out = rig.run_script(
         &script,
         &[

@@ -158,7 +158,13 @@ impl JsrtModuleLoader {
             Located::Refused => return Err(outside(&asked)),
         };
         if is_js_module(&resolved, requested) {
-            return Ok(());
+            // The inner loader reads the whole file; a FIFO or a device
+            // would block it, or stream without end.
+            return if resolved.is_file() {
+                Ok(())
+            } else {
+                Err(denied(format!("{asked} is not a regular file")))
+            };
         }
         let refused = |msg: String| {
             denied(format!(
