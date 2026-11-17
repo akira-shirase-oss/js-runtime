@@ -229,9 +229,10 @@ async fn execute(run: RunArgs) -> Result<(), HostError> {
     let options = HostOptions {
         capabilities,
         timeout: (run.timeout > 0).then(|| Duration::from_millis(run.timeout)),
-        // A parked event loop can't be interrupted — if termination
+        // A parked event loop can't be interrupted — if termination (by
+        // the run timeout, or at the heap limit even with --timeout 0)
         // doesn't unwind in 2s the process exits with the same code.
-        terminate_grace: (run.timeout > 0).then(|| Duration::from_secs(2)),
+        terminate_grace: Some(Duration::from_secs(2)),
         fetch_deadline: (run.fetch_timeout > 0).then(|| Duration::from_millis(run.fetch_timeout)),
         max_heap: (run.max_heap_mb > 0)
             .then(|| usize::try_from(run.max_heap_mb.saturating_mul(1024 * 1024)))

@@ -728,3 +728,92 @@ fn a_misspelt_manifest_key_is_an_error_naming_it() {
         assert_eq!(stdout(&out), "", "{key}: the script must not run");
     }
 }
+
+// ---- A heap bomb inside a callback ends the run, with or without a timeout -
+
+/// Run jsrt for at most `limit`. Returns the exit code (`None` when the
+/// run was still going at `limit` and was killed, or died by a signal),
+/// how long it took, and its stderr.
+fn run_bounded(
+    rig: &Rig,
+    script: &Path,
+    extra: &[&str],
+    limit: std::time::Duration,
+) -> (Option<i32>, std::time::Duration, String) {
+    let mut args = vec!["run", arg(script)];
+    args.extend_from_slice(extra);
+    let started = std::time::Instant::now();
+    let mut child = Command::new(JSRT)
+        .args(&args)
+        .current_dir(rig.dir.path())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|e| panic!("spawn jsrt: {e}"));
+    let mut finished = false;
+    while started.elapsed() < limit {
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            finished = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let took = started.elapsed();
+    if !finished {
+        let _ = child.kill();
+    }
+    let out = child
+        .wait_with_output()
+        .unwrap_or_else(|e| panic!("wait: {e}"));
+    let code = if finished { out.status.code() } else { None };
+    (code, took, stderr(&out))
+}
+
+/// Allocates until the heap limit stops it.
+const HEAP_BOMB: &str =
+    "const hoard = []; while (true) { hoard.push(new Array(100000).fill({ x: hoard.length })); }";
+
+#[test]
+fn a_heap_bomb_inside_a_callback_ends_the_run_even_without_a_timeout() {
+    let rig = Rig::new();
+    // Each runs the bomb from the event loop rather than the module's top
+    // level: there V8 terminates the callback, and the run must still end.
+    let kinds = [
+        (
+            "setTimeout",
+            format!("rt.setTimeout(() => {{ {HEAP_BOMB} }}, 0);\n"),
+        ),
+        (
+            "queueMicrotask",
+            format!("queueMicrotask(() => {{ {HEAP_BOMB} }});\n"),
+        ),
+        (
+            "Promise.then",
+            format!("Promise.resolve().then(() => {{ {HEAP_BOMB} }});\n"),
+        ),
+        (
+            "after an await",
+            format!("await rt.sleep(1);\n{HEAP_BOMB}\n"),
+        ),
+    ];
+    for (kind, source) in kinds {
+        let script = rig.script("callback-bomb.js", &source);
+        let (code, took, err) = run_bounded(
+            &rig,
+            &script,
+            &["--max-heap-mb", "64", "--timeout", "0"],
+            std::time::Duration::from_secs(20),
+        );
+        assert_eq!(
+            code,
+            Some(6),
+            "{kind}: still running or wrong ending after {took:?}; stderr: {}",
+            err.lines().take(5).collect::<Vec<_>>().join("\n")
+        );
+        assert!(err.contains("heap limit"), "{kind}: stderr: {err}");
+        assert!(
+            took < std::time::Duration::from_secs(10),
+            "{kind}: ended only after {took:?}"
+        );
+    }
+}
