@@ -1,4 +1,4 @@
 {
-	"serve": { "host": "127.0.0.1", "port": 9400 },
+	"serve": { "host": "127.0.0.1", "port": 47411 },
 	"kv": { "path": "data/webhook.kv", "max_bytes": 8388608 }
 }

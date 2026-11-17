@@ -6,7 +6,9 @@ set -u
 cd "$(dirname "$0")"
 
 JSRT="${JSRT:-$(cd ../.. && pwd)/target/debug/jsrt}"
-BASE="http://127.0.0.1:9400"
+# jsrt's port band on the maintainer laptop is 47400-47499; app.js, the manifest and the
+# broken build below carry the same literal (a script's rt.serve address must equal its grant).
+BASE="http://127.0.0.1:47411"
 LOG=drill.log
 : > "$LOG"
 mkdir -p data
@@ -48,7 +50,7 @@ say "list survived update: $(curl -s "$BASE/hooks/github")"
 note "BREAK — handler throws on every route; health must still be answerable by the wire"
 kill $SUP 2>/dev/null; wait $SUP 2>/dev/null
 cat > current.js <<'EOF'
-const server = rt.serve({host: "127.0.0.1", port: 9400}, async (req) => {
+const server = rt.serve({host: "127.0.0.1", port: 47411}, async (req) => {
 	throw new Error("v-broken: every request throws");
 });
 await server.done;
@@ -57,7 +59,7 @@ $JSRT supervise current.js \
 	--manifest jsrt.manifest.json --report data/runs.jsonl --wall-ms 30000 &
 SUP=$!
 for i in $(seq 1 50); do
-	nc -z 127.0.0.1 9400 2>/dev/null && break
+	nc -z 127.0.0.1 47411 2>/dev/null && break
 	sleep 0.1
 done
 say "health under broken build: $(curl -s -o /dev/null -w '%{http_code}' "$BASE/health")"

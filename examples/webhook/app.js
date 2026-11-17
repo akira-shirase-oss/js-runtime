@@ -8,7 +8,7 @@
 //
 // v1.
 
-const server = rt.serve({ host: "127.0.0.1", port: 9400 }, async (req) => {
+const server = rt.serve({ host: "127.0.0.1", port: 47411 }, async (req) => {
 	const path = req.path.split("?")[0];
 	if (path === "/health") {
 		return { status: 200, body: JSON.stringify({ ok: true, v: 1 }) };
@@ -35,5 +35,5 @@ const server = rt.serve({ host: "127.0.0.1", port: 9400 }, async (req) => {
 	return { status: 405, body: "method not allowed" };
 });
 
-rt.print("webhook v1 serving on 127.0.0.1:9400\n");
+rt.print("webhook v1 serving on 127.0.0.1:47411\n");
 await server.done;

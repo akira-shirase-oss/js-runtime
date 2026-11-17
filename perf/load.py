@@ -31,7 +31,7 @@ COLD_WARMUP = 20
 # own the neighbouring bands). serve-load.js and soak.js carry the same
 # literal: a script's rt.serve address must equal its grant.
 SERVE_PORT = 47410
-WEBHOOK_PORT = 47411
+WEBHOOK_PORT = 47411  # examples/webhook's own port
 SERVE_REQUESTS = 1_000_000
 SERVE_CONCURRENCY = 32
 SATURATION_CONCURRENCY = 128
@@ -209,11 +209,10 @@ def http(method: str, url: str, headers: dict | None = None, body: bytes | None 
 def webhook_million() -> None:
     """The real webhook app (examples/webhook) on the dedup path at 1M.
 
-    It runs from a temporary copy so the committed example data is not
-    touched; the only edit is the port literal (9400 -> WEBHOOK_PORT), in
-    both app.js and its manifest. One POST seeds delivery d1, the million
-    repeat it, and the stored key list is read back afterwards: dedup held
-    only if it is still exactly the one key.
+    It runs from a temporary copy (app.js and its manifest, unchanged) so
+    the example's own data is not touched. One POST seeds delivery d1, the
+    million repeat it, and the stored key list is read back afterwards:
+    dedup held only if it is still exactly the one key.
     """
     load_before = loadavg()
     base = f"http://127.0.0.1:{WEBHOOK_PORT}"
@@ -221,7 +220,7 @@ def webhook_million() -> None:
         work = Path(tmp)
         (work / "data").mkdir()
         for f in ("app.js", "jsrt.manifest.json"):
-            (work / f).write_text((WEBHOOK / f).read_text().replace("9400", str(WEBHOOK_PORT)))
+            (work / f).write_text((WEBHOOK / f).read_text())
         proc = subprocess.Popen(
             [str(BIN), "run", str(work / "app.js"),
              "--manifest", str(work / "jsrt.manifest.json"), "--timeout", "0"],
@@ -248,7 +247,7 @@ def webhook_million() -> None:
                 proc.kill()
     write_result("m7-2b-webhook-1m-composed", {
         "milestone": "M7.2b-composed",
-        "workload": f"{SERVE_REQUESTS} POST /hooks/github X-Delivery-Id:d1 through the real webhook app (examples/webhook, port literal moved to {WEBHOOK_PORT}, temporary copy) - the dedup path: serve dispatch + rt.kv.get on a live store. {SERVE_CONCURRENCY} keep-alive connections.",
+        "workload": f"{SERVE_REQUESTS} POST /hooks/github X-Delivery-Id:d1 through the real webhook app (examples/webhook on port {WEBHOOK_PORT}, temporary copy) - the dedup path: serve dispatch + rt.kv.get on a live store. {SERVE_CONCURRENCY} keep-alive connections.",
         "environment": machine(),
         "load_wall_ms": round(ms, 1),
         "seed": {"status": seed[0], "body": seed[1]},
