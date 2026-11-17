@@ -444,6 +444,19 @@ fn media_grant(
         })
 }
 
+/// Lowercase hex, written out byte by byte. `format!("{:x}", digest)`
+/// works on sha2 0.10's `GenericArray` but not on 0.11's `Array`, which has
+/// no `LowerHex`; this works on both.
+fn lower_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut hex = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        // Writing to a String cannot fail.
+        let _ = write!(hex, "{b:02x}");
+    }
+    hex
+}
+
 #[derive(Serialize)]
 struct MediaPutResult {
     name: String,
@@ -529,7 +542,7 @@ fn op_media_put(
         }
         out.sync_all()
             .map_err(|e| host_err(format!("media put: sync tmp: {e}")))?;
-        Ok((format!("{:x}", hasher.finalize()), total))
+        Ok((lower_hex(&hasher.finalize()), total))
     })();
 
     match streamed {
@@ -605,6 +618,19 @@ deno_core::extension!(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn media_names_are_the_lowercase_sha256_hex() {
+        use sha2::Digest;
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(b"abc");
+        // FIPS 180-2's known answer for "abc".
+        assert_eq!(
+            lower_hex(&hasher.finalize()),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(lower_hex(&[0x00, 0x0f, 0xa0, 0xff]), "000fa0ff");
+    }
 
     #[test]
     fn capability_errors_keep_their_name() {
