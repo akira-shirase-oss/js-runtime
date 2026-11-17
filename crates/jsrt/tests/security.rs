@@ -240,3 +240,63 @@ fn fetch_ignores_proxy_environment_variables() {
     assert_eq!(proxy.seen(), 0, "the proxy must never be contacted");
     assert_eq!(target.seen(), 2, "both fetches went straight to the target");
 }
+
+// ---- rt.fetch: a bounded number of exchanges in flight ---------------------
+
+/// Most fetches one run has in flight; the rest wait for a slot.
+const FETCH_MAX_IN_FLIGHT: usize = 32;
+
+#[test]
+fn a_thousand_parallel_fetches_keep_in_flight_under_the_cap() {
+    // A stub that holds every request for 50 ms and records how many it
+    // was holding at once.
+    let listener = listener();
+    let port = listener
+        .local_addr()
+        .unwrap_or_else(|e| panic!("addr: {e}"))
+        .port();
+    let in_flight = Arc::new(AtomicUsize::new(0));
+    let peak = Arc::new(AtomicUsize::new(0));
+    let (now, high) = (Arc::clone(&in_flight), Arc::clone(&peak));
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut s) = stream else { return };
+            let (now, high) = (Arc::clone(&now), Arc::clone(&high));
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 4096];
+                if s.read(&mut buf).unwrap_or(0) == 0 {
+                    return;
+                }
+                let held = now.fetch_add(1, Ordering::SeqCst) + 1;
+                high.fetch_max(held, Ordering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                now.fetch_sub(1, Ordering::SeqCst);
+                let _ = s.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                );
+            });
+        }
+    });
+    let rig = Rig::new();
+    let script = rig.script(
+        "parallel.js",
+        &format!(
+            "const all = [];\n\
+             for (let i = 0; i < 1000; i++) all.push(rt.fetch('http://127.0.0.1:{port}/' + i));\n\
+             const results = await Promise.allSettled(all);\n\
+             const ok = results.filter((r) => r.status === 'fulfilled' && r.value.body === 'ok').length;\n\
+             rt.print('ok ' + ok + '\\n');\n"
+        ),
+    );
+    let out = rig.run_script(
+        &script,
+        &["--net", &format!("127.0.0.1:{port}"), "--timeout", "60000"],
+    );
+    assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
+    assert_eq!(stdout(&out), "ok 1000\n", "stderr: {}", stderr(&out));
+    let peak = peak.load(Ordering::SeqCst);
+    assert!(
+        (1..=FETCH_MAX_IN_FLIGHT).contains(&peak),
+        "{peak} requests were in flight at once; the cap is {FETCH_MAX_IN_FLIGHT}"
+    );
+}

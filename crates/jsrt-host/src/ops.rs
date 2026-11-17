@@ -21,6 +21,12 @@ use crate::error::HostError;
 pub const FETCH_DEADLINE: Duration = Duration::from_secs(10);
 /// Largest response body `rt.fetch` will materialize.
 pub const FETCH_MAX_BODY: u64 = 4 * 1024 * 1024;
+/// Most fetch exchanges one run has in flight. Later calls wait for a
+/// slot, first come first served, so `Promise.all` over a thousand URLs
+/// still works; what it can no longer do is open a thousand connections
+/// and buffer a thousand bodies at once. Bodies being read are bounded by
+/// this times [`FETCH_MAX_BODY`] (128 MiB at the defaults).
+pub const FETCH_MAX_IN_FLIGHT: usize = 32;
 
 /// Operation budgets a run carries in `OpState` — the knobs a host may tune
 /// without touching the capability law itself.
@@ -75,6 +81,24 @@ fn http_client(state: &Rc<RefCell<OpState>>) -> Result<Rc<reqwest::Client>, JsEr
             None => "http client not installed".into(),
         },
     ))
+}
+
+/// The run's fetch slots, one per exchange in flight; see
+/// [`FETCH_MAX_IN_FLIGHT`].
+pub struct FetchSlots(pub tokio::sync::Semaphore);
+
+impl Default for FetchSlots {
+    fn default() -> Self {
+        Self(tokio::sync::Semaphore::new(FETCH_MAX_IN_FLIGHT))
+    }
+}
+
+fn fetch_slots(state: &Rc<RefCell<OpState>>) -> Result<Rc<FetchSlots>, JsErrorBox> {
+    state
+        .borrow()
+        .try_borrow::<Rc<FetchSlots>>()
+        .cloned()
+        .ok_or_else(|| host_err("fetch slots not installed".into()))
 }
 
 fn budgets(state: &Rc<RefCell<OpState>>) -> OpBudgets {
@@ -164,12 +188,21 @@ async fn op_fetch(
     let caps = capabilities(&state)?;
     let client = http_client(&state)?;
     let budgets = budgets(&state);
+    let slots = fetch_slots(&state)?;
     caps.may_net(&url).map_err(deny)?;
     // Every message below names the destination without its userinfo or
     // query string — the places credentials and tokens ride in a URL.
     let shown = crate::net::redact_url(&url);
     let deadline = budgets.fetch_deadline;
     let max_body = budgets.fetch_max_body;
+    // A slot first, held until the body is in hand or the exchange fails.
+    // Waiting for one is not part of the exchange, so the deadline starts
+    // when the slot is granted; the run timeout bounds the wait.
+    let _slot = slots
+        .0
+        .acquire()
+        .await
+        .map_err(|_| host_err("fetch slots closed".into()))?;
     let started = std::time::Instant::now();
     // One deadline over the whole exchange — connect, redirects, headers
     // and every body chunk. A deadline on send() alone let a server that
