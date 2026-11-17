@@ -552,3 +552,35 @@ fn a_script_without_a_read_grant_cannot_tell_which_host_paths_exist() {
         assert!(!line.contains("allowed"), "{line}");
     }
 }
+
+#[test]
+fn a_kv_store_that_cannot_open_does_not_name_its_path() {
+    let rig = Rig::new();
+    let app = rig.path("app");
+    // The declared store is a directory: SQLite cannot open it, and
+    // rusqlite's error carries the canonical path it tried.
+    fs::create_dir_all(app.join("data/store.kv")).unwrap_or_else(|e| panic!("mkdir: {e}"));
+    let manifest = rig.script(
+        "app/m.manifest.json",
+        "{ \"kv\": { \"path\": \"data/store.kv\" } }\n",
+    );
+    let script = rig.script(
+        "app/kv.js",
+        "for (const op of [() => rt.kv.get('k'), () => rt.kv.put('k', 'v')]) {\n\
+           try { op(); rt.print('opened\\n'); }\n\
+           catch (e) { rt.print(e.name + ': ' + e.message + '\\n'); }\n\
+         }\n",
+    );
+    let out = rig.run_script(&script, &["--manifest", arg(&manifest)]);
+    assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
+    let seen = stdout(&out);
+    assert_eq!(seen.lines().count(), 2, "{seen}");
+    let root = fs::canonicalize(rig.dir.path()).unwrap_or_else(|e| panic!("canonicalize: {e}"));
+    for line in seen.lines() {
+        assert!(line.starts_with("HostError: kv open"), "{line}");
+        assert!(
+            !line.contains(root.to_string_lossy().as_ref()) && !line.contains("store.kv"),
+            "a kv error names the store's path: {line}"
+        );
+    }
+}

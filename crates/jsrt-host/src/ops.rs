@@ -267,16 +267,30 @@ impl KvState {
     fn conn(&mut self) -> Result<&rusqlite::Connection, JsErrorBox> {
         if self.conn.is_none() {
             // The script never names the store's path, so its errors
-            // don't either.
+            // don't either: rusqlite puts the path in an open error, so
+            // the script gets SQLite's error code and the operator's
+            // stderr gets the whole error.
             let c = rusqlite::Connection::open(&self.grant.path)
-                .map_err(|e| host_err(format!("kv open: {e}")))?;
+                .map_err(|e| self.hide_path("kv open: the store cannot be opened", &e))?;
             c.execute_batch("CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT NOT NULL);")
-                .map_err(|e| host_err(format!("kv init: {e}")))?;
+                .map_err(|e| self.hide_path("kv init: the store cannot be set up", &e))?;
             self.conn = Some(c);
         }
         self.conn
             .as_ref()
             .ok_or_else(|| host_err("kv connection lost".into()))
+    }
+}
+
+impl KvState {
+    /// A store error for the script, `what` plus SQLite's error code; the
+    /// full error, path included, goes to stderr for the operator.
+    fn hide_path(&self, what: &str, err: &rusqlite::Error) -> JsErrorBox {
+        eprintln!("jsrt: {what}: {}: {err}", self.grant.path.display());
+        match err.sqlite_error_code() {
+            Some(code) => host_err(format!("{what} ({code:?})")),
+            None => host_err(what.to_string()),
+        }
     }
 }
 
