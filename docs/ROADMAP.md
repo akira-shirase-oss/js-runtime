@@ -129,7 +129,14 @@ failing on the code before it.
 | V.16 read cap on bytes (done, review 5-5) | only regular files are read (`readText`, `media.put`, imports); `readText` reads through `take(cap + 1)` | a FIFO in a read grant returned 8 MiB through the 4 MiB cap | `read_text_refuses_a_fifo_instead_of_reading_past_its_cap` — `fe2fef5` |
 | V.17 private addresses (done, review 5-9) | a refused private name's addresses go to stderr, not `e.message` | `e.message` listed `[::1, 127.0.0.1]` | `a_refused_private_name_does_not_show_the_script_its_addresses` — `a1904fc` |
 | V.18 strict manifest (done, review 5-10) | `deny_unknown_fields` on the manifest and every grant object | `max_byte` was ignored and the 64 MiB default applied | `a_misspelt_manifest_key_is_an_error_naming_it` — `82bc089` |
-| V.19 test and supply-chain fixes (done, reviews 5-6, 5-7, 5-8) | the trickling-fetch test times the hang-up from the stub; the media digest is hex-encoded by hand (sha2 0.10 and 0.11); one pinned cargo-deny release (0.21.0) for the local gate and CI | the fetch test bounded process start inside 1.8 s; sha2 0.11 failed with E0277; CI ran 0.19.4, the local gate 0.21.0 | `a_trickling_body_dies_at_the_same_deadline` (fails with a send-only deadline), `media_names_are_the_lowercase_sha256_hex`, `check.sh`'s version check — `7f7973c`, `114d776`, `a289543` |
+| V.19 test and supply-chain fixes (done, reviews 5-6, 5-7, 5-8) | the trickling-fetch test times the hang-up from the stub; the media digest is hex-encoded by hand (sha2 0.10 and 0.11); one pinned cargo-deny release for the local gate and CI (0.21.0 at first; 0.20.2 since V.21) | the fetch test bounded process start inside 1.8 s; sha2 0.11 failed with E0277; CI ran 0.19.4, the local gate 0.21.0 | `a_trickling_body_dies_at_the_same_deadline` (fails with a send-only deadline), `media_names_are_the_lowercase_sha256_hex`, `check.sh`'s version check — `7f7973c`, `114d776`, `a289543` |
+
+A second check of that round found one more gap, in V.13's own area.
+
+| Step | Outcome | Failure case before | Acceptance test |
+|---|---|---|---|
+| V.20 a stopped run ends (done) | the heap callback and the timeout watchdog wake `drive`, which returns `Terminated` as soon as the host stops the isolate and never reports success for a stopped run; under `jsrt run` a heap stop that has not ended 2 s later exits 6 whatever `--timeout` says | after V8 terminated a callback, deno_core 0.413 counted it as no work: with `--timeout 0`, bombs in a microtask, a `.then` and after an `await` were still running when killed at 12-20 s, and an `rt.serve` handler bomb exited 0 | `a_heap_bomb_inside_a_callback_ends_the_run_even_without_a_timeout`, `a_heap_bomb_in_a_handler_ends_the_server_and_closes_the_listener` — `6db795c` |
+| V.21 cargo-deny 0.20.2 (done) | the pin is a release at least two weeks old (0.20.2, 2026-07-09, builds for every target the script supports); 0.21.x may replace it on or after 2026-11-30 as a reviewed change | 0.21.0 was pinned on its release day and has no x86_64 macOS build | `check.sh`'s version check, and the gate passing with 0.20.2 — `3549b04` |
 
 ## Rejected / deferred, honestly
 

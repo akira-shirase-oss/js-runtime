@@ -91,6 +91,12 @@ Then the review of that pass (also 2026-11-16) changed these:
   4 MiB cap on the bytes it reads, not only on the size the metadata gave.
 - **A manifest key jsrt does not know is an error** (exit 8) naming it:
   `max_byte` used to be ignored, leaving the 64 MiB default.
+- **A heap bomb in a callback ends the run.** One inside a timer, a
+  microtask, code after an `await` or an `rt.serve` handler is now exit 6
+  at once, with or without `--timeout`; it used to leave the process parked
+  until the run timeout (forever with `--timeout 0`) or, for a handler,
+  exit 0. Under `jsrt run`, a run stopped at the heap limit that has not
+  ended 2 s later exits 6 regardless of `--timeout`.
 - **Errors no longer show host details**: a kv store that cannot open says
   "kv open: the store cannot be opened (CannotOpen)" (the full error, with
   its path, goes to stderr), and a name that resolves only to private
@@ -219,8 +225,15 @@ exit 6 rather than a V8 abort. The termination lands when the running call
 returns, so the first time the ceiling is reached V8 gets 1 GiB more for
 that call to finish: the heap can overshoot the ceiling by up to that much
 for a moment (peak RSS 0.73 GB for a 50-million-slot `fill` under
-`--max-heap-mb 64`, which ends as exit 6). What the tests prove: a loop of
-ordinary allocations and that one large `fill`, at 16 and 64 MiB. A single
+`--max-heap-mb 64`, which ends as exit 6). A stopped isolate ends the run
+even where deno_core's event loop would not: after V8 terminates a
+callback, deno_core 0.413 counts it as no work, so the host stops waiting
+on the loop as soon as it stops the isolate, and under `jsrt run` exits 6
+if the run has not ended 2 s later, with or without `--timeout`. What the
+tests prove: a loop of ordinary allocations and that one large `fill`, at
+16 and 64 MiB, and the loop inside a `setTimeout`, a `queueMicrotask`, a
+`.then`, code after an `await` and an `rt.serve` handler, all with
+`--timeout 0` (the server exits and its port closes). A single
 call that allocates more than 1 GiB past the ceiling before it returns can
 still make V8 abort (a signal, no exit code; `jsrt supervise` reports it
 as one). **What this does not cover:** memory outside the V8 heap —
@@ -260,10 +273,10 @@ Rust 1.99.1 (rustup honours it; Homebrew's cargo does not, and
 `scripts/check-toolchain.sh` says so).
 
 Gate: `scripts/check.sh` runs the toolchain check, checks that cargo-deny
-is the release CI pins (0.21.0, in `scripts/install-cargo-deny.sh`), then
-`cargo fmt --check`, Clippy with `-D warnings`, `cargo test --workspace
---locked` (154 tests: 76 lifecycle, 13 security, 30 serve, 11 supervise,
-24 host) and the full `cargo deny --locked check` (advisories, licences,
+is the release CI pins (0.20.2, in `scripts/install-cargo-deny.sh`; a pin
+moves only to a release at least two weeks old), then `cargo fmt --check`,
+Clippy with `-D warnings`, `cargo test --workspace --locked` (156 tests:
+76 lifecycle, 14 security, 31 serve, 11 supervise, 24 host) and the full `cargo deny --locked check` (advisories, licences,
 bans, sources). CI runs the same script on ubuntu-latest and macos-latest
 on every push and pull request, and daily for new advisories.
 
@@ -282,6 +295,8 @@ to watch the test fail, then restored.
 | A heap bomb under `jsrt run` ends as exit 6, not a V8 abort | `security.rs`: `an_allocation_bomb_under_jsrt_run_ends_classified_at_the_heap_limit` |
 | One call that allocates about 700 MB past a 64 MiB limit still ends as exit 6 | `security.rs`: `one_call_that_allocates_far_past_the_heap_limit_still_ends_classified` |
 | `--max-heap-mb` below 16 is a usage error; at 16 a script runs and a bomb is exit 6 | `security.rs`: `a_heap_limit_below_the_floor_is_refused_and_the_floor_works` |
+| A heap bomb in a timer, microtask, `.then` or after an `await` ends as exit 6 with `--timeout 0` | `security.rs`: `a_heap_bomb_inside_a_callback_ends_the_run_even_without_a_timeout` |
+| A heap bomb in an `rt.serve` handler ends the server (exit 6) and closes its port, with `--timeout 0` | `serve.rs`: `a_heap_bomb_in_a_handler_ends_the_server_and_closes_the_listener` |
 | Caught refusals name no canonical path or symlink target | `security.rs`: `caught_refusals_do_not_reveal_canonical_paths_or_symlink_targets` |
 | With no read grant, `readText`, `media.put`, `import.meta.resolve` and `import()` answer alike for an existing and a missing host path | `security.rs`: `a_script_without_a_read_grant_cannot_tell_which_host_paths_exist`; `lifecycle.rs`: `a_missing_import_outside_the_fence_is_refused_like_an_existing_one` |
 | A kv store that cannot open does not name its path | `security.rs`: `a_kv_store_that_cannot_open_does_not_name_its_path` |
