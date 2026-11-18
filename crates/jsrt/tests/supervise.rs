@@ -87,6 +87,8 @@ fn supervise_on_pty(script: &Path, extra: &[&str]) -> (i32, Vec<u8>) {
     let slave_err = slave_out
         .try_clone()
         .unwrap_or_else(|e| panic!("dup slave: {e}"));
+    // SAFETY: master is a live fd this test owns; File takes ownership and
+    // closes it.
     let mut master_file = unsafe { std::fs::File::from_raw_fd(master) };
     let mut child = Command::new(JSRT)
         .arg("supervise")
