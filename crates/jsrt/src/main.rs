@@ -194,8 +194,44 @@ fn exit_code(err: &HostError) -> i32 {
 /// values and the non-empty lines of each secrets file. The literals
 /// never appear in argv, logs or the report — only their masked byte
 /// count lands in `output.*_redacted_bytes`.
+/// Bounds on the redact set: the forwarder scans every output byte
+/// against every literal, so the set's size and shape are bounded —
+/// and a near-empty literal is refused outright, since masking "abc"
+/// anywhere it appears edits unrelated output beyond recognition.
+const REDACT_MIN_SECRET: usize = 4;
+const REDACT_MAX_SECRETS: usize = 256;
+const REDACT_MAX_TOTAL_BYTES: usize = 64 * 1024;
+
+fn push_secret(
+    out: &mut Vec<Vec<u8>>,
+    total: &mut usize,
+    secret: Vec<u8>,
+    what: &str,
+) -> Result<(), HostError> {
+    if secret.len() < REDACT_MIN_SECRET {
+        return Err(HostError::Host(format!(
+            "{what}: {} bytes — redact secrets must be at least {REDACT_MIN_SECRET} bytes",
+            secret.len()
+        )));
+    }
+    if out.len() >= REDACT_MAX_SECRETS {
+        return Err(HostError::Host(format!(
+            "{what}: over {REDACT_MAX_SECRETS} redact secrets — the output scan is bounded"
+        )));
+    }
+    *total += secret.len();
+    if *total > REDACT_MAX_TOTAL_BYTES {
+        return Err(HostError::Host(format!(
+            "{what}: redact secrets pass the {REDACT_MAX_TOTAL_BYTES}-byte bound"
+        )));
+    }
+    out.push(secret);
+    Ok(())
+}
+
 fn resolve_redact(names: &[String], files: &[PathBuf]) -> Result<Vec<Vec<u8>>, HostError> {
     let mut out = Vec::new();
+    let mut total = 0usize;
     for name in names {
         let value = std::env::var(name)
             .map_err(|_| HostError::Host(format!("--redact-env {name}: the variable is unset")))?;
@@ -204,7 +240,12 @@ fn resolve_redact(names: &[String], files: &[PathBuf]) -> Result<Vec<Vec<u8>>, H
                 "--redact-env {name}: the variable is empty"
             )));
         }
-        out.push(value.into_bytes());
+        push_secret(
+            &mut out,
+            &mut total,
+            value.into_bytes(),
+            &format!("--redact-env {name}"),
+        )?;
     }
     for path in files {
         use std::os::unix::fs::PermissionsExt;
@@ -226,7 +267,12 @@ fn resolve_redact(names: &[String], files: &[PathBuf]) -> Result<Vec<Vec<u8>>, H
                 _ => line,
             };
             if !line.is_empty() {
-                out.push(line.to_vec());
+                push_secret(
+                    &mut out,
+                    &mut total,
+                    line.to_vec(),
+                    &format!("--redact-file {}", path.display()),
+                )?;
             }
         }
     }

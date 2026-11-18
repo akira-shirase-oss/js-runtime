@@ -777,6 +777,167 @@ fn worker_escape_sequences_are_neutralised_on_a_tty_and_raw_on_a_pipe() {
 }
 
 #[test]
+fn worker_utf8_reaches_a_tty_byte_exact_and_c1_is_neutralised() {
+    let rig = Rig::new();
+    // Non-ASCII text must pass a terminal sink untouched — the bytes
+    // 0x80..=0x9F are UTF-8 continuations in normal text. The real C1 is
+    // U+009B, which a UTF-8 terminal receives as C2 9B.
+    let script = rig.script(
+        "utf8.js",
+        "rt.print('caf\u{e9} \u{20ac} \u{1f600} \u{65e5}\u{672c}\u{8a9e} ');\n\
+         rt.print('\\u009b');\n\
+         rt.print('done\\n');\n",
+    );
+    let utf8_line = "caf\u{e9} \u{20ac} \u{1f600} \u{65e5}\u{672c}\u{8a9e} ".as_bytes();
+    let csi = [0xc2u8, 0x9b];
+
+    // Pipe: consumer wants the worker's bytes — UTF-8 and C1 alike pass.
+    let out = rig.supervise(&script, &[]);
+    assert_eq!(
+        code(&out),
+        0,
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.stdout.windows(utf8_line.len()).any(|w| w == utf8_line),
+        "pipe rewrote UTF-8: {:?}",
+        &out.stdout[..out.stdout.len().min(200)]
+    );
+    assert!(
+        out.stdout.windows(2).any(|w| w == csi),
+        "pipe lost the C1: {:?}",
+        &out.stdout[..out.stdout.len().min(200)]
+    );
+
+    // PTY: the text is byte-exact and U+009B renders visibly as M-^[.
+    let (tty_code, captured) = supervise_on_pty(&script, &[]);
+    assert_eq!(
+        tty_code,
+        0,
+        "pty run failed: {}",
+        String::from_utf8_lossy(&captured)
+    );
+    assert!(
+        captured.windows(utf8_line.len()).any(|w| w == utf8_line),
+        "UTF-8 text corrupted on the terminal: {}",
+        String::from_utf8_lossy(&captured)
+    );
+    assert!(
+        !captured.windows(2).any(|w| w == csi),
+        "raw C2 9B reached the terminal: {}",
+        String::from_utf8_lossy(&captured)
+    );
+    let text = String::from_utf8_lossy(&captured);
+    assert!(text.contains("M-^[done"), "{text}");
+}
+
+#[test]
+fn overlapping_secrets_mask_their_union_not_the_second_secrets_tail() {
+    let rig = Rig::new();
+    // "12345678" contains "1234" and "345678": masking only the first
+    // leaves "5678" — most of the second secret. The union must be masked.
+    let secrets = rig.dir.path().join("secrets.txt");
+    fs::write(&secrets, "1234\n345678\n").unwrap_or_else(|e| panic!("write: {e}"));
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&secrets, fs::Permissions::from_mode(0o600))
+        .unwrap_or_else(|e| panic!("chmod: {e}"));
+    let path_s = secrets
+        .to_str()
+        .unwrap_or_else(|| panic!("utf8"))
+        .to_string();
+    let script = rig.script("overlap.js", "rt.print('pre 12345678 post\\n');\n");
+    let out = rig.supervise(&script, &["--redact-file", &path_s]);
+    assert_eq!(
+        code(&out),
+        0,
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains("5678"),
+        "tail of the second secret leaked: {stdout}"
+    );
+    assert!(stdout.contains("pre [redacted] post"), "{stdout}");
+    let r = report(&out);
+    assert_eq!(r["output"]["stdout_redacted_bytes"], 8, "{r}");
+}
+
+#[test]
+fn redaction_refuses_tiny_or_unbounded_secret_sets() {
+    use std::os::unix::fs::PermissionsExt;
+    let rig = Rig::new();
+    let script = rig.script("ok2.js", "rt.print('x\\n');\n");
+    let mk = |name: &str, body: &str| -> String {
+        let p = rig.dir.path().join(name);
+        fs::write(&p, body).unwrap_or_else(|e| panic!("write: {e}"));
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o600))
+            .unwrap_or_else(|e| panic!("chmod: {e}"));
+        p.to_str().unwrap_or_else(|| panic!("utf8")).to_string()
+    };
+
+    // A 3-byte literal would mask every unrelated occurrence.
+    let tiny = mk("tiny.txt", "abc\n");
+    let out = rig.supervise(&script, &["--redact-file", &tiny]);
+    assert_eq!(
+        code(&out),
+        8,
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("4 bytes"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // The same footgun through the environment.
+    let out = rig.supervise_env(
+        &script,
+        &["--redact-env", "JSRT_TEST_SECRET"],
+        &[("JSRT_TEST_SECRET", "abc")],
+    );
+    assert_eq!(
+        code(&out),
+        8,
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // A secrets file is a scan pattern per output byte — bound the set.
+    let many = mk(
+        "many.txt",
+        &(0..257)
+            .map(|i| format!("secret-number-{i:04}-long-enough"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    );
+    let out = rig.supervise(&script, &["--redact-file", &many]);
+    assert_eq!(
+        code(&out),
+        8,
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("256"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // And bound the total bytes scanned for.
+    let big = mk("big.txt", &format!("{}\n", "s".repeat(70000)));
+    let out = rig.supervise(&script, &["--redact-file", &big]);
+    assert_eq!(
+        code(&out),
+        8,
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
 fn a_steady_worker_under_the_rate_budget_flows_past_the_lifetime_cap() {
     let rig = Rig::new();
     // 16 x 1 KiB lines, one every ~100 ms (~10 KiB/s): past the 8 KiB

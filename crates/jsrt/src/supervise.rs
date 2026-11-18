@@ -121,28 +121,132 @@ struct ForwardCfg {
 
 const REDACTED: &[u8] = b"[redacted]";
 
-/// Terminal-hazard bytes rendered visibly, `cat -v` style: every C0
-/// control except `\n` and `\t`, DEL, and C1 — the bytes that make up
-/// escape sequences, cursor moves, OSC titles and hyperlinks. Everything
-/// else (printable ASCII and the UTF-8 high range) passes untouched.
-fn append_neutralised(out: &mut Vec<u8>, bytes: &[u8]) {
-    for &b in bytes {
-        match b {
-            0x00..=0x08 | 0x0b..=0x1f => {
-                out.push(b'^');
-                out.push(b + 0x40);
+/// Renders a worker's output safe for a terminal, UTF-8 aware: C0
+/// controls except `\n` and `\t`, DEL, and the C1 code points become
+/// `^X` / `M-^x` (a UTF-8 terminal receives U+0080..U+009F as C2 80..9F).
+/// Every other valid scalar passes byte-for-byte — the 0x80..0x9F range
+/// is ordinary continuation bytes in text like "café", "€" or "😀".
+/// Invalid or lone bytes render as `\xNN`: a lone 0x9B is still CSI in
+/// 8-bit terminal modes. An incomplete trailing sequence (at most 3
+/// bytes) is held for the next chunk — same shape as the redactor's
+/// hold-back — and flushed rendered at EOF.
+struct Neutraliser {
+    hold: Vec<u8>,
+}
+
+impl Neutraliser {
+    fn new() -> Self {
+        Self { hold: Vec::new() }
+    }
+
+    fn process(&mut self, chunk: &[u8], out: &mut Vec<u8>) {
+        self.hold.extend_from_slice(chunk);
+        let hay = std::mem::take(&mut self.hold);
+        let mut i = 0;
+        while i < hay.len() {
+            let b = hay[i];
+            match b {
+                b'\n' | b'\t' => {
+                    out.push(b);
+                    i += 1;
+                }
+                0x00..=0x08 | 0x0b..=0x1f => {
+                    out.push(b'^');
+                    out.push(b + 0x40);
+                    i += 1;
+                }
+                0x7f => {
+                    out.extend_from_slice(b"^?");
+                    i += 1;
+                }
+                0x20..=0x7e => {
+                    out.push(b);
+                    i += 1;
+                }
+                _ => {
+                    let len = utf8_len(b);
+                    if len == 0 {
+                        push_hex(out, b);
+                        i += 1;
+                        continue;
+                    }
+                    if hay.len() - i < len {
+                        if utf8_valid_prefix(&hay[i..]) {
+                            break;
+                        }
+                        push_hex(out, b);
+                        i += 1;
+                        continue;
+                    }
+                    let seq = &hay[i..i + len];
+                    if !utf8_valid_seq(seq) {
+                        push_hex(out, b);
+                        i += 1;
+                        continue;
+                    }
+                    if len == 2 && b == 0xc2 && (0x80..=0x9f).contains(&seq[1]) {
+                        out.extend_from_slice(b"M-^");
+                        out.push(seq[1] - 0x80 + 0x40);
+                    } else {
+                        out.extend_from_slice(seq);
+                    }
+                    i += len;
+                }
             }
-            0x7f => {
-                out.push(b'^');
-                out.push(b'?');
-            }
-            0x80..=0x9f => {
-                out.extend_from_slice(b"M-^");
-                out.push(b - 0x80 + 0x40);
-            }
-            _ => out.push(b),
+        }
+        self.hold.extend_from_slice(&hay[i..]);
+    }
+
+    /// The stream ended: a held partial sequence can never complete —
+    /// show its bytes rather than drop or emit them raw.
+    fn finish(&mut self, out: &mut Vec<u8>) {
+        for &b in std::mem::take(&mut self.hold).iter() {
+            push_hex(out, b);
         }
     }
+}
+
+fn push_hex(out: &mut Vec<u8>, b: u8) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    out.extend_from_slice(b"\\x");
+    out.push(HEX[(b >> 4) as usize]);
+    out.push(HEX[(b & 0xf) as usize]);
+}
+
+/// Length of the sequence a lead byte opens, or 0 for bytes that cannot
+/// lead one (lone continuations, overlong C0/C1, starts above U+10FFFF).
+fn utf8_len(lead: u8) -> usize {
+    match lead {
+        0xc2..=0xdf => 2,
+        0xe0..=0xef => 3,
+        0xf0..=0xf4 => 4,
+        _ => 0,
+    }
+}
+
+/// The constraint on the byte right after the lead — the only position
+/// whose range varies (overlong, surrogate and >U+10FFFF screens).
+fn second_byte_ok(lead: u8, b: u8) -> bool {
+    match lead {
+        0xe0 => (0xa0..=0xbf).contains(&b),
+        0xed => (0x80..=0x9f).contains(&b),
+        0xf0 => (0x90..=0xbf).contains(&b),
+        0xf4 => (0x80..=0x8f).contains(&b),
+        _ => (0x80..=0xbf).contains(&b),
+    }
+}
+
+/// `part`, shorter than a full sequence, could still complete into a
+/// valid one: every byte present satisfies its position's range.
+fn utf8_valid_prefix(part: &[u8]) -> bool {
+    utf8_len(part[0]) > 0
+        && part.get(1).map_or(true, |&b| second_byte_ok(part[0], b))
+        && part.iter().skip(2).all(|&b| (0x80..=0xbf).contains(&b))
+}
+
+/// `seq` is a complete, strictly valid UTF-8 sequence.
+fn utf8_valid_seq(seq: &[u8]) -> bool {
+    second_byte_ok(seq[0], seq[1]) && seq[2..].iter().all(|&b| (0x80..=0xbf).contains(&b))
 }
 
 /// Masks configured literals in the forwarded stream, across chunk
@@ -151,6 +255,13 @@ fn append_neutralised(out: &mut Vec<u8>, bytes: &[u8]) {
 /// original bytes masked — the marker is framing, like the line prefix.
 struct Redactor {
     secrets: Vec<Vec<u8>>,
+    /// Secret indices by their first byte: a position only scans the
+    /// literals it could begin. Without it every byte paid a
+    /// `starts_with` per secret — ~2.5 G compares over 10 MiB of output
+    /// at the 256-secret bound, enough to stall the worker past its
+    /// timeout. Worst case (all secrets sharing a first byte) stays
+    /// bounded by the 256 cap.
+    buckets: Vec<Vec<usize>>,
     hold: Vec<u8>,
     max_len: usize,
     redacted: u64,
@@ -159,8 +270,15 @@ struct Redactor {
 impl Redactor {
     fn new(secrets: Vec<Vec<u8>>) -> Self {
         let max_len = secrets.iter().map(|s| s.len()).max().unwrap_or(0);
+        let mut buckets = vec![Vec::new(); 256];
+        for (i, s) in secrets.iter().enumerate() {
+            if let Some(&first) = s.first() {
+                buckets[first as usize].push(i);
+            }
+        }
         Self {
             secrets,
+            buckets,
             hold: Vec::new(),
             max_len,
             redacted: 0,
@@ -181,11 +299,12 @@ impl Redactor {
         let mut hay = std::mem::take(&mut self.hold);
         hay.extend_from_slice(chunk);
         let mut pos = 0;
-        while let Some((start, len)) = self.find_earliest(&hay, pos, false) {
+        while let Some(start) = self.next_match(&hay, pos, false) {
             out.extend_from_slice(&hay[pos..start]);
+            let end = self.mask_union(&hay, start, false);
             out.extend_from_slice(REDACTED);
-            self.redacted += len as u64;
-            pos = start + len;
+            self.redacted += (end - start) as u64;
+            pos = end;
         }
         // Anything in the last max_len-1 bytes could be the start of a
         // secret the next chunk completes — hold it, emit the rest.
@@ -199,36 +318,54 @@ impl Redactor {
     fn finish(&mut self, out: &mut Vec<u8>) {
         let hay = std::mem::take(&mut self.hold);
         let mut pos = 0;
-        while let Some((start, len)) = self.find_earliest(&hay, pos, true) {
+        while let Some(start) = self.next_match(&hay, pos, true) {
             out.extend_from_slice(&hay[pos..start]);
+            let end = self.mask_union(&hay, start, true);
             out.extend_from_slice(REDACTED);
-            self.redacted += len as u64;
-            pos = start + len;
+            self.redacted += (end - start) as u64;
+            pos = end;
         }
         out.extend_from_slice(&hay[pos..]);
     }
 
-    /// Earliest match at or after `from` as (start, bytes masked). A
-    /// proper prefix of a secret at the very tail only counts when
-    /// `final_chunk` — mid-stream it may still complete or dissolve.
-    fn find_earliest(&self, hay: &[u8], from: usize, final_chunk: bool) -> Option<(usize, usize)> {
-        for i in from..hay.len() {
-            let mut best: Option<usize> = None;
-            for s in &self.secrets {
-                let len = if hay[i..].starts_with(s) {
-                    s.len()
-                } else if final_chunk && hay.len() - i < s.len() && s.starts_with(&hay[i..]) {
-                    hay.len() - i
-                } else {
-                    continue;
-                };
-                best = Some(best.map_or(len, |b| b.max(len)));
-            }
-            if let Some(len) = best {
-                return Some((i, len));
-            }
+    /// First position at or after `from` where a secret starts.
+    fn next_match(&self, hay: &[u8], from: usize, final_chunk: bool) -> Option<usize> {
+        (from..hay.len()).find(|&i| self.match_at(hay, i, final_chunk).is_some())
+    }
+
+    /// Longest match starting at `i` as bytes masked, or a proper-prefix
+    /// match at the very tail when `final_chunk` — mid-stream it may
+    /// still complete or dissolve.
+    fn match_at(&self, hay: &[u8], i: usize, final_chunk: bool) -> Option<usize> {
+        let mut best: Option<usize> = None;
+        for &si in &self.buckets[hay[i] as usize] {
+            let s = &self.secrets[si];
+            let len = if hay[i..].starts_with(s) {
+                s.len()
+            } else if final_chunk && hay.len() - i < s.len() && s.starts_with(&hay[i..]) {
+                hay.len() - i
+            } else {
+                continue;
+            };
+            best = Some(best.map_or(len, |b| b.max(len)));
         }
-        None
+        best
+    }
+
+    /// End of the masked union opened at `start`: a match that begins
+    /// inside the masked span extends it. Masking only the first match
+    /// would show the tail of any secret it overlaps — "1234" of
+    /// "12345678" leaves "5678" of "345678" visible.
+    fn mask_union(&self, hay: &[u8], start: usize, final_chunk: bool) -> usize {
+        let mut end = start + self.match_at(hay, start, final_chunk).unwrap_or(0);
+        let mut j = start + 1;
+        while j < end && j < hay.len() {
+            if let Some(l) = self.match_at(hay, j, final_chunk) {
+                end = end.max(j + l);
+            }
+            j += 1;
+        }
+        end
     }
 }
 
@@ -296,6 +433,7 @@ fn forward(
     let mut tokens = cap as f64;
     let mut last_refill = Instant::now();
     let mut redactor = Redactor::new(cfg.secrets);
+    let mut neutraliser = Neutraliser::new();
     let mut emit = Vec::new();
     let mut emit2 = Vec::new();
     loop {
@@ -319,7 +457,7 @@ fn forward(
             redactor.process(&buf[..keep], &mut emit);
             let payload: &[u8] = if cfg.sanitise {
                 emit2.clear();
-                append_neutralised(&mut emit2, &emit);
+                neutraliser.process(&emit, &mut emit2);
                 &emit2
             } else {
                 &emit
@@ -370,7 +508,7 @@ fn forward(
     if !emit.is_empty() {
         let payload: &[u8] = if cfg.sanitise {
             emit2.clear();
-            append_neutralised(&mut emit2, &emit);
+            neutraliser.process(&emit, &mut emit2);
             &emit2
         } else {
             &emit
@@ -378,6 +516,17 @@ fn forward(
         let _ = match &cfg.prefix {
             Some(prefix) => write_prefixed(&mut to, prefix, &mut at_line_start, payload),
             None => to.write_all(payload).and_then(|()| to.flush()),
+        };
+    }
+    // A scalar truncated at EOF renders as its \xNN bytes. Never fed
+    // when the sink is not a terminal, so its hold is empty and this
+    // writes nothing.
+    emit2.clear();
+    neutraliser.finish(&mut emit2);
+    if !emit2.is_empty() {
+        let _ = match &cfg.prefix {
+            Some(prefix) => write_prefixed(&mut to, prefix, &mut at_line_start, &emit2),
+            None => to.write_all(&emit2).and_then(|()| to.flush()),
         };
     }
     if !tail.is_empty() {
@@ -401,7 +550,8 @@ fn forward(
         redactor.finish(&mut emit);
         let bytes = if cfg.sanitise {
             emit2.clear();
-            append_neutralised(&mut emit2, &emit);
+            neutraliser.process(&emit, &mut emit2);
+            neutraliser.finish(&mut emit2);
             std::mem::take(&mut emit2)
         } else {
             emit
@@ -912,4 +1062,76 @@ fn append_line(path: &std::path::Path, line: &str) -> Result<(), HostError> {
         .open(path)
         .map_err(|e| HostError::Host(format!("report file {}: {e}", path.display())))?;
     writeln!(f, "{line}").map_err(|e| HostError::Host(format!("report file: {e}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Neutraliser, Redactor};
+
+    #[test]
+    fn utf8_text_passes_the_neutraliser_byte_for_byte() {
+        let mut n = Neutraliser::new();
+        let mut out = Vec::new();
+        n.process("café € 😀 日本語\n".as_bytes(), &mut out);
+        n.finish(&mut out);
+        assert_eq!(out, "café € 😀 日本語\n".as_bytes());
+    }
+
+    #[test]
+    fn c1_code_points_render_but_lone_bytes_stay_hex() {
+        let mut n = Neutraliser::new();
+        let mut out = Vec::new();
+        // U+009B (CSI) arrives on a UTF-8 terminal as C2 9B.
+        n.process(&[0xc2, 0x9b], &mut out);
+        assert_eq!(out, b"M-^[");
+        out.clear();
+        // The lone byte is the 8-bit form of the same control.
+        n.process(&[0x9b], &mut out);
+        assert_eq!(out, b"\\x9b");
+    }
+
+    #[test]
+    fn a_scalar_split_across_chunks_arrives_intact() {
+        let mut n = Neutraliser::new();
+        let mut out = Vec::new();
+        n.process(&[0xf0, 0x9f], &mut out); // first half of U+1F600
+        assert!(out.is_empty(), "held: {out:?}");
+        n.process(&[0x98, 0x80], &mut out);
+        assert_eq!(out, &[0xf0, 0x9f, 0x98, 0x80]);
+    }
+
+    #[test]
+    fn a_truncated_scalar_renders_at_eof() {
+        let mut n = Neutraliser::new();
+        let mut out = Vec::new();
+        n.process(&[0xf0, 0x9f], &mut out);
+        n.finish(&mut out);
+        assert_eq!(out, b"\\xf0\\x9f");
+    }
+
+    #[test]
+    fn invalid_and_control_bytes_stay_visible() {
+        let mut n = Neutraliser::new();
+        let mut out = Vec::new();
+        n.process(
+            &[
+                0x1b, b'[', b'2', b'J', // CSI clear-screen attempt
+                0x07, // BEL
+                0xed, 0xa0, 0xbd, // unpaired surrogate (WTF-8)
+                0xff, b'A', b'\n',
+            ],
+            &mut out,
+        );
+        assert_eq!(out, b"^[[2J^G\\xed\\xa0\\xbd\\xffA\n");
+    }
+
+    #[test]
+    fn overlapping_secrets_mask_their_union() {
+        let mut r = Redactor::new(vec![b"1234".to_vec(), b"345678".to_vec()]);
+        let mut out = Vec::new();
+        r.process(b"pre 12345678 post", &mut out);
+        r.finish(&mut out);
+        assert_eq!(out, b"pre [redacted] post");
+        assert_eq!(r.redacted, 8);
+    }
 }
