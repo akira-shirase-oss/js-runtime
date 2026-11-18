@@ -163,6 +163,10 @@ enum Command {
         /// budget and a long-lived worker goes quiet at it).
         #[arg(long, default_value_t = 0)]
         max_output_rate_kbs: u64,
+        /// Prefix each worker stdout line with the run id, as stderr
+        /// already gets.
+        #[arg(long)]
+        prefix_stdout: bool,
     },
 }
 
@@ -193,6 +197,7 @@ async fn main() {
             report_max_kb,
             max_output_kb,
             max_output_rate_kbs,
+            prefix_stdout,
         } => {
             let plan = supervise::SupervisePlan {
                 worker_args: run.to_argv(),
@@ -204,6 +209,7 @@ async fn main() {
                 report_max_bytes: report_max_kb * 1024,
                 max_output_bytes: max_output_kb.saturating_mul(1024),
                 output_rate_bps: max_output_rate_kbs.saturating_mul(1024),
+                prefix_stdout,
             };
             match supervise::supervise(&plan) {
                 Ok(code) => std::process::exit(code),

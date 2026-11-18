@@ -75,6 +75,10 @@ pub struct SupervisePlan {
     /// Sustained pass-through in bytes/s once the burst is spent
     /// (0 = lifetime cap only — a long-lived worker goes quiet at it).
     pub output_rate_bps: u64,
+    /// Also prefix worker stdout lines with the run id. stderr lines are
+    /// always prefixed; stdout is a data pipe and stays byte-exact unless
+    /// the operator asks.
+    pub prefix_stdout: bool,
 }
 
 /// The last bytes of each capped stream, kept and shown at exit — where a
@@ -88,6 +92,47 @@ struct Forwarded {
     written: u64,
     dropped: u64,
     tail: u64,
+}
+
+/// What one worker stream's forwarder does with the bytes the budget
+/// lets through: pass them untouched, or mark each line with its run id
+/// so a shared log says which run produced it.
+struct ForwardCfg {
+    cap: u64,
+    rate_bps: u64,
+    /// Line prefix marking the stream's run; `None` passes bytes raw.
+    prefix: Option<String>,
+}
+
+/// Write `bytes` to `to` with `prefix` at the start of every line,
+/// tracking `at_line_start` across calls so a line split over several
+/// reads stays byte-exact and still goes out live. Prefix bytes are
+/// framing — they are not counted against the worker's output budget.
+fn write_prefixed(
+    to: &mut impl Write,
+    prefix: &str,
+    at_line_start: &mut bool,
+    bytes: &[u8],
+) -> std::io::Result<()> {
+    let mut rest = bytes;
+    while !rest.is_empty() {
+        if *at_line_start {
+            to.write_all(prefix.as_bytes())?;
+            *at_line_start = false;
+        }
+        match rest.iter().position(|b| *b == b'\n') {
+            Some(i) => {
+                to.write_all(&rest[..=i])?;
+                *at_line_start = true;
+                rest = &rest[i + 1..];
+            }
+            None => {
+                to.write_all(rest)?;
+                rest = &[];
+            }
+        }
+    }
+    to.flush()
 }
 
 /// Copy `from` to `to` until EOF, passing what a token bucket allows and
@@ -109,13 +154,15 @@ fn forward(
     mut from: impl Read,
     mut to: impl Write,
     mut notice: impl Write,
-    cap: u64,
-    rate_bps: u64,
+    cfg: ForwardCfg,
 ) -> Forwarded {
+    let cap = cfg.cap;
+    let rate_bps = cfg.rate_bps;
     let mut done = Forwarded::default();
     let mut tail: std::collections::VecDeque<u8> =
         std::collections::VecDeque::with_capacity(OUTPUT_TAIL_BYTES);
     let mut buf = [0u8; 8192];
+    let mut at_line_start = true;
     let rate = rate_bps as f64;
     let capacity = cap.max(buf.len() as u64) as f64;
     let mut tokens = cap as f64;
@@ -137,7 +184,11 @@ fn forward(
         let keep = n.min(tokens as usize);
         tokens -= keep as f64;
         if keep > 0 {
-            if to.write_all(&buf[..keep]).and_then(|()| to.flush()).is_ok() {
+            let wrote = match &cfg.prefix {
+                Some(prefix) => write_prefixed(&mut to, prefix, &mut at_line_start, &buf[..keep]),
+                None => to.write_all(&buf[..keep]).and_then(|()| to.flush()),
+            };
+            if wrote.is_ok() {
                 done.written += keep as u64;
             } else {
                 done.dropped += keep as u64;
@@ -292,28 +343,28 @@ pub fn supervise(plan: &SupervisePlan) -> Result<i32, HostError> {
     // cannot start processes that would inherit the pipes).
     let cap = plan.max_output_bytes;
     let rate = plan.output_rate_bps;
+    // Worker stderr always carries its run id — that is where the host's
+    // error lines land; stdout is a data pipe and gets the marker only
+    // when asked.
+    let line_prefix = format!("[run {run_id}] ");
+    let out_cfg = ForwardCfg {
+        cap,
+        rate_bps: rate,
+        prefix: plan.prefix_stdout.then(|| line_prefix.clone()),
+    };
+    let err_cfg = ForwardCfg {
+        cap,
+        rate_bps: rate,
+        prefix: Some(line_prefix),
+    };
     let out_forwarder = child.stdout.take().map(|out| {
         std::thread::spawn(move || {
-            forward(
-                "stdout",
-                out,
-                std::io::stdout(),
-                std::io::stderr(),
-                cap,
-                rate,
-            )
+            forward("stdout", out, std::io::stdout(), std::io::stderr(), out_cfg)
         })
     });
     let err_forwarder = child.stderr.take().map(|err| {
         std::thread::spawn(move || {
-            forward(
-                "stderr",
-                err,
-                std::io::stderr(),
-                std::io::stderr(),
-                cap,
-                rate,
-            )
+            forward("stderr", err, std::io::stderr(), std::io::stderr(), err_cfg)
         })
     });
     // The handle stays alive purely so the child stays ours until reaped —
@@ -467,11 +518,13 @@ struct Outcome {
 /// Map the child's wait-status onto the run taxonomy. A signal we sent is
 /// a budget doing its job; a signal nobody asked for is a host failure —
 /// the report names it either way. Returns the label, the exit code, and
-/// the `killed_by` the report should carry (SIGXCPU explains itself).
+/// the `killed_by` the report should carry (SIGXCPU explains itself; any
+/// other signal names itself and admits the sender is unknown — claiming
+/// a kill jsrt never ordered would be a lie).
 fn classify_death(
     status: libc::c_int,
     killed_by: Option<&'static str>,
-) -> (Outcome, i32, Option<&'static str>) {
+) -> (Outcome, i32, Option<String>) {
     if libc::WIFEXITED(status) {
         let code = libc::WEXITSTATUS(status);
         let label = match code {
@@ -491,20 +544,21 @@ fn classify_death(
                 signal: None,
             },
             code,
-            killed_by,
+            killed_by.map(str::to_string),
         );
     }
     if libc::WIFSIGNALED(status) {
         let sig = libc::WTERMSIG(status);
-        // A SIGXCPU is the CPU rlimit, a SIGTERM/SIGKILL after kill_sent is
-        // our own hand, a SIGABRT is most likely V8's OOM handler firing —
-        // all budget-class deaths. Anything else is unexplained.
-        let by = killed_by.or(if sig == libc::SIGXCPU {
-            Some(KILLED_BY_CPU)
+        // A SIGXCPU is the CPU rlimit, a SIGTERM/SIGKILL after sigterm_at
+        // is our own hand, a SIGABRT is most likely V8's OOM handler
+        // firing — all explained deaths. Anything else names the signal
+        // and says the sender is unknown instead of implying jsrt sent it.
+        let by = killed_by.map(str::to_string).or(if sig == libc::SIGXCPU {
+            Some(KILLED_BY_CPU.to_string())
         } else if sig == libc::SIGABRT {
-            Some("abort")
+            Some("abort".to_string())
         } else {
-            None
+            Some(format!("signal {sig} (sender unknown)"))
         });
         let expected = killed_by.is_some()
             || sig == libc::SIGXCPU
@@ -528,7 +582,7 @@ fn classify_death(
             signal: None,
         },
         8,
-        killed_by,
+        killed_by.map(str::to_string),
     )
 }
 

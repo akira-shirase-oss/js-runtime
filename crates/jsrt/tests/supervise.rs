@@ -363,6 +363,138 @@ fn a_flooding_worker_is_capped_per_stream_and_the_drop_is_counted() {
 }
 
 #[test]
+fn worker_stderr_lines_carry_the_run_id_and_stdout_stays_bare() {
+    let rig = Rig::new();
+    // The host's final error line is worker stderr; an operator reading a
+    // shared log needs to know which run said it. stdout is a data pipe —
+    // it stays byte-exact unless --prefix-stdout asks for the marker.
+    let script = rig.script("die.js", "throw new Error('MARKED-LINE-7f3a');\n");
+    let out = rig.supervise(&script, &[]);
+    assert_eq!(code(&out), 5);
+    let r = report(&out);
+    let run_id = r["run_id"].as_str().unwrap_or_else(|| panic!("{r}"));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let marked = stderr
+        .lines()
+        .find(|l| l.contains("MARKED-LINE-7f3a"))
+        .unwrap_or_else(|| panic!("worker error line missing: {stderr}"));
+    assert!(
+        marked.starts_with(&format!("[run {run_id}]")),
+        "worker stderr line is not prefixed with its run id: {marked}"
+    );
+    // The supervisor's own lines are not worker output — no prefix.
+    let readiness = stderr
+        .lines()
+        .find(|l| l.contains("running, signals forwarded"))
+        .unwrap_or_else(|| panic!("no readiness line: {stderr}"));
+    assert!(
+        !readiness.contains("[run "),
+        "supervisor line got a worker prefix: {readiness}"
+    );
+    // stdout carries only the report — nothing prefixed.
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains("[run "),
+        "stdout was prefixed without the flag: {stdout}"
+    );
+}
+
+#[test]
+fn prefix_stdout_marks_worker_lines_when_asked() {
+    let rig = Rig::new();
+    let script = rig.script("ok.js", "rt.print('worker-says-hi\\n');\n");
+    let out = rig.supervise(&script, &["--prefix-stdout"]);
+    assert_eq!(
+        code(&out),
+        0,
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let r = report(&out);
+    let run_id = r["run_id"].as_str().unwrap_or_else(|| panic!("{r}"));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let marked = stdout
+        .lines()
+        .find(|l| l.contains("worker-says-hi"))
+        .unwrap_or_else(|| panic!("worker line missing: {stdout}"));
+    assert!(
+        marked.starts_with(&format!("[run {run_id}]")),
+        "worker stdout line is not prefixed: {marked}"
+    );
+}
+
+#[test]
+fn an_external_signal_is_reported_without_claiming_the_supervisor_sent_it() {
+    // A signal that lands on the worker from outside (an operator, OOM
+    // killer, another tool) is not a budget doing its job — the report
+    // must name the signal and say the sender is unknown.
+    let rig = Rig::new();
+    let script = rig.script("stall.js", "await new Promise(() => {});\n");
+    let mut child = Command::new(JSRT)
+        .args([
+            "supervise",
+            script.to_str().unwrap_or_else(|| panic!("utf8")),
+            "--timeout",
+            "0",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|e| panic!("spawn supervise: {e}"));
+    let stderr = child
+        .stderr
+        .take()
+        .unwrap_or_else(|| panic!("no stderr pipe"));
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        for line in std::io::BufReader::new(stderr).lines() {
+            let Ok(line) = line else { break };
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let mut worker_pid = None;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while worker_pid.is_none() {
+        let left = deadline
+            .checked_duration_since(std::time::Instant::now())
+            .unwrap_or_else(|| panic!("supervisor never armed: no readiness line in 15s"));
+        let line = rx
+            .recv_timeout(left)
+            .unwrap_or_else(|e| panic!("supervisor stderr closed before arming: {e}"));
+        if let Some(rest) = line.strip_prefix("jsrt: supervise: worker ") {
+            worker_pid = rest
+                .split_whitespace()
+                .next()
+                .and_then(|s| s.parse::<i32>().ok());
+        }
+    }
+    let worker_pid = worker_pid.unwrap_or_else(|| panic!("no pid in readiness line"));
+
+    // Kill the worker itself — not the supervisor. The supervisor watches
+    // a death it never ordered.
+    Command::new("kill")
+        .args(["-TERM", &worker_pid.to_string()])
+        .output()
+        .unwrap_or_else(|e| panic!("kill: {e}"));
+    let out = child
+        .wait_with_output()
+        .unwrap_or_else(|e| panic!("wait: {e}"));
+    assert_eq!(
+        code(&out),
+        6,
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let r = report(&out);
+    assert_eq!(r["outcome"], "terminated", "{r}");
+    assert_eq!(r["signal"], 15, "{r}");
+    assert_eq!(r["killed_by"], "signal 15 (sender unknown)", "{r}");
+}
+
+#[test]
 fn a_steady_worker_under_the_rate_budget_flows_past_the_lifetime_cap() {
     let rig = Rig::new();
     // 16 x 1 KiB lines, one every ~100 ms (~10 KiB/s): past the 8 KiB
