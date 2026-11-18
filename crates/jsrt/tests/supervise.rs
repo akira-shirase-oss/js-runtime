@@ -363,6 +363,76 @@ fn a_flooding_worker_is_capped_per_stream_and_the_drop_is_counted() {
 }
 
 #[test]
+fn a_steady_worker_under_the_rate_budget_flows_past_the_lifetime_cap() {
+    let rig = Rig::new();
+    // 16 x 1 KiB lines, one every ~100 ms (~10 KiB/s): past the 8 KiB
+    // lifetime cap early, but under a 32 KiB/s rate every chunk is covered
+    // by what the bucket accrued during the 100 ms gap. Without the rate
+    // flag this is exit 2; with the old code it would be 8 KiB passed and
+    // the rest dropped.
+    let script = rig.script(
+        "steady.js",
+        "const line = 'x'.repeat(1023) + '\\n';\n\
+         for (let i = 0; i < 16; i++) { rt.print(line); await rt.sleep(100); }\n",
+    );
+    let out = rig.supervise(
+        &script,
+        &["--max-output-kb", "8", "--max-output-rate-kbs", "32"],
+    );
+    assert_eq!(
+        code(&out),
+        0,
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let r = report(&out);
+    assert_eq!(r["output"]["rate_bytes_per_sec"], 32 * 1024, "{r}");
+    assert_eq!(r["output"]["stdout_bytes"], 16 * 1024, "{r}");
+    assert_eq!(r["output"]["stdout_dropped_bytes"], 0, "{r}");
+}
+
+#[test]
+fn a_flooding_worker_stays_bounded_when_a_rate_is_configured() {
+    let rig = Rig::new();
+    // 200 KiB at once against an 8 KiB cap + 64 KiB/s rate: the burst
+    // spends the bucket, the flood finishes before the rate accrues
+    // anything meaningful, and the drop is named in the new wording.
+    let script = rig.script(
+        "flood.js",
+        "const line = 'x'.repeat(1023) + '\\n';\n\
+         for (let i = 0; i < 200; i++) rt.print(line);\n",
+    );
+    let out = rig.supervise(
+        &script,
+        &["--max-output-kb", "8", "--max-output-rate-kbs", "64"],
+    );
+    assert_eq!(
+        code(&out),
+        0,
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let r = report(&out);
+    let passed = r["output"]["stdout_bytes"].as_u64().unwrap_or(u64::MAX);
+    // The whole run is well under a second, so at most cap + ~1s of rate
+    // can have passed — never the flood itself.
+    assert!(
+        passed <= 8 * 1024 + 64 * 1024,
+        "{passed} bytes passed — the rate let the flood through"
+    );
+    assert!(
+        r["output"]["stdout_dropped_bytes"].as_u64().unwrap_or(0) > 0,
+        "{r}"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("exceeded its output budget"),
+        "stderr tail: {}",
+        &stderr[stderr.len().saturating_sub(400)..]
+    );
+}
+
+#[test]
 fn the_cause_of_death_survives_a_flooded_stream() {
     let rig = Rig::new();
     // The host's own final line is 200 KiB long and ends with the part an

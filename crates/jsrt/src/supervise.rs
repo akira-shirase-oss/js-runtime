@@ -69,7 +69,12 @@ pub struct SupervisePlan {
     /// Byte cap for the report file before it rotates.
     pub report_max_bytes: u64,
     /// Bytes of worker stdout, and separately stderr, passed through.
+    /// With `output_rate_bps` this is the burst allowance, refilled at
+    /// that rate; at rate 0 it is a lifetime budget.
     pub max_output_bytes: u64,
+    /// Sustained pass-through in bytes/s once the burst is spent
+    /// (0 = lifetime cap only — a long-lived worker goes quiet at it).
+    pub output_rate_bps: u64,
 }
 
 /// The last bytes of each capped stream, kept and shown at exit — where a
@@ -85,12 +90,16 @@ struct Forwarded {
     tail: u64,
 }
 
-/// Copy `from` to `to` until EOF, passing at most `cap` bytes and counting
-/// the rest. It keeps reading past the cap — a worker blocked on a full
-/// pipe would stall instead of being limited — so the bound is on what
-/// reaches the operator, not on what the worker may try to write.
+/// Copy `from` to `to` until EOF, passing what a token bucket allows and
+/// counting the rest. `cap` is the burst (the bucket starts full) and
+/// `rate_bps` refills it; at rate 0 that degenerates to the old lifetime
+/// cap. The bucket's capacity floors at one read buffer so a 0-burst
+/// plus a rate still lets a trickle through. The forwarder keeps reading
+/// past any drop — a worker blocked on a full pipe would stall instead
+/// of being limited — so the bound is on what reaches the operator, not
+/// on what the worker may try to write.
 ///
-/// The moment the cap is first hit, a notice goes to `notice` (the
+/// The moment output is first dropped, a notice goes to `notice` (the
 /// supervisor's stderr), so a long-running worker's operator learns it
 /// then, not at exit. The last `OUTPUT_TAIL_BYTES` of the dropped output
 /// are kept and written at EOF, starting at a line boundary when there is
@@ -101,11 +110,16 @@ fn forward(
     mut to: impl Write,
     mut notice: impl Write,
     cap: u64,
+    rate_bps: u64,
 ) -> Forwarded {
     let mut done = Forwarded::default();
     let mut tail: std::collections::VecDeque<u8> =
         std::collections::VecDeque::with_capacity(OUTPUT_TAIL_BYTES);
     let mut buf = [0u8; 8192];
+    let rate = rate_bps as f64;
+    let capacity = cap.max(buf.len() as u64) as f64;
+    let mut tokens = cap as f64;
+    let mut last_refill = Instant::now();
     loop {
         let n = match from.read(&mut buf) {
             Ok(0) => break,
@@ -113,8 +127,15 @@ fn forward(
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(_) => break,
         };
-        let room = usize::try_from(cap.saturating_sub(done.written)).unwrap_or(usize::MAX);
-        let keep = n.min(room);
+        if rate > 0.0 {
+            // Quiet time accrues allowance — that is what lets a burst
+            // form again after the bucket was spent.
+            let now = Instant::now();
+            tokens = (tokens + now.duration_since(last_refill).as_secs_f64() * rate).min(capacity);
+            last_refill = now;
+        }
+        let keep = n.min(tokens as usize);
+        tokens -= keep as f64;
         if keep > 0 {
             if to.write_all(&buf[..keep]).and_then(|()| to.flush()).is_ok() {
                 done.written += keep as u64;
@@ -125,11 +146,21 @@ fn forward(
         let over = &buf[keep..n];
         if !over.is_empty() {
             if done.dropped == 0 {
-                let _ = writeln!(
-                    notice,
-                    "\njsrt: supervise: worker {name} reached the {cap}-byte cap; further output \
-                     is dropped and counted, its last {OUTPUT_TAIL_BYTES} bytes are shown at exit"
-                );
+                if rate_bps > 0 {
+                    let _ = writeln!(
+                        notice,
+                        "\njsrt: supervise: worker {name} exceeded its output budget \
+                         ({cap}-byte burst + {rate_bps} bytes/s); excess output is dropped \
+                         and counted, its last {OUTPUT_TAIL_BYTES} bytes are shown at exit"
+                    );
+                } else {
+                    let _ = writeln!(
+                        notice,
+                        "\njsrt: supervise: worker {name} reached the {cap}-byte cap; further \
+                         output is dropped and counted, its last {OUTPUT_TAIL_BYTES} bytes \
+                         are shown at exit"
+                    );
+                }
                 let _ = notice.flush();
             }
             done.dropped += over.len() as u64;
@@ -260,14 +291,29 @@ pub fn supervise(plan: &SupervisePlan) -> Result<i32, HostError> {
     // The forwarders end at EOF, which comes when the worker exits (scripts
     // cannot start processes that would inherit the pipes).
     let cap = plan.max_output_bytes;
+    let rate = plan.output_rate_bps;
     let out_forwarder = child.stdout.take().map(|out| {
         std::thread::spawn(move || {
-            forward("stdout", out, std::io::stdout(), std::io::stderr(), cap)
+            forward(
+                "stdout",
+                out,
+                std::io::stdout(),
+                std::io::stderr(),
+                cap,
+                rate,
+            )
         })
     });
     let err_forwarder = child.stderr.take().map(|err| {
         std::thread::spawn(move || {
-            forward("stderr", err, std::io::stderr(), std::io::stderr(), cap)
+            forward(
+                "stderr",
+                err,
+                std::io::stderr(),
+                std::io::stderr(),
+                cap,
+                rate,
+            )
         })
     });
     // The handle stays alive purely so the child stays ours until reaped —
@@ -399,6 +445,7 @@ pub fn supervise(plan: &SupervisePlan) -> Result<i32, HostError> {
         "poll_interval_ms": POLL_INTERVAL.as_millis(),
         "output": {
             "max_bytes_per_stream": cap,
+            "rate_bytes_per_sec": plan.output_rate_bps,
             "stdout_bytes": stdout_fwd.written,
             "stdout_dropped_bytes": stdout_fwd.dropped,
             "stdout_tail_bytes": stdout_fwd.tail,
