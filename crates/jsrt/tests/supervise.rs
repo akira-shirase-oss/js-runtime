@@ -865,6 +865,60 @@ fn overlapping_secrets_mask_their_union_not_the_second_secrets_tail() {
 }
 
 #[test]
+fn redaction_at_full_bounds_scans_ten_mib_inside_a_budget() {
+    use std::os::unix::fs::PermissionsExt;
+    let rig = Rig::new();
+    // The bound case: 256 literals over 10 MiB of forwarded output.
+    // Measured 1.47 s wall / 0.19 s user on the dev machine after the
+    // first-byte bucketing; the naive scan never finished (the worker
+    // died at its timeout). 15 s is ~10x headroom — a regression to the
+    // per-position scan shows up here, CI jitter does not.
+    let secrets = rig.dir.path().join("secrets.txt");
+    fs::write(
+        &secrets,
+        (0..256)
+            .map(|i| format!("throughput-secret-{i:04}-abcdef0123456789"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+    .unwrap_or_else(|e| panic!("write: {e}"));
+    fs::set_permissions(&secrets, fs::Permissions::from_mode(0o600))
+        .unwrap_or_else(|e| panic!("chmod: {e}"));
+    let path_s = secrets
+        .to_str()
+        .unwrap_or_else(|| panic!("utf8"))
+        .to_string();
+    let script = rig.script(
+        "flood.js",
+        "const line = 'x'.repeat(1023) + '\\n';\n\
+         for (let i = 0; i < 10240; i++) rt.print(line);\n",
+    );
+    let started = std::time::Instant::now();
+    let out = rig.supervise(
+        &script,
+        &["--redact-file", &path_s, "--max-output-kb", "10240"],
+    );
+    let elapsed = started.elapsed();
+    assert_eq!(
+        code(&out),
+        0,
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(15),
+        "256 secrets over 10 MiB took {elapsed:?} — the scan regressed"
+    );
+    let r = report(&out);
+    assert_eq!(
+        r["output"]["stdout_bytes"],
+        10 * 1024 * 1024,
+        "every byte passed under the cap: {r}"
+    );
+    assert_eq!(r["output"]["stdout_redacted_bytes"], 0, "{r}");
+}
+
+#[test]
 fn redaction_refuses_tiny_or_unbounded_secret_sets() {
     use std::os::unix::fs::PermissionsExt;
     let rig = Rig::new();
