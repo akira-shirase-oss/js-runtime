@@ -240,7 +240,7 @@ fn second_byte_ok(lead: u8, b: u8) -> bool {
 /// valid one: every byte present satisfies its position's range.
 fn utf8_valid_prefix(part: &[u8]) -> bool {
     utf8_len(part[0]) > 0
-        && part.get(1).map_or(true, |&b| second_byte_ok(part[0], b))
+        && part.get(1).is_none_or(|&b| second_byte_ok(part[0], b))
         && part.iter().skip(2).all(|&b| (0x80..=0xbf).contains(&b))
 }
 
