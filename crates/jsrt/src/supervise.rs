@@ -83,6 +83,10 @@ pub struct SupervisePlan {
     /// tail). They never appear in argv, logs or the report — the report
     /// carries only their count and masked bytes.
     pub redact_literals: Vec<Vec<u8>>,
+    /// Pass worker bytes untouched — no run-id prefix and no terminal
+    /// neutralising. For trusted workers; configured redaction still
+    /// applies.
+    pub output_raw: bool,
 }
 
 /// The last bytes of each capped stream, kept and shown at exit — where a
@@ -110,9 +114,36 @@ struct ForwardCfg {
     prefix: Option<String>,
     /// Literals masked out of the emitted stream.
     secrets: Vec<Vec<u8>>,
+    /// The destination is a terminal: render control bytes visibly so the
+    /// worker cannot drive the operator's terminal.
+    sanitise: bool,
 }
 
 const REDACTED: &[u8] = b"[redacted]";
+
+/// Terminal-hazard bytes rendered visibly, `cat -v` style: every C0
+/// control except `\n` and `\t`, DEL, and C1 — the bytes that make up
+/// escape sequences, cursor moves, OSC titles and hyperlinks. Everything
+/// else (printable ASCII and the UTF-8 high range) passes untouched.
+fn append_neutralised(out: &mut Vec<u8>, bytes: &[u8]) {
+    for &b in bytes {
+        match b {
+            0x00..=0x08 | 0x0b..=0x1f => {
+                out.push(b'^');
+                out.push(b + 0x40);
+            }
+            0x7f => {
+                out.push(b'^');
+                out.push(b'?');
+            }
+            0x80..=0x9f => {
+                out.extend_from_slice(b"M-^");
+                out.push(b - 0x80 + 0x40);
+            }
+            _ => out.push(b),
+        }
+    }
+}
 
 /// Masks configured literals in the forwarded stream, across chunk
 /// boundaries: the last `max_len - 1` unemitted bytes are held back so a
@@ -266,6 +297,7 @@ fn forward(
     let mut last_refill = Instant::now();
     let mut redactor = Redactor::new(cfg.secrets);
     let mut emit = Vec::new();
+    let mut emit2 = Vec::new();
     loop {
         let n = match from.read(&mut buf) {
             Ok(0) => break,
@@ -285,9 +317,16 @@ fn forward(
         if keep > 0 {
             emit.clear();
             redactor.process(&buf[..keep], &mut emit);
+            let payload: &[u8] = if cfg.sanitise {
+                emit2.clear();
+                append_neutralised(&mut emit2, &emit);
+                &emit2
+            } else {
+                &emit
+            };
             let wrote = match &cfg.prefix {
-                Some(prefix) => write_prefixed(&mut to, prefix, &mut at_line_start, &emit),
-                None => to.write_all(&emit).and_then(|()| to.flush()),
+                Some(prefix) => write_prefixed(&mut to, prefix, &mut at_line_start, payload),
+                None => to.write_all(payload).and_then(|()| to.flush()),
             };
             if wrote.is_ok() {
                 done.written += keep as u64;
@@ -329,9 +368,16 @@ fn forward(
     emit.clear();
     redactor.finish(&mut emit);
     if !emit.is_empty() {
+        let payload: &[u8] = if cfg.sanitise {
+            emit2.clear();
+            append_neutralised(&mut emit2, &emit);
+            &emit2
+        } else {
+            &emit
+        };
         let _ = match &cfg.prefix {
-            Some(prefix) => write_prefixed(&mut to, prefix, &mut at_line_start, &emit),
-            None => to.write_all(&emit).and_then(|()| to.flush()),
+            Some(prefix) => write_prefixed(&mut to, prefix, &mut at_line_start, payload),
+            None => to.write_all(payload).and_then(|()| to.flush()),
         };
     }
     if !tail.is_empty() {
@@ -349,11 +395,17 @@ fn forward(
             bytes.push(b'\n');
         }
         // The re-shown tail gets the same masking — a dropped secret
-        // must not resurface at exit.
+        // must not resurface at exit — and the same terminal rendering.
         emit.clear();
         redactor.process(&bytes, &mut emit);
         redactor.finish(&mut emit);
-        let bytes = emit;
+        let bytes = if cfg.sanitise {
+            emit2.clear();
+            append_neutralised(&mut emit2, &emit);
+            std::mem::take(&mut emit2)
+        } else {
+            emit
+        };
         let header = format!(
             "\n--- jsrt: supervise: last {} of the {} bytes of worker {name} past the cap ---\n",
             bytes.len(),
@@ -465,17 +517,25 @@ pub fn supervise(plan: &SupervisePlan) -> Result<i32, HostError> {
     // error lines land; stdout is a data pipe and gets the marker only
     // when asked.
     let line_prefix = format!("[run {run_id}] ");
+    // A terminal sink gets neutralised control bytes — a worker must not
+    // drive the operator's terminal. A pipe keeps the bytes as they are:
+    // downstream consumers want the worker's output, not a rewrite.
+    use std::io::IsTerminal;
+    let stdout_tty = std::io::stdout().is_terminal();
+    let stderr_tty = std::io::stderr().is_terminal();
     let out_cfg = ForwardCfg {
         cap,
         rate_bps: rate,
-        prefix: plan.prefix_stdout.then(|| line_prefix.clone()),
+        prefix: (plan.prefix_stdout && !plan.output_raw).then(|| line_prefix.clone()),
         secrets: plan.redact_literals.clone(),
+        sanitise: stdout_tty && !plan.output_raw,
     };
     let err_cfg = ForwardCfg {
         cap,
         rate_bps: rate,
-        prefix: Some(line_prefix),
+        prefix: (!plan.output_raw).then_some(line_prefix),
         secrets: plan.redact_literals.clone(),
+        sanitise: stderr_tty && !plan.output_raw,
     };
     let out_forwarder = child.stdout.take().map(|out| {
         std::thread::spawn(move || {
@@ -626,6 +686,11 @@ pub fn supervise(plan: &SupervisePlan) -> Result<i32, HostError> {
             "stderr_dropped_bytes": stderr_fwd.dropped,
             "stderr_tail_bytes": stderr_fwd.tail,
             "stderr_redacted_bytes": stderr_fwd.redacted,
+            "raw_passthrough": plan.output_raw,
+            "tty_neutralised": {
+                "stdout": stdout_tty && !plan.output_raw,
+                "stderr": stderr_tty && !plan.output_raw,
+            },
         },
     });
 

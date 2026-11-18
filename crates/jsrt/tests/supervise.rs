@@ -6,6 +6,8 @@
 //! (rlimits) or by footprint polling, never by a flag inside the runtime.
 
 use std::fs;
+use std::io::Read;
+use std::os::fd::FromRawFd;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -58,6 +60,79 @@ fn code(out: &Output) -> i32 {
     out.status
         .code()
         .unwrap_or_else(|| panic!("killed by signal — status: {:?}", out.status))
+}
+
+/// Spawn `jsrt supervise <script>` with the supervisor's stdout and
+/// stderr attached to a pty slave — so `is_terminal` sees a terminal —
+/// and capture everything the pty master receives. Returns the exit code
+/// and the captured bytes.
+fn supervise_on_pty(script: &Path, extra: &[&str]) -> (i32, Vec<u8>) {
+    let mut master: libc::c_int = -1;
+    let mut slave: libc::c_int = -1;
+    // SAFETY: openpty fills two `int` out-params with live fds on success;
+    // null name/termios/winsize take the defaults.
+    let rc = unsafe {
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, 0, "openpty");
+    // SAFETY: slave and master are live fds this test owns; File takes
+    // ownership and closes them.
+    let slave_out = unsafe { std::fs::File::from_raw_fd(slave) };
+    let slave_err = slave_out
+        .try_clone()
+        .unwrap_or_else(|e| panic!("dup slave: {e}"));
+    let mut master_file = unsafe { std::fs::File::from_raw_fd(master) };
+    let mut child = Command::new(JSRT)
+        .arg("supervise")
+        .arg(script)
+        .args(extra)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::from(slave_out))
+        .stderr(std::process::Stdio::from(slave_err))
+        .spawn()
+        .unwrap_or_else(|e| panic!("spawn supervise: {e}"));
+    // Drain the pty until EOF (or EIO when the last slave fd closes).
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut captured = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            match master_file.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => captured.extend_from_slice(&buf[..n]),
+            }
+        }
+        let _ = tx.send(captured);
+    });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(s)) => break s,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                panic!("supervise on a pty did not finish in 15s");
+            }
+            Err(e) => panic!("wait: {e}"),
+        }
+    };
+    let captured = rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap_or_else(|e| panic!("pty reader did not finish: {e}"));
+    (
+        status
+            .code()
+            .unwrap_or_else(|| panic!("signalled: {status}")),
+        captured,
+    )
 }
 
 /// The last stdout line is the JSON run report (the worker's own prints
@@ -622,6 +697,80 @@ fn redaction_refuses_a_leaky_file_and_a_missing_env() {
         String::from_utf8_lossy(&out.stderr).contains("JSRT_TEST_DEFINITELY_UNSET"),
         "stderr: {}",
         String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn worker_escape_sequences_are_neutralised_on_a_tty_and_raw_on_a_pipe() {
+    let rig = Rig::new();
+    // An OSC window-title, a cursor clear, an OSC-8 link, and a sequence
+    // split over two writes — the classic terminal-injection kit.
+    let script = rig.script(
+        "esc.js",
+        "rt.print('\\x1b]0;owned\\x07move\\x1b[2Jlink\\x1b]8;;https://example.com\\x07here\\x1b]8;;\\x07\\n');\n\
+         await rt.sleep(300);\n\
+         rt.print('\\x1b');\n\
+         await rt.sleep(300);\n\
+         rt.print(']0;split\\x07\\n');\n",
+    );
+    let attack = b"\x1b]0;owned\x07";
+
+    // Pipe: the consumer asked for the worker's bytes — the supervisor
+    // passes them byte-exact, escapes and all.
+    let out = rig.supervise(&script, &[]);
+    assert_eq!(
+        code(&out),
+        0,
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.stdout
+            .windows(attack.len())
+            .any(|w| w == attack.as_slice()),
+        "pipe run rewrote worker bytes: {:?}",
+        &out.stdout[..out.stdout.len().min(200)]
+    );
+
+    // PTY: every control byte is rendered visibly instead — the worker
+    // cannot drive the operator's terminal, and the attempt stays visible.
+    let (tty_code, captured) = supervise_on_pty(&script, &[]);
+    assert_eq!(
+        tty_code,
+        0,
+        "pty run failed: {}",
+        String::from_utf8_lossy(&captured)
+    );
+    assert!(
+        !captured.contains(&0x1b),
+        "raw ESC reached the terminal: {}",
+        String::from_utf8_lossy(&captured)
+    );
+    assert!(
+        !captured.contains(&0x07),
+        "raw BEL reached the terminal: {}",
+        String::from_utf8_lossy(&captured)
+    );
+    let text = String::from_utf8_lossy(&captured);
+    assert!(text.contains("^[]0;owned^G"), "{text}");
+    assert!(text.contains("^[[2J"), "{text}");
+    // Split across two pipe reads, the ESC is still rendered.
+    assert!(text.contains("^[]0;split^G"), "{text}");
+
+    // --output-raw on the same pty: a trusted worker keeps its bytes.
+    let (raw_code, captured) = supervise_on_pty(&script, &["--output-raw"]);
+    assert_eq!(
+        raw_code,
+        0,
+        "raw pty run failed: {}",
+        String::from_utf8_lossy(&captured)
+    );
+    assert!(
+        captured
+            .windows(attack.len())
+            .any(|w| w == attack.as_slice()),
+        "--output-raw did not pass bytes: {}",
+        String::from_utf8_lossy(&captured)
     );
 }
 

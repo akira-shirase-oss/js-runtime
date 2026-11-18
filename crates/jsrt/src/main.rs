@@ -178,6 +178,11 @@ enum Command {
         /// Repeatable.
         #[arg(long = "redact-file")]
         redact_file: Vec<PathBuf>,
+        /// Pass worker output bytes untouched — no [run] prefix and no
+        /// neutralising of terminal control characters. For trusted
+        /// workers only; configured redaction still applies.
+        #[arg(long = "output-raw")]
+        output_raw: bool,
     },
 }
 
@@ -254,6 +259,7 @@ async fn main() {
             prefix_stdout,
             redact_env,
             redact_file,
+            output_raw,
         } => {
             let redact_literals = match resolve_redact(&redact_env, &redact_file) {
                 Ok(v) => v,
@@ -274,6 +280,7 @@ async fn main() {
                 output_rate_bps: max_output_rate_kbs.saturating_mul(1024),
                 prefix_stdout,
                 redact_literals,
+                output_raw,
             };
             match supervise::supervise(&plan) {
                 Ok(code) => std::process::exit(code),
