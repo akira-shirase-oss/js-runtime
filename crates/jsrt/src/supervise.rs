@@ -79,6 +79,10 @@ pub struct SupervisePlan {
     /// always prefixed; stdout is a data pipe and stays byte-exact unless
     /// the operator asks.
     pub prefix_stdout: bool,
+    /// Literals masked out of forwarded worker output (and the re-shown
+    /// tail). They never appear in argv, logs or the report — the report
+    /// carries only their count and masked bytes.
+    pub redact_literals: Vec<Vec<u8>>,
 }
 
 /// The last bytes of each capped stream, kept and shown at exit — where a
@@ -86,12 +90,14 @@ pub struct SupervisePlan {
 const OUTPUT_TAIL_BYTES: usize = 4096;
 
 /// What one worker stream did: bytes passed through, bytes dropped past
-/// the cap, and how many of the dropped bytes were re-shown as the tail.
+/// the cap, how many of the dropped bytes were re-shown as the tail, and
+/// how many emitted bytes were masked as secrets.
 #[derive(Debug, Default, Clone, Copy)]
 struct Forwarded {
     written: u64,
     dropped: u64,
     tail: u64,
+    redacted: u64,
 }
 
 /// What one worker stream's forwarder does with the bytes the budget
@@ -102,6 +108,97 @@ struct ForwardCfg {
     rate_bps: u64,
     /// Line prefix marking the stream's run; `None` passes bytes raw.
     prefix: Option<String>,
+    /// Literals masked out of the emitted stream.
+    secrets: Vec<Vec<u8>>,
+}
+
+const REDACTED: &[u8] = b"[redacted]";
+
+/// Masks configured literals in the forwarded stream, across chunk
+/// boundaries: the last `max_len - 1` unemitted bytes are held back so a
+/// secret split over two reads is still caught. `redacted` counts the
+/// original bytes masked — the marker is framing, like the line prefix.
+struct Redactor {
+    secrets: Vec<Vec<u8>>,
+    hold: Vec<u8>,
+    max_len: usize,
+    redacted: u64,
+}
+
+impl Redactor {
+    fn new(secrets: Vec<Vec<u8>>) -> Self {
+        let max_len = secrets.iter().map(|s| s.len()).max().unwrap_or(0);
+        Self {
+            secrets,
+            hold: Vec::new(),
+            max_len,
+            redacted: 0,
+        }
+    }
+
+    fn active(&self) -> bool {
+        self.max_len > 0
+    }
+
+    /// Append `chunk`; emit into `out` everything that cannot still open
+    /// a secret, with matches replaced by "[redacted]".
+    fn process(&mut self, chunk: &[u8], out: &mut Vec<u8>) {
+        if !self.active() {
+            out.extend_from_slice(chunk);
+            return;
+        }
+        let mut hay = std::mem::take(&mut self.hold);
+        hay.extend_from_slice(chunk);
+        let mut pos = 0;
+        while let Some((start, len)) = self.find_earliest(&hay, pos, false) {
+            out.extend_from_slice(&hay[pos..start]);
+            out.extend_from_slice(REDACTED);
+            self.redacted += len as u64;
+            pos = start + len;
+        }
+        // Anything in the last max_len-1 bytes could be the start of a
+        // secret the next chunk completes — hold it, emit the rest.
+        let hold_start = pos.max(hay.len().saturating_sub(self.max_len - 1));
+        out.extend_from_slice(&hay[pos..hold_start]);
+        self.hold = hay[hold_start..].to_vec();
+    }
+
+    /// The stream ended: emit the held tail, masking a dangling secret
+    /// prefix too — showing it would reveal all but the secret's end.
+    fn finish(&mut self, out: &mut Vec<u8>) {
+        let hay = std::mem::take(&mut self.hold);
+        let mut pos = 0;
+        while let Some((start, len)) = self.find_earliest(&hay, pos, true) {
+            out.extend_from_slice(&hay[pos..start]);
+            out.extend_from_slice(REDACTED);
+            self.redacted += len as u64;
+            pos = start + len;
+        }
+        out.extend_from_slice(&hay[pos..]);
+    }
+
+    /// Earliest match at or after `from` as (start, bytes masked). A
+    /// proper prefix of a secret at the very tail only counts when
+    /// `final_chunk` — mid-stream it may still complete or dissolve.
+    fn find_earliest(&self, hay: &[u8], from: usize, final_chunk: bool) -> Option<(usize, usize)> {
+        for i in from..hay.len() {
+            let mut best: Option<usize> = None;
+            for s in &self.secrets {
+                let len = if hay[i..].starts_with(s) {
+                    s.len()
+                } else if final_chunk && hay.len() - i < s.len() && s.starts_with(&hay[i..]) {
+                    hay.len() - i
+                } else {
+                    continue;
+                };
+                best = Some(best.map_or(len, |b| b.max(len)));
+            }
+            if let Some(len) = best {
+                return Some((i, len));
+            }
+        }
+        None
+    }
 }
 
 /// Write `bytes` to `to` with `prefix` at the start of every line,
@@ -167,6 +264,8 @@ fn forward(
     let capacity = cap.max(buf.len() as u64) as f64;
     let mut tokens = cap as f64;
     let mut last_refill = Instant::now();
+    let mut redactor = Redactor::new(cfg.secrets);
+    let mut emit = Vec::new();
     loop {
         let n = match from.read(&mut buf) {
             Ok(0) => break,
@@ -184,9 +283,11 @@ fn forward(
         let keep = n.min(tokens as usize);
         tokens -= keep as f64;
         if keep > 0 {
+            emit.clear();
+            redactor.process(&buf[..keep], &mut emit);
             let wrote = match &cfg.prefix {
-                Some(prefix) => write_prefixed(&mut to, prefix, &mut at_line_start, &buf[..keep]),
-                None => to.write_all(&buf[..keep]).and_then(|()| to.flush()),
+                Some(prefix) => write_prefixed(&mut to, prefix, &mut at_line_start, &emit),
+                None => to.write_all(&emit).and_then(|()| to.flush()),
             };
             if wrote.is_ok() {
                 done.written += keep as u64;
@@ -223,6 +324,16 @@ fn forward(
             }
         }
     }
+    // EOF: flush what the redactor held back — the stream is over, so a
+    // dangling secret prefix is masked rather than shown.
+    emit.clear();
+    redactor.finish(&mut emit);
+    if !emit.is_empty() {
+        let _ = match &cfg.prefix {
+            Some(prefix) => write_prefixed(&mut to, prefix, &mut at_line_start, &emit),
+            None => to.write_all(&emit).and_then(|()| to.flush()),
+        };
+    }
     if !tail.is_empty() {
         let mut bytes: Vec<u8> = tail.into_iter().collect();
         // Start at a line boundary if the window cut a line — unless the
@@ -237,6 +348,12 @@ fn forward(
         if !bytes.ends_with(b"\n") {
             bytes.push(b'\n');
         }
+        // The re-shown tail gets the same masking — a dropped secret
+        // must not resurface at exit.
+        emit.clear();
+        redactor.process(&bytes, &mut emit);
+        redactor.finish(&mut emit);
+        let bytes = emit;
         let header = format!(
             "\n--- jsrt: supervise: last {} of the {} bytes of worker {name} past the cap ---\n",
             bytes.len(),
@@ -251,6 +368,7 @@ fn forward(
             done.tail = bytes.len() as u64;
         }
     }
+    done.redacted = redactor.redacted;
     done
 }
 
@@ -351,11 +469,13 @@ pub fn supervise(plan: &SupervisePlan) -> Result<i32, HostError> {
         cap,
         rate_bps: rate,
         prefix: plan.prefix_stdout.then(|| line_prefix.clone()),
+        secrets: plan.redact_literals.clone(),
     };
     let err_cfg = ForwardCfg {
         cap,
         rate_bps: rate,
         prefix: Some(line_prefix),
+        secrets: plan.redact_literals.clone(),
     };
     let out_forwarder = child.stdout.take().map(|out| {
         std::thread::spawn(move || {
@@ -497,12 +617,15 @@ pub fn supervise(plan: &SupervisePlan) -> Result<i32, HostError> {
         "output": {
             "max_bytes_per_stream": cap,
             "rate_bytes_per_sec": plan.output_rate_bps,
+            "redact_literals": plan.redact_literals.len(),
             "stdout_bytes": stdout_fwd.written,
             "stdout_dropped_bytes": stdout_fwd.dropped,
             "stdout_tail_bytes": stdout_fwd.tail,
+            "stdout_redacted_bytes": stdout_fwd.redacted,
             "stderr_bytes": stderr_fwd.written,
             "stderr_dropped_bytes": stderr_fwd.dropped,
             "stderr_tail_bytes": stderr_fwd.tail,
+            "stderr_redacted_bytes": stderr_fwd.redacted,
         },
     });
 

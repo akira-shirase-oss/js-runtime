@@ -167,11 +167,65 @@ enum Command {
         /// already gets.
         #[arg(long)]
         prefix_stdout: bool,
+        /// Mask a literal in forwarded worker output: the value of this
+        /// environment variable. Repeatable; an unset or empty variable
+        /// is an error. (The literal itself never enters argv — ps shows
+        /// it to every local user.)
+        #[arg(long = "redact-env")]
+        redact_env: Vec<String>,
+        /// Mask each non-empty line of this file in forwarded worker
+        /// output. Refused if the file is group- or world-readable.
+        /// Repeatable.
+        #[arg(long = "redact-file")]
+        redact_file: Vec<PathBuf>,
     },
 }
 
 fn exit_code(err: &HostError) -> i32 {
     err.exit_code()
+}
+
+/// Resolve the masking literals for `supervise`: environment variable
+/// values and the non-empty lines of each secrets file. The literals
+/// never appear in argv, logs or the report — only their masked byte
+/// count lands in `output.*_redacted_bytes`.
+fn resolve_redact(names: &[String], files: &[PathBuf]) -> Result<Vec<Vec<u8>>, HostError> {
+    let mut out = Vec::new();
+    for name in names {
+        let value = std::env::var(name)
+            .map_err(|_| HostError::Host(format!("--redact-env {name}: the variable is unset")))?;
+        if value.is_empty() {
+            return Err(HostError::Host(format!(
+                "--redact-env {name}: the variable is empty"
+            )));
+        }
+        out.push(value.into_bytes());
+    }
+    for path in files {
+        use std::os::unix::fs::PermissionsExt;
+        let meta = std::fs::metadata(path)
+            .map_err(|e| HostError::Host(format!("--redact-file {}: {e}", path.display())))?;
+        // A secrets file other local users can read cannot be trusted to
+        // hold secrets — refuse it rather than mask halfheartedly.
+        if meta.permissions().mode() & 0o077 != 0 {
+            return Err(HostError::Host(format!(
+                "--redact-file {}: group- or world-readable — chmod 600 it first",
+                path.display()
+            )));
+        }
+        let content = std::fs::read(path)
+            .map_err(|e| HostError::Host(format!("--redact-file {}: {e}", path.display())))?;
+        for line in content.split(|b| *b == b'\n') {
+            let line = match line.last() {
+                Some(b'\r') => &line[..line.len() - 1],
+                _ => line,
+            };
+            if !line.is_empty() {
+                out.push(line.to_vec());
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Single-thread executor: `JsRuntime` is `!Send`, so every run must stay on
@@ -198,7 +252,16 @@ async fn main() {
             max_output_kb,
             max_output_rate_kbs,
             prefix_stdout,
+            redact_env,
+            redact_file,
         } => {
+            let redact_literals = match resolve_redact(&redact_env, &redact_file) {
+                Ok(v) => v,
+                Err(err) => {
+                    eprintln!("jsrt: {err}");
+                    std::process::exit(exit_code(&err));
+                }
+            };
             let plan = supervise::SupervisePlan {
                 worker_args: run.to_argv(),
                 max_rss_bytes: max_rss_mb.map(|mb| mb * 1024 * 1024),
@@ -210,6 +273,7 @@ async fn main() {
                 max_output_bytes: max_output_kb.saturating_mul(1024),
                 output_rate_bps: max_output_rate_kbs.saturating_mul(1024),
                 prefix_stdout,
+                redact_literals,
             };
             match supervise::supervise(&plan) {
                 Ok(code) => std::process::exit(code),

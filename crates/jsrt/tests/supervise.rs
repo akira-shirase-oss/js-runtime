@@ -40,6 +40,18 @@ impl Rig {
             .output()
             .unwrap_or_else(|e| panic!("spawn jsrt: {e}"))
     }
+
+    fn supervise_env(&self, script: &Path, extra: &[&str], env: &[(&str, &str)]) -> Output {
+        let mut args = vec!["supervise"];
+        args.push(script.to_str().unwrap_or_else(|| panic!("utf8")));
+        args.extend_from_slice(extra);
+        let mut cmd = Command::new(JSRT);
+        cmd.args(&args).current_dir(self.dir.path());
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        cmd.output().unwrap_or_else(|e| panic!("spawn jsrt: {e}"))
+    }
 }
 
 fn code(out: &Output) -> i32 {
@@ -492,6 +504,125 @@ fn an_external_signal_is_reported_without_claiming_the_supervisor_sent_it() {
     assert_eq!(r["outcome"], "terminated", "{r}");
     assert_eq!(r["signal"], 15, "{r}");
     assert_eq!(r["killed_by"], "signal 15 (sender unknown)", "{r}");
+}
+
+#[test]
+fn worker_output_is_redacted_for_env_and_file_literals_and_counted() {
+    use std::os::unix::fs::PermissionsExt;
+    let rig = Rig::new();
+    // Literal secrets come from the environment and a tight file — never
+    // argv, which every local user can read through ps.
+    let secrets = rig.dir.path().join("secrets.txt");
+    fs::write(&secrets, "s3cr3t-file\n\n").unwrap_or_else(|e| panic!("write: {e}"));
+    fs::set_permissions(&secrets, fs::Permissions::from_mode(0o600))
+        .unwrap_or_else(|e| panic!("chmod: {e}"));
+    let script = rig.script(
+        "leak.js",
+        "rt.print('token=hunter2 done\\n');\n\
+         rt.print('file s3cr3t-file ok\\n');\n",
+    );
+    let path_s = secrets
+        .to_str()
+        .unwrap_or_else(|| panic!("utf8"))
+        .to_string();
+    let out = rig.supervise_env(
+        &script,
+        &["--redact-env", "JSRT_TEST_SECRET", "--redact-file", &path_s],
+        &[("JSRT_TEST_SECRET", "hunter2")],
+    );
+    assert_eq!(
+        code(&out),
+        0,
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(!stdout.contains("hunter2"), "env secret leaked: {stdout}");
+    assert!(
+        !stdout.contains("s3cr3t-file"),
+        "file secret leaked: {stdout}"
+    );
+    assert!(stdout.contains("token=[redacted] done"), "{stdout}");
+    assert!(stdout.contains("file [redacted] ok"), "{stdout}");
+    let r = report(&out);
+    // hunter2 (7) + s3cr3t-file (11) masked.
+    assert_eq!(r["output"]["stdout_redacted_bytes"], 18, "{r}");
+    assert_eq!(r["output"]["redact_literals"], 2, "{r}");
+}
+
+#[test]
+fn a_secret_split_across_pipe_chunks_is_still_redacted() {
+    let rig = Rig::new();
+    // The worker emits the secret in two writes separated by a sleep, so
+    // it lands in two different reads of the forwarder. A naive
+    // per-chunk match misses it; the hold-back boundary must not.
+    let script = rig.script(
+        "split.js",
+        "rt.print('AAhun');\n\
+         await rt.sleep(300);\n\
+         rt.print('ter2BB\\n');\n",
+    );
+    let out = rig.supervise_env(
+        &script,
+        &["--redact-env", "JSRT_TEST_SECRET"],
+        &[("JSRT_TEST_SECRET", "hunter2")],
+    );
+    assert_eq!(
+        code(&out),
+        0,
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(!stdout.contains("hunter2"), "secret leaked: {stdout}");
+    assert!(stdout.contains("AA[redacted]BB"), "{stdout}");
+    let r = report(&out);
+    assert_eq!(r["output"]["stdout_redacted_bytes"], 7, "{r}");
+}
+
+#[test]
+fn redaction_refuses_a_leaky_file_and_a_missing_env() {
+    use std::os::unix::fs::PermissionsExt;
+    let rig = Rig::new();
+    let script = rig.script("ok.js", "rt.print('x\\n');\n");
+
+    // A secrets file any local user can read cannot be trusted to hold
+    // secrets — refuse it rather than mask halfheartedly.
+    let secrets = rig.dir.path().join("leaky.txt");
+    fs::write(&secrets, "hunter2\n").unwrap_or_else(|e| panic!("write: {e}"));
+    fs::set_permissions(&secrets, fs::Permissions::from_mode(0o644))
+        .unwrap_or_else(|e| panic!("chmod: {e}"));
+    let path_s = secrets
+        .to_str()
+        .unwrap_or_else(|| panic!("utf8"))
+        .to_string();
+    let out = rig.supervise(&script, &["--redact-file", &path_s]);
+    assert_eq!(
+        code(&out),
+        8,
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("readable"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // A named variable that does not exist protects nothing — refuse
+    // instead of silently masking nothing.
+    let out = rig.supervise(&script, &["--redact-env", "JSRT_TEST_DEFINITELY_UNSET"]);
+    assert_eq!(
+        code(&out),
+        8,
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("JSRT_TEST_DEFINITELY_UNSET"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 #[test]
