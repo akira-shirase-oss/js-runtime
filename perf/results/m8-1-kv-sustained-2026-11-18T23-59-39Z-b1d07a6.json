@@ -1,0 +1,61 @@
+{
+  "milestone": "M8.1",
+  "workload": "50000 mixed rt.kv get/put/list/delete ops on a granted store (1024-key working set, kv-sustained.js), then 64 KiB writes until the 8 MiB quota refuses",
+  "environment": {
+    "commit": "b1d07a6",
+    "date_utc": "2026-11-18T23:59:39+00:00",
+    "arch": "arm64",
+    "chip": "arm",
+    "cores": 12,
+    "mem_bytes": 34359738368,
+    "os": "27.2.1",
+    "build": "release (opt-level 3)"
+  },
+  "wall_ms": 9727.5,
+  "result": {
+    "ops": 50000,
+    "mixed_wall_ms": 9591,
+    "puts": 18750,
+    "gets": 18750,
+    "gets_hit": 18750,
+    "deletes": 6250,
+    "lists": 6250,
+    "integrity_fail": 0,
+    "quota_puts": 126,
+    "quota_refusals": 200,
+    "refusals_named_capability": 200,
+    "post_quota_ok": true,
+    "quota_wall_ms": 44
+  },
+  "store_bytes": 8351744,
+  "thresholds": {
+    "ops": 50000,
+    "integrity_fail": 0,
+    "quota_refusals_min": 1,
+    "refusals_all_capability_named": true,
+    "post_quota_ok": true,
+    "store_bytes_max": 9437184,
+    "exit_code": 0
+  },
+  "checks": {
+    "ops": true,
+    "integrity_fail": true,
+    "quota_refusals_min": true,
+    "refusals_all_capability_named": true,
+    "post_quota_ok": true,
+    "store_bytes_max": true,
+    "exit_code": true
+  },
+  "passed": true,
+  "stderr": null,
+  "loadavg_before": [
+    7.94,
+    9.69,
+    15.0
+  ],
+  "loadavg_after": [
+    7.36,
+    9.51,
+    14.87
+  ]
+}

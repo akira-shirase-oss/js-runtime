@@ -10,11 +10,12 @@ compatibility and not a new JavaScript engine.
 jsrt run script.js --timeout 5000 --manifest jsrt.manifest.json
 ```
 
-**Status: the M0–M7 roadmap is complete.** Deny-by-default capabilities, the
-supervisor, the stdlib wave (`rt.kv`, `rt.media`, `rt.serve`) and the
-million-scale evidence (1M op calls, 1M requests through `rt.serve`, 1,000 cold
-starts, a one-hour soak) are all built, with committed results under
-`perf/results/`.
+**Status: v1.0.0, the M0–M7 roadmap and the load matrix complete.**
+Deny-by-default capabilities, the supervisor, the stdlib wave (`rt.kv`,
+`rt.media`, `rt.serve`) and the load matrix (1M op calls, 1M requests through
+`rt.serve`, 1,000 cold starts, a one-hour soak, kv/media/refusal/churn
+scenarios) are all built, with committed results under `perf/results/`.
+Release checklist: `docs/RELEASE.md`; changes: `CHANGELOG.md`.
 
 ## Breaking changes (2026-11-16 security fixes)
 
@@ -243,6 +244,41 @@ bounded JSONL run reports, worker stdout and stderr each capped per run by
 `--max-output-kb` — default 8 MiB, a lifetime budget per run — with a notice the moment a stream hits it, its last 4 KiB re-shown at exit so the cause of death survives, and passed/dropped/re-shown bytes in the report), and we don't pretend an in-process flag replaces
 it.
 
+## Install
+
+There are no published binaries or crates (`publish = false`) — jsrt is
+built from this repository.
+
+```sh
+git clone <this repo> && cd jsrt
+export PATH="$(brew --prefix rustup)/bin:$PATH"   # rustup cargo, so the
+                                                # pinned toolchain applies
+cargo build --release --locked
+target/release/jsrt run scripts/hello.js
+```
+
+`rust-toolchain.toml` pins Rust 1.99.1; rustup installs it on demand
+(Homebrew's `cargo` ignores the pin, which is why PATH matters —
+`scripts/check-toolchain.sh` checks this). The first build downloads
+~95 MB of prebuilt V8 for `deno_core`; `V8_FROM_SOURCE=1` builds V8
+from source instead. macOS (arm64) and Linux (x86_64) are the tested
+platforms — CI gates on ubuntu-latest and macos-latest, and all
+committed load evidence is from those two.
+
+To put the binaries on PATH:
+
+```sh
+cargo install --path crates/jsrt --locked          # jsrt
+cargo install --path crates/jsrt-load --locked     # jsrt-load (load driver)
+```
+
+Verify the install end to end — a clean script exits 0, a missing entry
+3, bad syntax 4, an uncaught throw 5 (the full contract is below):
+
+```sh
+jsrt run scripts/hello.js    # prints, exits 0
+```
+
 ## Layout
 
 ```
@@ -267,16 +303,11 @@ docs/              ROADMAP and module notes
 - `reqwest` (rustls/webpki-roots) behind `rt.fetch`.
 - Extension JS must be 7-bit ASCII — deno_core asserts it.
 
-Build: `export PATH="$(brew --prefix rustup)/bin:$PATH"; cargo build` —
-the first build downloads ~95 MB of prebuilt V8. `rust-toolchain.toml` pins
-Rust 1.99.1 (rustup honours it; Homebrew's cargo does not, and
-`scripts/check-toolchain.sh` says so).
-
 Gate: `scripts/check.sh` runs the toolchain check, checks that cargo-deny
 is the release CI pins (0.20.2, in `scripts/install-cargo-deny.sh`; a pin
 moves only to a release at least two weeks old), then `cargo fmt --check`,
-Clippy with `-D warnings`, `cargo test --workspace --locked` (156 tests:
-76 lifecycle, 14 security, 31 serve, 11 supervise, 24 host) and the full `cargo deny --locked check` (advisories, licences,
+Clippy with `-D warnings`, `cargo test --workspace --locked` (180 tests:
+76 lifecycle, 14 security, 31 serve, 31 supervise, 28 host) and the full `cargo deny --locked check` (advisories, licences,
 bans, sources). CI runs the same script on ubuntu-latest and macos-latest
 on every push and pull request, and daily for new advisories.
 
@@ -320,7 +351,7 @@ directory's canonical path, as ESM does; at the `rt.serve` connection cap
 a newcomer behind slow readers can wait up to `body_first_byte_ms`; a
 data import is checked against the 4 MiB cap by its metadata and then read
 whole by deno_core's loader, so a file that grows in between is read whole;
-the M7 load runs were repeated on the current build on 2026-11-17 (`f83f39d`, all passed; see ROADMAP), and the webhook drill is still owed a re-run.
+the M7 load runs were repeated on the current build on 2026-11-17 (`f83f39d`, all passed; see ROADMAP), and the webhook drill was re-run on the current build on 2026-11-18 (all five phases green).
 
 ## License
 

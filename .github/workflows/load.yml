@@ -1,0 +1,40 @@
+name: load
+
+# The full-scale load matrix, on demand only: local runs commit small
+# results; this job produces the million-scale artifacts and uploads
+# them as workflow artifacts — never pushed back into the repo.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  load:
+    name: load matrix (full scale)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      # Third-party actions are pinned to full commit SHAs.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the pinned toolchain
+        run: |
+          channel=$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)
+          rustup toolchain install "$channel" --profile minimal
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Build release binaries
+        run: cargo build --release -p jsrt -p jsrt-load --locked
+      - name: Run the load matrix
+        run: python3 perf/load.py all
+      - name: Upload the result artifacts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: load-results-${{ github.sha }}
+          path: perf/results/
+          retention-days: 30

@@ -111,8 +111,12 @@ Serve throughput is 3–5% below the 2026-11-06 numbers and the soak did 8%
 fewer iterations (its fetch now goes through the checked client). The old
 runs did not record the load average, so the difference is not attributed
 to the code; the 15-minute load was 5.8–5.9 at the start of these runs.
-Artifacts: `perf/results/m7-*-f83f39d.json`. Still owed from the list
-above: the webhook drill (`examples/webhook/drill.sh`) on the current build.
+Artifacts: `perf/results/m7-*-f83f39d.json`. The webhook drill was re-run
+on the current build (2026-11-18): all five phases green — deploy,
+update with KV surviving, broken build answering 500s on the wire,
+inspect, rollback with data — 12 supervisor records in
+`examples/webhook/data/runs.jsonl`, each respawn classified
+`operator-sigterm`, no orphans.
 
 ## Security verification (2026-11-16)
 

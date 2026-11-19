@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/jsrt", "crates/jsrt-host", "crates/jsrt-load"]
 
 [workspace.package]
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
 license = "MIT"
 # Not published: the crates are built from this repository only.

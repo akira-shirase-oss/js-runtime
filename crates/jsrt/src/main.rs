@@ -154,14 +154,129 @@ enum Command {
         report_max_kb: u64,
         /// Bytes of worker stdout, and separately stderr, passed through
         /// per run, in KiB (default 8192). The rest is read and dropped,
-        /// and the report counts it.
+        /// and the report counts it. With --max-output-rate-kbs this is
+        /// the burst allowance instead of a lifetime one.
         #[arg(long, default_value_t = 8192)]
         max_output_kb: u64,
+        /// Sustained worker output in KiB/s allowed past the
+        /// --max-output-kb burst (default 0 = the cap is a lifetime
+        /// budget and a long-lived worker goes quiet at it).
+        #[arg(long, default_value_t = 0)]
+        max_output_rate_kbs: u64,
+        /// Prefix each worker stdout line with the run id, as stderr
+        /// already gets.
+        #[arg(long)]
+        prefix_stdout: bool,
+        /// Mask a literal in forwarded worker output: the value of this
+        /// environment variable. Repeatable; an unset or empty variable
+        /// is an error. (The literal itself never enters argv — ps shows
+        /// it to every local user.)
+        #[arg(long = "redact-env")]
+        redact_env: Vec<String>,
+        /// Mask each non-empty line of this file in forwarded worker
+        /// output. Refused if the file is group- or world-readable.
+        /// Repeatable.
+        #[arg(long = "redact-file")]
+        redact_file: Vec<PathBuf>,
+        /// Pass worker output bytes untouched — no [run] prefix and no
+        /// neutralising of terminal control characters. For trusted
+        /// workers only; configured redaction still applies.
+        #[arg(long = "output-raw")]
+        output_raw: bool,
     },
 }
 
 fn exit_code(err: &HostError) -> i32 {
     err.exit_code()
+}
+
+/// Resolve the masking literals for `supervise`: environment variable
+/// values and the non-empty lines of each secrets file. The literals
+/// never appear in argv, logs or the report — only their masked byte
+/// count lands in `output.*_redacted_bytes`.
+/// Bounds on the redact set: the forwarder scans every output byte
+/// against every literal, so the set's size and shape are bounded —
+/// and a near-empty literal is refused outright, since masking "abc"
+/// anywhere it appears edits unrelated output beyond recognition.
+const REDACT_MIN_SECRET: usize = 4;
+const REDACT_MAX_SECRETS: usize = 256;
+const REDACT_MAX_TOTAL_BYTES: usize = 64 * 1024;
+
+fn push_secret(
+    out: &mut Vec<Vec<u8>>,
+    total: &mut usize,
+    secret: Vec<u8>,
+    what: &str,
+) -> Result<(), HostError> {
+    if secret.len() < REDACT_MIN_SECRET {
+        return Err(HostError::Host(format!(
+            "{what}: {} bytes — redact secrets must be at least {REDACT_MIN_SECRET} bytes",
+            secret.len()
+        )));
+    }
+    if out.len() >= REDACT_MAX_SECRETS {
+        return Err(HostError::Host(format!(
+            "{what}: over {REDACT_MAX_SECRETS} redact secrets — the output scan is bounded"
+        )));
+    }
+    *total += secret.len();
+    if *total > REDACT_MAX_TOTAL_BYTES {
+        return Err(HostError::Host(format!(
+            "{what}: redact secrets pass the {REDACT_MAX_TOTAL_BYTES}-byte bound"
+        )));
+    }
+    out.push(secret);
+    Ok(())
+}
+
+fn resolve_redact(names: &[String], files: &[PathBuf]) -> Result<Vec<Vec<u8>>, HostError> {
+    let mut out = Vec::new();
+    let mut total = 0usize;
+    for name in names {
+        let value = std::env::var(name)
+            .map_err(|_| HostError::Host(format!("--redact-env {name}: the variable is unset")))?;
+        if value.is_empty() {
+            return Err(HostError::Host(format!(
+                "--redact-env {name}: the variable is empty"
+            )));
+        }
+        push_secret(
+            &mut out,
+            &mut total,
+            value.into_bytes(),
+            &format!("--redact-env {name}"),
+        )?;
+    }
+    for path in files {
+        use std::os::unix::fs::PermissionsExt;
+        let meta = std::fs::metadata(path)
+            .map_err(|e| HostError::Host(format!("--redact-file {}: {e}", path.display())))?;
+        // A secrets file other local users can read cannot be trusted to
+        // hold secrets — refuse it rather than mask halfheartedly.
+        if meta.permissions().mode() & 0o077 != 0 {
+            return Err(HostError::Host(format!(
+                "--redact-file {}: group- or world-readable — chmod 600 it first",
+                path.display()
+            )));
+        }
+        let content = std::fs::read(path)
+            .map_err(|e| HostError::Host(format!("--redact-file {}: {e}", path.display())))?;
+        for line in content.split(|b| *b == b'\n') {
+            let line = match line.last() {
+                Some(b'\r') => &line[..line.len() - 1],
+                _ => line,
+            };
+            if !line.is_empty() {
+                push_secret(
+                    &mut out,
+                    &mut total,
+                    line.to_vec(),
+                    &format!("--redact-file {}", path.display()),
+                )?;
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Single-thread executor: `JsRuntime` is `!Send`, so every run must stay on
@@ -186,7 +301,19 @@ async fn main() {
             report,
             report_max_kb,
             max_output_kb,
+            max_output_rate_kbs,
+            prefix_stdout,
+            redact_env,
+            redact_file,
+            output_raw,
         } => {
+            let redact_literals = match resolve_redact(&redact_env, &redact_file) {
+                Ok(v) => v,
+                Err(err) => {
+                    eprintln!("jsrt: {err}");
+                    std::process::exit(exit_code(&err));
+                }
+            };
             let plan = supervise::SupervisePlan {
                 worker_args: run.to_argv(),
                 max_rss_bytes: max_rss_mb.map(|mb| mb * 1024 * 1024),
@@ -196,6 +323,10 @@ async fn main() {
                 report_path: report,
                 report_max_bytes: report_max_kb * 1024,
                 max_output_bytes: max_output_kb.saturating_mul(1024),
+                output_rate_bps: max_output_rate_kbs.saturating_mul(1024),
+                prefix_stdout,
+                redact_literals,
+                output_raw,
             };
             match supervise::supervise(&plan) {
                 Ok(code) => std::process::exit(code),

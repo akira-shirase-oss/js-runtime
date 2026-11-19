@@ -69,7 +69,24 @@ pub struct SupervisePlan {
     /// Byte cap for the report file before it rotates.
     pub report_max_bytes: u64,
     /// Bytes of worker stdout, and separately stderr, passed through.
+    /// With `output_rate_bps` this is the burst allowance, refilled at
+    /// that rate; at rate 0 it is a lifetime budget.
     pub max_output_bytes: u64,
+    /// Sustained pass-through in bytes/s once the burst is spent
+    /// (0 = lifetime cap only — a long-lived worker goes quiet at it).
+    pub output_rate_bps: u64,
+    /// Also prefix worker stdout lines with the run id. stderr lines are
+    /// always prefixed; stdout is a data pipe and stays byte-exact unless
+    /// the operator asks.
+    pub prefix_stdout: bool,
+    /// Literals masked out of forwarded worker output (and the re-shown
+    /// tail). They never appear in argv, logs or the report — the report
+    /// carries only their count and masked bytes.
+    pub redact_literals: Vec<Vec<u8>>,
+    /// Pass worker bytes untouched — no run-id prefix and no terminal
+    /// neutralising. For trusted workers; configured redaction still
+    /// applies.
+    pub output_raw: bool,
 }
 
 /// The last bytes of each capped stream, kept and shown at exit — where a
@@ -77,20 +94,322 @@ pub struct SupervisePlan {
 const OUTPUT_TAIL_BYTES: usize = 4096;
 
 /// What one worker stream did: bytes passed through, bytes dropped past
-/// the cap, and how many of the dropped bytes were re-shown as the tail.
+/// the cap, how many of the dropped bytes were re-shown as the tail, and
+/// how many emitted bytes were masked as secrets.
 #[derive(Debug, Default, Clone, Copy)]
 struct Forwarded {
     written: u64,
     dropped: u64,
     tail: u64,
+    redacted: u64,
 }
 
-/// Copy `from` to `to` until EOF, passing at most `cap` bytes and counting
-/// the rest. It keeps reading past the cap — a worker blocked on a full
-/// pipe would stall instead of being limited — so the bound is on what
-/// reaches the operator, not on what the worker may try to write.
+/// What one worker stream's forwarder does with the bytes the budget
+/// lets through: pass them untouched, or mark each line with its run id
+/// so a shared log says which run produced it.
+struct ForwardCfg {
+    cap: u64,
+    rate_bps: u64,
+    /// Line prefix marking the stream's run; `None` passes bytes raw.
+    prefix: Option<String>,
+    /// Literals masked out of the emitted stream.
+    secrets: Vec<Vec<u8>>,
+    /// The destination is a terminal: render control bytes visibly so the
+    /// worker cannot drive the operator's terminal.
+    sanitise: bool,
+}
+
+const REDACTED: &[u8] = b"[redacted]";
+
+/// Renders a worker's output safe for a terminal, UTF-8 aware: C0
+/// controls except `\n` and `\t`, DEL, and the C1 code points become
+/// `^X` / `M-^x` (a UTF-8 terminal receives U+0080..U+009F as C2 80..9F).
+/// Every other valid scalar passes byte-for-byte — the 0x80..0x9F range
+/// is ordinary continuation bytes in text like "café", "€" or "😀".
+/// Invalid or lone bytes render as `\xNN`: a lone 0x9B is still CSI in
+/// 8-bit terminal modes. An incomplete trailing sequence (at most 3
+/// bytes) is held for the next chunk — same shape as the redactor's
+/// hold-back — and flushed rendered at EOF.
+struct Neutraliser {
+    hold: Vec<u8>,
+}
+
+impl Neutraliser {
+    fn new() -> Self {
+        Self { hold: Vec::new() }
+    }
+
+    fn process(&mut self, chunk: &[u8], out: &mut Vec<u8>) {
+        self.hold.extend_from_slice(chunk);
+        let hay = std::mem::take(&mut self.hold);
+        let mut i = 0;
+        while i < hay.len() {
+            let b = hay[i];
+            match b {
+                b'\n' | b'\t' => {
+                    out.push(b);
+                    i += 1;
+                }
+                0x00..=0x08 | 0x0b..=0x1f => {
+                    out.push(b'^');
+                    out.push(b + 0x40);
+                    i += 1;
+                }
+                0x7f => {
+                    out.extend_from_slice(b"^?");
+                    i += 1;
+                }
+                0x20..=0x7e => {
+                    out.push(b);
+                    i += 1;
+                }
+                _ => {
+                    let len = utf8_len(b);
+                    if len == 0 {
+                        push_hex(out, b);
+                        i += 1;
+                        continue;
+                    }
+                    if hay.len() - i < len {
+                        if utf8_valid_prefix(&hay[i..]) {
+                            break;
+                        }
+                        push_hex(out, b);
+                        i += 1;
+                        continue;
+                    }
+                    let seq = &hay[i..i + len];
+                    if !utf8_valid_seq(seq) {
+                        push_hex(out, b);
+                        i += 1;
+                        continue;
+                    }
+                    if len == 2 && b == 0xc2 && (0x80..=0x9f).contains(&seq[1]) {
+                        out.extend_from_slice(b"M-^");
+                        out.push(seq[1] - 0x80 + 0x40);
+                    } else {
+                        out.extend_from_slice(seq);
+                    }
+                    i += len;
+                }
+            }
+        }
+        self.hold.extend_from_slice(&hay[i..]);
+    }
+
+    /// The stream ended: a held partial sequence can never complete —
+    /// show its bytes rather than drop or emit them raw.
+    fn finish(&mut self, out: &mut Vec<u8>) {
+        for &b in std::mem::take(&mut self.hold).iter() {
+            push_hex(out, b);
+        }
+    }
+}
+
+fn push_hex(out: &mut Vec<u8>, b: u8) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    out.extend_from_slice(b"\\x");
+    out.push(HEX[(b >> 4) as usize]);
+    out.push(HEX[(b & 0xf) as usize]);
+}
+
+/// Length of the sequence a lead byte opens, or 0 for bytes that cannot
+/// lead one (lone continuations, overlong C0/C1, starts above U+10FFFF).
+fn utf8_len(lead: u8) -> usize {
+    match lead {
+        0xc2..=0xdf => 2,
+        0xe0..=0xef => 3,
+        0xf0..=0xf4 => 4,
+        _ => 0,
+    }
+}
+
+/// The constraint on the byte right after the lead — the only position
+/// whose range varies (overlong, surrogate and >U+10FFFF screens).
+fn second_byte_ok(lead: u8, b: u8) -> bool {
+    match lead {
+        0xe0 => (0xa0..=0xbf).contains(&b),
+        0xed => (0x80..=0x9f).contains(&b),
+        0xf0 => (0x90..=0xbf).contains(&b),
+        0xf4 => (0x80..=0x8f).contains(&b),
+        _ => (0x80..=0xbf).contains(&b),
+    }
+}
+
+/// `part`, shorter than a full sequence, could still complete into a
+/// valid one: every byte present satisfies its position's range.
+fn utf8_valid_prefix(part: &[u8]) -> bool {
+    utf8_len(part[0]) > 0
+        && part.get(1).is_none_or(|&b| second_byte_ok(part[0], b))
+        && part.iter().skip(2).all(|&b| (0x80..=0xbf).contains(&b))
+}
+
+/// `seq` is a complete, strictly valid UTF-8 sequence.
+fn utf8_valid_seq(seq: &[u8]) -> bool {
+    second_byte_ok(seq[0], seq[1]) && seq[2..].iter().all(|&b| (0x80..=0xbf).contains(&b))
+}
+
+/// Masks configured literals in the forwarded stream, across chunk
+/// boundaries: the last `max_len - 1` unemitted bytes are held back so a
+/// secret split over two reads is still caught. `redacted` counts the
+/// original bytes masked — the marker is framing, like the line prefix.
+struct Redactor {
+    secrets: Vec<Vec<u8>>,
+    /// Secret indices by their first byte: a position only scans the
+    /// literals it could begin. Without it every byte paid a
+    /// `starts_with` per secret — ~2.5 G compares over 10 MiB of output
+    /// at the 256-secret bound, enough to stall the worker past its
+    /// timeout. Worst case (all secrets sharing a first byte) stays
+    /// bounded by the 256 cap.
+    buckets: Vec<Vec<usize>>,
+    hold: Vec<u8>,
+    max_len: usize,
+    redacted: u64,
+}
+
+impl Redactor {
+    fn new(secrets: Vec<Vec<u8>>) -> Self {
+        let max_len = secrets.iter().map(|s| s.len()).max().unwrap_or(0);
+        let mut buckets = vec![Vec::new(); 256];
+        for (i, s) in secrets.iter().enumerate() {
+            if let Some(&first) = s.first() {
+                buckets[first as usize].push(i);
+            }
+        }
+        Self {
+            secrets,
+            buckets,
+            hold: Vec::new(),
+            max_len,
+            redacted: 0,
+        }
+    }
+
+    fn active(&self) -> bool {
+        self.max_len > 0
+    }
+
+    /// Append `chunk`; emit into `out` everything that cannot still open
+    /// a secret, with matches replaced by "[redacted]".
+    fn process(&mut self, chunk: &[u8], out: &mut Vec<u8>) {
+        if !self.active() {
+            out.extend_from_slice(chunk);
+            return;
+        }
+        let mut hay = std::mem::take(&mut self.hold);
+        hay.extend_from_slice(chunk);
+        let mut pos = 0;
+        while let Some(start) = self.next_match(&hay, pos, false) {
+            out.extend_from_slice(&hay[pos..start]);
+            let end = self.mask_union(&hay, start, false);
+            out.extend_from_slice(REDACTED);
+            self.redacted += (end - start) as u64;
+            pos = end;
+        }
+        // Anything in the last max_len-1 bytes could be the start of a
+        // secret the next chunk completes — hold it, emit the rest.
+        let hold_start = pos.max(hay.len().saturating_sub(self.max_len - 1));
+        out.extend_from_slice(&hay[pos..hold_start]);
+        self.hold = hay[hold_start..].to_vec();
+    }
+
+    /// The stream ended: emit the held tail, masking a dangling secret
+    /// prefix too — showing it would reveal all but the secret's end.
+    fn finish(&mut self, out: &mut Vec<u8>) {
+        let hay = std::mem::take(&mut self.hold);
+        let mut pos = 0;
+        while let Some(start) = self.next_match(&hay, pos, true) {
+            out.extend_from_slice(&hay[pos..start]);
+            let end = self.mask_union(&hay, start, true);
+            out.extend_from_slice(REDACTED);
+            self.redacted += (end - start) as u64;
+            pos = end;
+        }
+        out.extend_from_slice(&hay[pos..]);
+    }
+
+    /// First position at or after `from` where a secret starts.
+    fn next_match(&self, hay: &[u8], from: usize, final_chunk: bool) -> Option<usize> {
+        (from..hay.len()).find(|&i| self.match_at(hay, i, final_chunk).is_some())
+    }
+
+    /// Longest match starting at `i` as bytes masked, or a proper-prefix
+    /// match at the very tail when `final_chunk` — mid-stream it may
+    /// still complete or dissolve.
+    fn match_at(&self, hay: &[u8], i: usize, final_chunk: bool) -> Option<usize> {
+        let mut best: Option<usize> = None;
+        for &si in &self.buckets[hay[i] as usize] {
+            let s = &self.secrets[si];
+            let len = if hay[i..].starts_with(s) {
+                s.len()
+            } else if final_chunk && hay.len() - i < s.len() && s.starts_with(&hay[i..]) {
+                hay.len() - i
+            } else {
+                continue;
+            };
+            best = Some(best.map_or(len, |b| b.max(len)));
+        }
+        best
+    }
+
+    /// End of the masked union opened at `start`: a match that begins
+    /// inside the masked span extends it. Masking only the first match
+    /// would show the tail of any secret it overlaps — "1234" of
+    /// "12345678" leaves "5678" of "345678" visible.
+    fn mask_union(&self, hay: &[u8], start: usize, final_chunk: bool) -> usize {
+        let mut end = start + self.match_at(hay, start, final_chunk).unwrap_or(0);
+        let mut j = start + 1;
+        while j < end && j < hay.len() {
+            if let Some(l) = self.match_at(hay, j, final_chunk) {
+                end = end.max(j + l);
+            }
+            j += 1;
+        }
+        end
+    }
+}
+
+/// Write `bytes` to `to` with `prefix` at the start of every line,
+/// tracking `at_line_start` across calls so a line split over several
+/// reads stays byte-exact and still goes out live. Prefix bytes are
+/// framing — they are not counted against the worker's output budget.
+fn write_prefixed(
+    to: &mut impl Write,
+    prefix: &str,
+    at_line_start: &mut bool,
+    bytes: &[u8],
+) -> std::io::Result<()> {
+    let mut rest = bytes;
+    while !rest.is_empty() {
+        if *at_line_start {
+            to.write_all(prefix.as_bytes())?;
+            *at_line_start = false;
+        }
+        match rest.iter().position(|b| *b == b'\n') {
+            Some(i) => {
+                to.write_all(&rest[..=i])?;
+                *at_line_start = true;
+                rest = &rest[i + 1..];
+            }
+            None => {
+                to.write_all(rest)?;
+                rest = &[];
+            }
+        }
+    }
+    to.flush()
+}
+
+/// Copy `from` to `to` until EOF, passing what a token bucket allows and
+/// counting the rest. `cap` is the burst (the bucket starts full) and
+/// `rate_bps` refills it; at rate 0 that degenerates to the old lifetime
+/// cap. The bucket's capacity floors at one read buffer so a 0-burst
+/// plus a rate still lets a trickle through. The forwarder keeps reading
+/// past any drop — a worker blocked on a full pipe would stall instead
+/// of being limited — so the bound is on what reaches the operator, not
+/// on what the worker may try to write.
 ///
-/// The moment the cap is first hit, a notice goes to `notice` (the
+/// The moment output is first dropped, a notice goes to `notice` (the
 /// supervisor's stderr), so a long-running worker's operator learns it
 /// then, not at exit. The last `OUTPUT_TAIL_BYTES` of the dropped output
 /// are kept and written at EOF, starting at a line boundary when there is
@@ -100,12 +419,23 @@ fn forward(
     mut from: impl Read,
     mut to: impl Write,
     mut notice: impl Write,
-    cap: u64,
+    cfg: ForwardCfg,
 ) -> Forwarded {
+    let cap = cfg.cap;
+    let rate_bps = cfg.rate_bps;
     let mut done = Forwarded::default();
     let mut tail: std::collections::VecDeque<u8> =
         std::collections::VecDeque::with_capacity(OUTPUT_TAIL_BYTES);
     let mut buf = [0u8; 8192];
+    let mut at_line_start = true;
+    let rate = rate_bps as f64;
+    let capacity = cap.max(buf.len() as u64) as f64;
+    let mut tokens = cap as f64;
+    let mut last_refill = Instant::now();
+    let mut redactor = Redactor::new(cfg.secrets);
+    let mut neutraliser = Neutraliser::new();
+    let mut emit = Vec::new();
+    let mut emit2 = Vec::new();
     loop {
         let n = match from.read(&mut buf) {
             Ok(0) => break,
@@ -113,10 +443,30 @@ fn forward(
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(_) => break,
         };
-        let room = usize::try_from(cap.saturating_sub(done.written)).unwrap_or(usize::MAX);
-        let keep = n.min(room);
+        if rate > 0.0 {
+            // Quiet time accrues allowance — that is what lets a burst
+            // form again after the bucket was spent.
+            let now = Instant::now();
+            tokens = (tokens + now.duration_since(last_refill).as_secs_f64() * rate).min(capacity);
+            last_refill = now;
+        }
+        let keep = n.min(tokens as usize);
+        tokens -= keep as f64;
         if keep > 0 {
-            if to.write_all(&buf[..keep]).and_then(|()| to.flush()).is_ok() {
+            emit.clear();
+            redactor.process(&buf[..keep], &mut emit);
+            let payload: &[u8] = if cfg.sanitise {
+                emit2.clear();
+                neutraliser.process(&emit, &mut emit2);
+                &emit2
+            } else {
+                &emit
+            };
+            let wrote = match &cfg.prefix {
+                Some(prefix) => write_prefixed(&mut to, prefix, &mut at_line_start, payload),
+                None => to.write_all(payload).and_then(|()| to.flush()),
+            };
+            if wrote.is_ok() {
                 done.written += keep as u64;
             } else {
                 done.dropped += keep as u64;
@@ -125,11 +475,21 @@ fn forward(
         let over = &buf[keep..n];
         if !over.is_empty() {
             if done.dropped == 0 {
-                let _ = writeln!(
-                    notice,
-                    "\njsrt: supervise: worker {name} reached the {cap}-byte cap; further output \
-                     is dropped and counted, its last {OUTPUT_TAIL_BYTES} bytes are shown at exit"
-                );
+                if rate_bps > 0 {
+                    let _ = writeln!(
+                        notice,
+                        "\njsrt: supervise: worker {name} exceeded its output budget \
+                         ({cap}-byte burst + {rate_bps} bytes/s); excess output is dropped \
+                         and counted, its last {OUTPUT_TAIL_BYTES} bytes are shown at exit"
+                    );
+                } else {
+                    let _ = writeln!(
+                        notice,
+                        "\njsrt: supervise: worker {name} reached the {cap}-byte cap; further \
+                         output is dropped and counted, its last {OUTPUT_TAIL_BYTES} bytes \
+                         are shown at exit"
+                    );
+                }
                 let _ = notice.flush();
             }
             done.dropped += over.len() as u64;
@@ -140,6 +500,34 @@ fn forward(
                 tail.push_back(b);
             }
         }
+    }
+    // EOF: flush what the redactor held back — the stream is over, so a
+    // dangling secret prefix is masked rather than shown.
+    emit.clear();
+    redactor.finish(&mut emit);
+    if !emit.is_empty() {
+        let payload: &[u8] = if cfg.sanitise {
+            emit2.clear();
+            neutraliser.process(&emit, &mut emit2);
+            &emit2
+        } else {
+            &emit
+        };
+        let _ = match &cfg.prefix {
+            Some(prefix) => write_prefixed(&mut to, prefix, &mut at_line_start, payload),
+            None => to.write_all(payload).and_then(|()| to.flush()),
+        };
+    }
+    // A scalar truncated at EOF renders as its \xNN bytes. Never fed
+    // when the sink is not a terminal, so its hold is empty and this
+    // writes nothing.
+    emit2.clear();
+    neutraliser.finish(&mut emit2);
+    if !emit2.is_empty() {
+        let _ = match &cfg.prefix {
+            Some(prefix) => write_prefixed(&mut to, prefix, &mut at_line_start, &emit2),
+            None => to.write_all(&emit2).and_then(|()| to.flush()),
+        };
     }
     if !tail.is_empty() {
         let mut bytes: Vec<u8> = tail.into_iter().collect();
@@ -155,6 +543,19 @@ fn forward(
         if !bytes.ends_with(b"\n") {
             bytes.push(b'\n');
         }
+        // The re-shown tail gets the same masking — a dropped secret
+        // must not resurface at exit — and the same terminal rendering.
+        emit.clear();
+        redactor.process(&bytes, &mut emit);
+        redactor.finish(&mut emit);
+        let bytes = if cfg.sanitise {
+            emit2.clear();
+            neutraliser.process(&emit, &mut emit2);
+            neutraliser.finish(&mut emit2);
+            std::mem::take(&mut emit2)
+        } else {
+            emit
+        };
         let header = format!(
             "\n--- jsrt: supervise: last {} of the {} bytes of worker {name} past the cap ---\n",
             bytes.len(),
@@ -169,6 +570,7 @@ fn forward(
             done.tail = bytes.len() as u64;
         }
     }
+    done.redacted = redactor.redacted;
     done
 }
 
@@ -260,14 +662,39 @@ pub fn supervise(plan: &SupervisePlan) -> Result<i32, HostError> {
     // The forwarders end at EOF, which comes when the worker exits (scripts
     // cannot start processes that would inherit the pipes).
     let cap = plan.max_output_bytes;
+    let rate = plan.output_rate_bps;
+    // Worker stderr always carries its run id — that is where the host's
+    // error lines land; stdout is a data pipe and gets the marker only
+    // when asked.
+    let line_prefix = format!("[run {run_id}] ");
+    // A terminal sink gets neutralised control bytes — a worker must not
+    // drive the operator's terminal. A pipe keeps the bytes as they are:
+    // downstream consumers want the worker's output, not a rewrite.
+    use std::io::IsTerminal;
+    let stdout_tty = std::io::stdout().is_terminal();
+    let stderr_tty = std::io::stderr().is_terminal();
+    let out_cfg = ForwardCfg {
+        cap,
+        rate_bps: rate,
+        prefix: (plan.prefix_stdout && !plan.output_raw).then(|| line_prefix.clone()),
+        secrets: plan.redact_literals.clone(),
+        sanitise: stdout_tty && !plan.output_raw,
+    };
+    let err_cfg = ForwardCfg {
+        cap,
+        rate_bps: rate,
+        prefix: (!plan.output_raw).then_some(line_prefix),
+        secrets: plan.redact_literals.clone(),
+        sanitise: stderr_tty && !plan.output_raw,
+    };
     let out_forwarder = child.stdout.take().map(|out| {
         std::thread::spawn(move || {
-            forward("stdout", out, std::io::stdout(), std::io::stderr(), cap)
+            forward("stdout", out, std::io::stdout(), std::io::stderr(), out_cfg)
         })
     });
     let err_forwarder = child.stderr.take().map(|err| {
         std::thread::spawn(move || {
-            forward("stderr", err, std::io::stderr(), std::io::stderr(), cap)
+            forward("stderr", err, std::io::stderr(), std::io::stderr(), err_cfg)
         })
     });
     // The handle stays alive purely so the child stays ours until reaped —
@@ -399,12 +826,21 @@ pub fn supervise(plan: &SupervisePlan) -> Result<i32, HostError> {
         "poll_interval_ms": POLL_INTERVAL.as_millis(),
         "output": {
             "max_bytes_per_stream": cap,
+            "rate_bytes_per_sec": plan.output_rate_bps,
+            "redact_literals": plan.redact_literals.len(),
             "stdout_bytes": stdout_fwd.written,
             "stdout_dropped_bytes": stdout_fwd.dropped,
             "stdout_tail_bytes": stdout_fwd.tail,
+            "stdout_redacted_bytes": stdout_fwd.redacted,
             "stderr_bytes": stderr_fwd.written,
             "stderr_dropped_bytes": stderr_fwd.dropped,
             "stderr_tail_bytes": stderr_fwd.tail,
+            "stderr_redacted_bytes": stderr_fwd.redacted,
+            "raw_passthrough": plan.output_raw,
+            "tty_neutralised": {
+                "stdout": stdout_tty && !plan.output_raw,
+                "stderr": stderr_tty && !plan.output_raw,
+            },
         },
     });
 
@@ -420,11 +856,13 @@ struct Outcome {
 /// Map the child's wait-status onto the run taxonomy. A signal we sent is
 /// a budget doing its job; a signal nobody asked for is a host failure —
 /// the report names it either way. Returns the label, the exit code, and
-/// the `killed_by` the report should carry (SIGXCPU explains itself).
+/// the `killed_by` the report should carry (SIGXCPU explains itself; any
+/// other signal names itself and admits the sender is unknown — claiming
+/// a kill jsrt never ordered would be a lie).
 fn classify_death(
     status: libc::c_int,
     killed_by: Option<&'static str>,
-) -> (Outcome, i32, Option<&'static str>) {
+) -> (Outcome, i32, Option<String>) {
     if libc::WIFEXITED(status) {
         let code = libc::WEXITSTATUS(status);
         let label = match code {
@@ -444,20 +882,21 @@ fn classify_death(
                 signal: None,
             },
             code,
-            killed_by,
+            killed_by.map(str::to_string),
         );
     }
     if libc::WIFSIGNALED(status) {
         let sig = libc::WTERMSIG(status);
-        // A SIGXCPU is the CPU rlimit, a SIGTERM/SIGKILL after kill_sent is
-        // our own hand, a SIGABRT is most likely V8's OOM handler firing —
-        // all budget-class deaths. Anything else is unexplained.
-        let by = killed_by.or(if sig == libc::SIGXCPU {
-            Some(KILLED_BY_CPU)
+        // A SIGXCPU is the CPU rlimit, a SIGTERM/SIGKILL after sigterm_at
+        // is our own hand, a SIGABRT is most likely V8's OOM handler
+        // firing — all explained deaths. Anything else names the signal
+        // and says the sender is unknown instead of implying jsrt sent it.
+        let by = killed_by.map(str::to_string).or(if sig == libc::SIGXCPU {
+            Some(KILLED_BY_CPU.to_string())
         } else if sig == libc::SIGABRT {
-            Some("abort")
+            Some("abort".to_string())
         } else {
-            None
+            Some(format!("signal {sig} (sender unknown)"))
         });
         let expected = killed_by.is_some()
             || sig == libc::SIGXCPU
@@ -481,7 +920,7 @@ fn classify_death(
             signal: None,
         },
         8,
-        killed_by,
+        killed_by.map(str::to_string),
     )
 }
 
@@ -623,4 +1062,76 @@ fn append_line(path: &std::path::Path, line: &str) -> Result<(), HostError> {
         .open(path)
         .map_err(|e| HostError::Host(format!("report file {}: {e}", path.display())))?;
     writeln!(f, "{line}").map_err(|e| HostError::Host(format!("report file: {e}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Neutraliser, Redactor};
+
+    #[test]
+    fn utf8_text_passes_the_neutraliser_byte_for_byte() {
+        let mut n = Neutraliser::new();
+        let mut out = Vec::new();
+        n.process("café € 😀 日本語\n".as_bytes(), &mut out);
+        n.finish(&mut out);
+        assert_eq!(out, "café € 😀 日本語\n".as_bytes());
+    }
+
+    #[test]
+    fn c1_code_points_render_but_lone_bytes_stay_hex() {
+        let mut n = Neutraliser::new();
+        let mut out = Vec::new();
+        // U+009B (CSI) arrives on a UTF-8 terminal as C2 9B.
+        n.process(&[0xc2, 0x9b], &mut out);
+        assert_eq!(out, b"M-^[");
+        out.clear();
+        // The lone byte is the 8-bit form of the same control.
+        n.process(&[0x9b], &mut out);
+        assert_eq!(out, b"\\x9b");
+    }
+
+    #[test]
+    fn a_scalar_split_across_chunks_arrives_intact() {
+        let mut n = Neutraliser::new();
+        let mut out = Vec::new();
+        n.process(&[0xf0, 0x9f], &mut out); // first half of U+1F600
+        assert!(out.is_empty(), "held: {out:?}");
+        n.process(&[0x98, 0x80], &mut out);
+        assert_eq!(out, &[0xf0, 0x9f, 0x98, 0x80]);
+    }
+
+    #[test]
+    fn a_truncated_scalar_renders_at_eof() {
+        let mut n = Neutraliser::new();
+        let mut out = Vec::new();
+        n.process(&[0xf0, 0x9f], &mut out);
+        n.finish(&mut out);
+        assert_eq!(out, b"\\xf0\\x9f");
+    }
+
+    #[test]
+    fn invalid_and_control_bytes_stay_visible() {
+        let mut n = Neutraliser::new();
+        let mut out = Vec::new();
+        n.process(
+            &[
+                0x1b, b'[', b'2', b'J', // CSI clear-screen attempt
+                0x07, // BEL
+                0xed, 0xa0, 0xbd, // unpaired surrogate (WTF-8)
+                0xff, b'A', b'\n',
+            ],
+            &mut out,
+        );
+        assert_eq!(out, b"^[[2J^G\\xed\\xa0\\xbd\\xffA\n");
+    }
+
+    #[test]
+    fn overlapping_secrets_mask_their_union() {
+        let mut r = Redactor::new(vec![b"1234".to_vec(), b"345678".to_vec()]);
+        let mut out = Vec::new();
+        r.process(b"pre 12345678 post", &mut out);
+        r.finish(&mut out);
+        assert_eq!(out, b"pre [redacted] post");
+        assert_eq!(r.redacted, 8);
+    }
 }
