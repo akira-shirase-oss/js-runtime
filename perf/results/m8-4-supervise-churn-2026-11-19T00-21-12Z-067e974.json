@@ -1,0 +1,51 @@
+{
+  "milestone": "M8.4",
+  "workload": "1000 jsrt supervise spawn->ready->SIGTERM cycles of a serve worker on port 47412 \u2014 an orphaned worker would hold the port and break the next respawn",
+  "environment": {
+    "commit": "067e974",
+    "date_utc": "2026-11-19T00:21:12+00:00",
+    "arch": "x86_64",
+    "chip": "AMD EPYC 7763 64-Core Processor",
+    "cores": 4,
+    "mem_bytes": 16760344576,
+    "os": "Linux 7.0.0-1017-azure",
+    "build": "release (opt-level 3)"
+  },
+  "wall_ms": 82371.1,
+  "rounds": 1000,
+  "exit_codes": {
+    "6": 1000
+  },
+  "records_classified_operator_sigterm": 144,
+  "report_records": 144,
+  "respawn_failed": 0,
+  "orphans": 0,
+  "thresholds": {
+    "rounds": 1000,
+    "exit_code": 6,
+    "killed_by": "operator-sigterm",
+    "respawn_failed": 0,
+    "orphans": 0
+  },
+  "checks": {
+    "rounds": true,
+    "exit_code": true,
+    "killed_by": false,
+    "respawn_failed": true,
+    "orphans": true
+  },
+  "passed": false,
+  "loadavg_before": [
+    1.66,
+    1.62,
+    1.16
+  ],
+  "loadavg_after": [
+    1.33,
+    1.52,
+    1.17
+  ],
+  "caveats": [
+    "port-free-per-round is the orphan proof; process listing is not used"
+  ]
+}
