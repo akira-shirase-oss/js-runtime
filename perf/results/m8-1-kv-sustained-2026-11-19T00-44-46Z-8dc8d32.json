@@ -1,0 +1,61 @@
+{
+  "milestone": "M8.1",
+  "workload": "1000000 mixed rt.kv get/put/list/delete ops on a granted store (1024-key working set, kv-sustained.js), then 64 KiB writes until the 8 MiB quota refuses",
+  "environment": {
+    "commit": "8dc8d32",
+    "date_utc": "2026-11-19T00:44:46+00:00",
+    "arch": "x86_64",
+    "chip": "INTEL(R) XEON(R) PLATINUM 8573C",
+    "cores": 4,
+    "mem_bytes": 16759308288,
+    "os": "Linux 7.0.0-1017-azure",
+    "build": "release (opt-level 3)"
+  },
+  "wall_ms": 623495.6,
+  "result": {
+    "ops": 1000000,
+    "mixed_wall_ms": 623281,
+    "puts": 375000,
+    "gets": 375000,
+    "gets_hit": 375000,
+    "deletes": 125000,
+    "lists": 125000,
+    "integrity_fail": 0,
+    "quota_puts": 126,
+    "quota_refusals": 200,
+    "refusals_named_capability": 200,
+    "post_quota_ok": true,
+    "quota_wall_ms": 197
+  },
+  "store_bytes": 8351744,
+  "thresholds": {
+    "ops": 1000000,
+    "integrity_fail": 0,
+    "quota_refusals_min": 1,
+    "refusals_all_capability_named": true,
+    "post_quota_ok": true,
+    "store_bytes_max": 9437184,
+    "exit_code": 0
+  },
+  "checks": {
+    "ops": true,
+    "integrity_fail": true,
+    "quota_refusals_min": true,
+    "refusals_all_capability_named": true,
+    "post_quota_ok": true,
+    "store_bytes_max": true,
+    "exit_code": true
+  },
+  "passed": true,
+  "stderr": null,
+  "loadavg_before": [
+    2.7,
+    1.81,
+    0.78
+  ],
+  "loadavg_after": [
+    1.32,
+    1.49,
+    1.12
+  ]
+}

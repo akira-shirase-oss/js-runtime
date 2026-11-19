@@ -1,0 +1,69 @@
+{
+  "milestone": "M7.2b-composed",
+  "workload": "1000000 POST /hooks/github X-Delivery-Id:d1 through the real webhook app (examples/webhook on port 47411, temporary copy) - the dedup path: serve dispatch + rt.kv.get on a live store. 32 keep-alive connections.",
+  "environment": {
+    "commit": "8dc8d32",
+    "date_utc": "2026-11-19T00:34:23+00:00",
+    "arch": "x86_64",
+    "chip": "INTEL(R) XEON(R) PLATINUM 8573C",
+    "cores": 4,
+    "mem_bytes": 16759308288,
+    "os": "Linux 7.0.0-1017-azure",
+    "build": "release (opt-level 3)"
+  },
+  "load_wall_ms": 24077.4,
+  "seed": {
+    "status": 201,
+    "body": "stored hook/github/d1"
+  },
+  "driver": {
+    "url": "http://127.0.0.1:47411/hooks/github",
+    "method": "POST",
+    "requests_target": 1000000,
+    "requests_issued": 1000000,
+    "concurrency": 32,
+    "wall_ms": 24066,
+    "rps": 41551,
+    "latency_us": {
+      "p50": 808,
+      "p95": 930,
+      "p99": 1006,
+      "max": 2582
+    },
+    "outcomes": {
+      "ok": 1000000,
+      "non2xx": 0,
+      "refused": 0,
+      "timeout": 0,
+      "client_err": 0
+    },
+    "error_rate": 0.0
+  },
+  "checks": {
+    "issued": true,
+    "all_ok": true,
+    "zero_errors": true,
+    "dedup_held": true
+  },
+  "passed": true,
+  "driver_stderr": null,
+  "keys_after": [
+    "hook/github/d1"
+  ],
+  "dedup_held": true,
+  "server_exit": -15,
+  "loadavg_before": [
+    3.59,
+    1.88,
+    0.78
+  ],
+  "loadavg_after": [
+    2.7,
+    1.81,
+    0.78
+  ],
+  "caveats": [
+    "latency is client-observed (includes client stack + loopback), not server service time",
+    "single workstation; the driver shares cores with the server under test"
+  ]
+}

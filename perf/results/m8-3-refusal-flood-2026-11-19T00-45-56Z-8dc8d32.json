@@ -1,0 +1,52 @@
+{
+  "milestone": "M8.3",
+  "workload": "1000000 ungated op calls (rt.kv/rt.fetch/rt.media/rt.readText) in one ungranted run \u2014 refusals must classify fast and clean",
+  "environment": {
+    "commit": "8dc8d32",
+    "date_utc": "2026-11-19T00:45:56+00:00",
+    "arch": "x86_64",
+    "chip": "INTEL(R) XEON(R) PLATINUM 8573C",
+    "cores": 4,
+    "mem_bytes": 16759308288,
+    "os": "Linux 7.0.0-1017-azure",
+    "build": "release (opt-level 3)"
+  },
+  "wall_ms": 6686.3,
+  "result": {
+    "attempts": 1000000,
+    "refused": 1000000,
+    "capability_named": 1000000,
+    "not_refused": 0,
+    "by_name": {
+      "CapabilityError": 1000000
+    },
+    "wall_ms": 6665,
+    "sink_len": 0
+  },
+  "thresholds": {
+    "attempts": 1000000,
+    "refused": 1000000,
+    "capability_named": 1000000,
+    "not_refused": 0,
+    "exit_code": 0
+  },
+  "checks": {
+    "attempts": true,
+    "refused": true,
+    "capability_named": true,
+    "not_refused": true,
+    "exit_code": true
+  },
+  "passed": true,
+  "stderr": null,
+  "loadavg_before": [
+    1.31,
+    1.46,
+    1.14
+  ],
+  "loadavg_after": [
+    1.28,
+    1.46,
+    1.14
+  ]
+}
