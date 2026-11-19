@@ -240,7 +240,7 @@ still make V8 abort (a signal, no exit code; `jsrt supervise` reports it
 as one). **What this does not cover:** memory outside the V8 heap —
 `ArrayBuffer` backing stores and host buffers — which needs a process
 boundary, which is what `jsrt supervise` is for (`RLIMIT_CPU` seconds, RSS polling, SIGTERM→SIGKILL,
-bounded JSONL run reports, worker stdout and stderr each capped per run by
+bounded JSONL run reports — the `--report` file rotates to `<name>.1` at `--report-max-kb` (default 512 KiB), so it keeps the last records within the cap plus one previous generation, and each fresh file opens with a meta-record counting the records the rotation displaced — worker stdout and stderr each capped per run by
 `--max-output-kb` — default 8 MiB, a lifetime budget per run — with a notice the moment a stream hits it, its last 4 KiB re-shown at exit so the cause of death survives, and passed/dropped/re-shown bytes in the report), and we don't pretend an in-process flag replaces
 it.
 
