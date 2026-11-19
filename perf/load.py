@@ -134,13 +134,14 @@ def machine() -> dict:
     }
 
 
-def write_result(name: str, payload: dict) -> Path:
+def write_result(name: str, payload: dict) -> bool:
     RESULTS.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H-%M-%SZ")
     out = RESULTS / f"{name}-{stamp}-{payload['environment']['commit']}.json"
     out.write_text(json.dumps(payload, indent=2) + "\n")
     print(f"wrote {out}")
-    return out
+    # A scenario without declared checks records; it cannot fail.
+    return bool(payload.get("passed", True))
 
 
 def wait_port(port: int, proc: subprocess.Popen, timeout_s=15) -> None:
@@ -157,7 +158,7 @@ def wait_port(port: int, proc: subprocess.Popen, timeout_s=15) -> None:
     sys.exit(f"port {port} never came up in {timeout_s}s")
 
 
-def cold_start() -> None:
+def cold_start() -> bool:
     load_before = loadavg()
     for _ in range(COLD_WARMUP):
         run_ms([str(BIN), "run", str(SCRIPTS / "cold.js")])
@@ -173,12 +174,15 @@ def cold_start() -> None:
     # ru_maxrss on Darwin is bytes; it is the max across ALL waited-for
     # children, i.e. the worst single spawn's peak.
     peak_rss = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
-    write_result("m7-1-cold-start", {
+    checks = {"no_failed_spawns": not fails}
+    return write_result("m7-1-cold-start", {
         "milestone": "M7.1",
         "workload": f"{COLD_RUNS} release-binary spawns of cold.js ({COLD_WARMUP} warmup), wall-clock spawn->exit",
         "environment": machine(),
         "cold_start_ms": summarize(samples) if samples else None,
         "failures": fails,
+        "checks": checks,
+        "passed": all(checks.values()),
         "peak_child_rss_bytes": peak_rss,
         "loadavg_before": load_before,
         "loadavg_after": loadavg(),
@@ -187,17 +191,23 @@ def cold_start() -> None:
     })
 
 
-def op_million() -> None:
+def op_million() -> bool:
     load_before = loadavg()
     ms, proc = run_ms([str(BIN), "run", str(SCRIPTS / "op-1m.js")])
     report = json.loads(proc.stdout.strip()) if proc.returncode == 0 else None
-    write_result("m7-2a-op-1m", {
+    checks = {
+        "exit_code": proc.returncode == 0,
+        "ops": report is not None and report.get("n") == 1_000_000,
+    }
+    return write_result("m7-2a-op-1m", {
         "milestone": "M7.2a",
         "workload": "op-1m.js: 1,000,000 rt.now() calls, empty-loop baseline subtracted",
         "environment": machine(),
         "wall_ms": round(ms, 1),
         "exit_code": proc.returncode,
         "result": report,
+        "checks": checks,
+        "passed": all(checks.values()),
         "stderr": proc.stderr[:500] if proc.returncode != 0 else None,
         "loadavg_before": load_before,
         "loadavg_after": loadavg(),
@@ -205,7 +215,7 @@ def op_million() -> None:
 
 
 def serve_million(concurrency: int = SERVE_CONCURRENCY,
-                  name: str = "m7-2b-serve-1m", milestone: str = "M7.2b") -> None:
+                  name: str = "m7-2b-serve-1m", milestone: str = "M7.2b") -> bool:
     load_before = loadavg()
     proc = subprocess.Popen(
         [str(BIN), "run", str(SCRIPTS / "serve-load.js"),
@@ -227,12 +237,21 @@ def serve_million(concurrency: int = SERVE_CONCURRENCY,
             proc.wait(timeout=10)
         except subprocess.TimeoutExpired:
             proc.kill()
-    write_result(name, {
+    outcomes = (report or {}).get("outcomes", {})
+    checks = {
+        "issued": report is not None and report.get("requests_issued") == SERVE_REQUESTS,
+        "all_ok": report is not None and outcomes.get("ok") == SERVE_REQUESTS,
+        "zero_errors": report is not None
+        and all(v == 0 for k, v in outcomes.items() if k != "ok"),
+    }
+    return write_result(name, {
         "milestone": milestone,
         "workload": f"{SERVE_REQUESTS} GET / through rt.serve, {concurrency} keep-alive connections (jsrt-load driver, client-observed latency)",
         "environment": machine(),
         "load_wall_ms": round(ms, 1),
         "driver": report,
+        "checks": checks,
+        "passed": all(checks.values()),
         "driver_stderr": load_stderr if lp.returncode != 0 else None,
         "server_exit": proc.returncode,
         "loadavg_before": load_before,
@@ -244,8 +263,8 @@ def serve_million(concurrency: int = SERVE_CONCURRENCY,
     })
 
 
-def saturation_million() -> None:
-    serve_million(SATURATION_CONCURRENCY, "m7-2b-serve-1m-saturation", "M7.2b-saturation")
+def saturation_million() -> bool:
+    return serve_million(SATURATION_CONCURRENCY, "m7-2b-serve-1m-saturation", "M7.2b-saturation")
 
 
 def http(method: str, url: str, headers: dict | None = None, body: bytes | None = None):
@@ -254,7 +273,7 @@ def http(method: str, url: str, headers: dict | None = None, body: bytes | None 
         return r.status, r.read().decode()
 
 
-def webhook_million() -> None:
+def webhook_million() -> bool:
     """The real webhook app (examples/webhook) on the dedup path at 1M.
 
     It runs from a temporary copy (app.js and its manifest, unchanged) so
@@ -293,13 +312,23 @@ def webhook_million() -> None:
                 proc.wait(timeout=10)
             except subprocess.TimeoutExpired:
                 proc.kill()
-    write_result("m7-2b-webhook-1m-composed", {
+    outcomes = (report or {}).get("outcomes", {})
+    checks = {
+        "issued": report is not None and report.get("requests_issued") == SERVE_REQUESTS,
+        "all_ok": report is not None and outcomes.get("ok") == SERVE_REQUESTS,
+        "zero_errors": report is not None
+        and all(v == 0 for k, v in outcomes.items() if k != "ok"),
+        "dedup_held": keys_after == ["hook/github/d1"],
+    }
+    return write_result("m7-2b-webhook-1m-composed", {
         "milestone": "M7.2b-composed",
         "workload": f"{SERVE_REQUESTS} POST /hooks/github X-Delivery-Id:d1 through the real webhook app (examples/webhook on port {WEBHOOK_PORT}, temporary copy) - the dedup path: serve dispatch + rt.kv.get on a live store. {SERVE_CONCURRENCY} keep-alive connections.",
         "environment": machine(),
         "load_wall_ms": round(ms, 1),
         "seed": {"status": seed[0], "body": seed[1]},
         "driver": report,
+        "checks": checks,
+        "passed": all(checks.values()),
         "driver_stderr": load_stderr if lp.returncode != 0 else None,
         "keys_after": keys_after,
         "dedup_held": keys_after == ["hook/github/d1"],
@@ -322,7 +351,7 @@ def materialize(template: str, dst: Path, subs: dict) -> Path:
     return dst
 
 
-def kv_sustained() -> None:
+def kv_sustained() -> bool:
     """N mixed kv ops on a granted store, then writes until the quota
     refuses — integrity, quota enforcement and store sanity under load."""
     load_before = loadavg()
@@ -356,7 +385,7 @@ def kv_sustained() -> None:
         "store_bytes_max": store_bytes <= thresholds["store_bytes_max"],
         "exit_code": proc.returncode == 0,
     }
-    write_result("m8-1-kv-sustained", {
+    return write_result("m8-1-kv-sustained", {
         "milestone": "M8.1",
         "workload": f"{KV_UNITS} mixed rt.kv get/put/list/delete ops on a granted store (1024-key working set, kv-sustained.js), then 64 KiB writes until the {quota_mb} MiB quota refuses",
         "environment": machine(),
@@ -372,7 +401,7 @@ def kv_sustained() -> None:
     })
 
 
-def media_sustained() -> None:
+def media_sustained() -> bool:
     """N streamed rt.media.put from a read-granted dir, dedup every 10th,
     stat on every distinct name — the store must hold exactly the source
     set, complete files only."""
@@ -420,7 +449,7 @@ def media_sustained() -> None:
         "stat_ok": report is not None and report["stat_ok"] == MEDIA_FILES,
         "exit_code": proc.returncode == 0,
     }
-    write_result("m8-2-media-sustained", {
+    return write_result("m8-2-media-sustained", {
         "milestone": "M8.2",
         "workload": f"{MEDIA_UNITS} rt.media.put over {MEDIA_FILES} distinct sources (~4-8 KiB each), dedup every 10th op, stat per distinct name",
         "environment": machine(),
@@ -437,7 +466,7 @@ def media_sustained() -> None:
     })
 
 
-def refuse_flood() -> None:
+def refuse_flood() -> bool:
     """N ungated op calls in one run: every refusal must classify as a
     named CapabilityError, the run must end clean, nothing may leak."""
     load_before = loadavg()
@@ -460,7 +489,7 @@ def refuse_flood() -> None:
         "not_refused": report is not None and report["not_refused"] == 0,
         "exit_code": proc.returncode == 0,
     }
-    write_result("m8-3-refusal-flood", {
+    return write_result("m8-3-refusal-flood", {
         "milestone": "M8.3",
         "workload": f"{REFUSE_UNITS} ungated op calls (rt.kv/rt.fetch/rt.media/rt.readText) in one ungranted run — refusals must classify fast and clean",
         "environment": machine(),
@@ -475,22 +504,55 @@ def refuse_flood() -> None:
     })
 
 
-def supervise_churn() -> None:
+def report_records(path: Path) -> list[dict]:
+    """Every non-empty line of a report generation, parsed."""
+    if not path.exists():
+        return []
+    return [
+        json.loads(line)
+        for line in path.read_text().splitlines()
+        if line.strip()
+    ]
+
+
+def last_run_record(path: Path) -> dict | None:
+    """The last run record in a report file — the record the run that
+    just exited appended (a rotation writes its meta-line first, so the
+    run's own record is still last)."""
+    for rec in reversed(report_records(path)):
+        if "run_id" in rec:
+            return rec
+    return None
+
+
+def supervise_churn() -> bool:
     """N spawn->ready->SIGTERM cycles: the worker holds a port, so an
-    orphaned worker breaks the next respawn. Every kill must classify."""
+    orphaned worker breaks the next respawn. Every kill must classify.
+
+    The report file is bounded by design — it rotates to <name>.1 at
+    --report-max-kb keeping the current file plus ONE previous
+    generation, so at 1,000 rounds only the last records are retained.
+    Classification is therefore checked twice: per round the scenario
+    reads back the record that round just appended, and at the end every
+    record still retained (in either generation) must classify."""
     load_before = loadavg()
+    report_max_kb = 512  # supervise's --report-max-kb default, passed explicitly
     rounds_done = 0
     exits: dict[int, int] = {}
     orphans = 0
     respawn_failed = 0
+    per_round_classified = 0
+    last_seen_run_id = None
     t0 = time.perf_counter()
     with tempfile.TemporaryDirectory(prefix="jsrt-churn-") as tmp:
         report_path = Path(tmp) / "runs.jsonl"
+        rotated_path = report_path.with_name(report_path.name + ".1")
         for i in range(CHURN_ROUNDS):
             proc = subprocess.Popen(
                 [str(BIN), "supervise", str(SCRIPTS / "churn-worker.js"),
                  "--serve", f"127.0.0.1:{CHURN_PORT}",
-                 "--report", str(report_path), "--wall-ms", "30000"],
+                 "--report", str(report_path),
+                 "--report-max-kb", str(report_max_kb), "--wall-ms", "30000"],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             )
             try:
@@ -507,6 +569,13 @@ def supervise_churn() -> None:
                 proc.kill()
             exits[proc.returncode] = exits.get(proc.returncode, 0) + 1
             rounds_done += 1
+            # The record this round appended is the file's last run
+            # record; a missing emit leaves the previous record in place.
+            rec = last_run_record(report_path)
+            if rec is not None and rec.get("run_id") != last_seen_run_id:
+                last_seen_run_id = rec.get("run_id")
+                if rec.get("killed_by") == "operator-sigterm":
+                    per_round_classified += 1
             if (i + 1) % 200 == 0:
                 print(f"  churn {i + 1}/{CHURN_ROUNDS}", file=sys.stderr)
         # The port must be free after the last kill — an orphan holds it.
@@ -515,38 +584,44 @@ def supervise_churn() -> None:
                 orphans += 1
         except OSError:
             pass
-        records = []
-        if report_path.exists():
-            records = [
-                json.loads(line)
-                for line in report_path.read_text().splitlines()
-                if line.strip() and '"run_id"' in line
-            ]
+        retained = report_records(report_path) + report_records(rotated_path)
+        retained_runs = [r for r in retained if "run_id" in r]
+        rotations = [r for r in retained if r.get("type") == "rotation"]
+        report_bytes = sum(
+            p.stat().st_size for p in (report_path, rotated_path) if p.exists()
+        )
     wall_ms = (time.perf_counter() - t0) * 1000
-    classified = sum(1 for r in records if r.get("killed_by") == "operator-sigterm")
+    classified_retained = sum(1 for r in retained_runs if r.get("killed_by") == "operator-sigterm")
     thresholds = {
         "rounds": CHURN_ROUNDS,
         "exit_code": 6,
         "killed_by": "operator-sigterm",
         "respawn_failed": 0,
         "orphans": 0,
+        "report_max_kb": report_max_kb,
     }
     checks = {
         "rounds": rounds_done == CHURN_ROUNDS,
         "exit_code": set(exits) <= {6},
-        "killed_by": classified == rounds_done,
+        "killed_by": per_round_classified == rounds_done,
+        "retained_all_classified": len(retained_runs) > 0 and classified_retained == len(retained_runs),
+        "report_bounded": report_bytes <= report_max_kb * 1024 * 2,
         "respawn_failed": respawn_failed == 0,
         "orphans": orphans == 0,
     }
-    write_result("m8-4-supervise-churn", {
+    return write_result("m8-4-supervise-churn", {
         "milestone": "M8.4",
         "workload": f"{CHURN_ROUNDS} jsrt supervise spawn->ready->SIGTERM cycles of a serve worker on port {CHURN_PORT} — an orphaned worker would hold the port and break the next respawn",
         "environment": machine(),
         "wall_ms": round(wall_ms, 1),
         "rounds": rounds_done,
         "exit_codes": exits,
-        "records_classified_operator_sigterm": classified,
-        "report_records": len(records),
+        "per_round_classified_operator_sigterm": per_round_classified,
+        "records_classified_operator_sigterm": classified_retained,
+        "report_records": len(retained_runs),
+        "rotation_records": len(rotations),
+        "records_displaced_to_rotated_file": sum(r.get("dropped_records", 0) for r in rotations),
+        "report_file_bytes": report_bytes,
         "respawn_failed": respawn_failed,
         "orphans": orphans,
         "thresholds": thresholds,
@@ -554,34 +629,46 @@ def supervise_churn() -> None:
         "passed": all(checks.values()),
         "loadavg_before": load_before,
         "loadavg_after": loadavg(),
-        "caveats": ["port-free-per-round is the orphan proof; process listing is not used"],
+        "caveats": [
+            "port-free-per-round is the orphan proof; process listing is not used",
+            "the report is bounded by design: at --report-max-kb the file rotates to <name>.1 keeping one previous generation, so report_records < rounds means rotation dropped the earlier generations, not lost records",
+        ],
     })
 
 
-def main() -> None:
-    for b in (BIN, LOAD):
-        if not b.exists():
-            sys.exit(f"missing {b} — cargo build --release -p jsrt -p jsrt-load")
-    which = sys.argv[1] if len(sys.argv) > 1 else "all"
-    if which in ("all", "cold"):
-        cold_start()
-    if which in ("all", "op"):
-        op_million()
-    if which in ("all", "serve"):
-        serve_million()
-    if which in ("all", "saturation"):
-        saturation_million()
-    if which in ("all", "webhook"):
-        webhook_million()
-    if which in ("all", "kv"):
-        kv_sustained()
-    if which in ("all", "media"):
-        media_sustained()
-    if which in ("all", "refuse"):
-        refuse_flood()
-    if which in ("all", "churn"):
-        supervise_churn()
+SCENARIOS = {
+    "cold": cold_start,
+    "op": op_million,
+    "serve": serve_million,
+    "saturation": saturation_million,
+    "webhook": webhook_million,
+    "kv": kv_sustained,
+    "media": media_sustained,
+    "refuse": refuse_flood,
+    "churn": supervise_churn,
+}
+
+
+def main(which: str | None = None, scenarios: dict | None = None,
+         check_bins: bool = True) -> int:
+    """Run the chosen scenarios; exit 1 when any declares a failed check —
+    a `passed:false` artifact must fail the workflow, not just record."""
+    if check_bins:
+        for b in (BIN, LOAD):
+            if not b.exists():
+                sys.exit(f"missing {b} — cargo build --release -p jsrt -p jsrt-load")
+    which = which or (sys.argv[1] if len(sys.argv) > 1 else "all")
+    table = SCENARIOS if scenarios is None else scenarios
+    names = list(table) if which == "all" else [which]
+    unknown = [n for n in names if n not in table]
+    if unknown:
+        sys.exit(f"unknown scenario {unknown[0]} — one of: all, {', '.join(table)}")
+    ok = True
+    for n in names:
+        # Every scenario runs even after a failure: all artifacts land.
+        ok = table[n]() and ok
+    return 0 if ok else 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

@@ -1,0 +1,60 @@
+{
+  "milestone": "M7.2b",
+  "workload": "1000000 GET / through rt.serve, 32 keep-alive connections (jsrt-load driver, client-observed latency)",
+  "environment": {
+    "commit": "8dc8d32",
+    "date_utc": "2026-11-19T00:33:45+00:00",
+    "arch": "x86_64",
+    "chip": "INTEL(R) XEON(R) PLATINUM 8573C",
+    "cores": 4,
+    "mem_bytes": 16759308288,
+    "os": "Linux 7.0.0-1017-azure",
+    "build": "release (opt-level 3)"
+  },
+  "load_wall_ms": 13317.0,
+  "driver": {
+    "url": "http://127.0.0.1:47410/",
+    "method": "GET",
+    "requests_target": 1000000,
+    "requests_issued": 1000000,
+    "concurrency": 32,
+    "wall_ms": 13307,
+    "rps": 75148,
+    "latency_us": {
+      "p50": 424,
+      "p95": 512,
+      "p99": 586,
+      "max": 4693
+    },
+    "outcomes": {
+      "ok": 1000000,
+      "non2xx": 0,
+      "refused": 0,
+      "timeout": 0,
+      "client_err": 0
+    },
+    "error_rate": 0.0
+  },
+  "checks": {
+    "issued": true,
+    "all_ok": true,
+    "zero_errors": true
+  },
+  "passed": true,
+  "driver_stderr": null,
+  "server_exit": -15,
+  "loadavg_before": [
+    3.76,
+    1.72,
+    0.69
+  ],
+  "loadavg_after": [
+    3.74,
+    1.82,
+    0.74
+  ],
+  "caveats": [
+    "latency is client-observed (includes client stack + loopback), not server service time",
+    "single workstation; the driver shares cores with the server under test"
+  ]
+}

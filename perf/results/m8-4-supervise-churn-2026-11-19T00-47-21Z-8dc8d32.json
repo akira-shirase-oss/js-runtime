@@ -1,0 +1,59 @@
+{
+  "milestone": "M8.4",
+  "workload": "1000 jsrt supervise spawn->ready->SIGTERM cycles of a serve worker on port 47412 \u2014 an orphaned worker would hold the port and break the next respawn",
+  "environment": {
+    "commit": "8dc8d32",
+    "date_utc": "2026-11-19T00:47:21+00:00",
+    "arch": "x86_64",
+    "chip": "INTEL(R) XEON(R) PLATINUM 8573C",
+    "cores": 4,
+    "mem_bytes": 16759308288,
+    "os": "Linux 7.0.0-1017-azure",
+    "build": "release (opt-level 3)"
+  },
+  "wall_ms": 85074.8,
+  "rounds": 1000,
+  "exit_codes": {
+    "6": 1000
+  },
+  "per_round_classified_operator_sigterm": 1000,
+  "records_classified_operator_sigterm": 1000,
+  "report_records": 1000,
+  "rotation_records": 1,
+  "records_displaced_to_rotated_file": 856,
+  "report_file_bytes": 612072,
+  "respawn_failed": 0,
+  "orphans": 0,
+  "thresholds": {
+    "rounds": 1000,
+    "exit_code": 6,
+    "killed_by": "operator-sigterm",
+    "respawn_failed": 0,
+    "orphans": 0,
+    "report_max_kb": 512
+  },
+  "checks": {
+    "rounds": true,
+    "exit_code": true,
+    "killed_by": true,
+    "retained_all_classified": true,
+    "report_bounded": true,
+    "respawn_failed": true,
+    "orphans": true
+  },
+  "passed": true,
+  "loadavg_before": [
+    1.28,
+    1.46,
+    1.14
+  ],
+  "loadavg_after": [
+    1.06,
+    1.33,
+    1.12
+  ],
+  "caveats": [
+    "port-free-per-round is the orphan proof; process listing is not used",
+    "the report is bounded by design: at --report-max-kb the file rotates to <name>.1 keeping one previous generation, so report_records < rounds means rotation dropped the earlier generations, not lost records"
+  ]
+}

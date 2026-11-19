@@ -1,0 +1,40 @@
+{
+  "milestone": "M7.2a",
+  "workload": "op-1m.js: 1,000,000 rt.now() calls, empty-loop baseline subtracted",
+  "environment": {
+    "commit": "8dc8d32",
+    "date_utc": "2026-11-19T00:33:32+00:00",
+    "arch": "x86_64",
+    "chip": "INTEL(R) XEON(R) PLATINUM 8573C",
+    "cores": 4,
+    "mem_bytes": 16759308288,
+    "os": "Linux 7.0.0-1017-azure",
+    "build": "release (opt-level 3)"
+  },
+  "wall_ms": 74.4,
+  "exit_code": 0,
+  "result": {
+    "n": 1000000,
+    "loop_ns_per_call": 4.36572265625,
+    "now_ns_per_call": 51.49658203125,
+    "now_boundary_ns_per_call": 47.130859375,
+    "calls_per_sec": 19418765,
+    "acc_sink": 499999500000
+  },
+  "checks": {
+    "exit_code": true,
+    "ops": true
+  },
+  "passed": true,
+  "stderr": null,
+  "loadavg_before": [
+    3.76,
+    1.72,
+    0.69
+  ],
+  "loadavg_after": [
+    3.76,
+    1.72,
+    0.69
+  ]
+}

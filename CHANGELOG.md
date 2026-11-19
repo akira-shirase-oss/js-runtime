@@ -30,7 +30,10 @@ lifecycle and honest error classification.
 ### Supervision (`jsrt supervise`)
 
 - Process boundary for what the V8 heap cannot bound: `RLIMIT_CPU`, RSS
-  polling, SIGTERM→SIGKILL escalation, bounded JSONL run reports.
+  polling, SIGTERM→SIGKILL escalation, bounded JSONL run reports —
+  `--report` files rotate to `<name>.1` at `--report-max-kb` (default
+  512 KiB), keeping the records that fit plus one previous generation;
+  the rotation meta-record counts the displaced.
 - Worker output bounded per stream: a lifetime cap (`--max-output-kb`,
   default 8 MiB) that doubles as a token-bucket burst once a sustained
   rate is set (`--max-output-rate-kbs`); the last 4 KiB is re-shown at

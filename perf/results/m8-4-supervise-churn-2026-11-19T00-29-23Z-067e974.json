@@ -1,0 +1,59 @@
+{
+  "milestone": "M8.4",
+  "workload": "1000 jsrt supervise spawn->ready->SIGTERM cycles of a serve worker on port 47412 \u2014 an orphaned worker would hold the port and break the next respawn",
+  "environment": {
+    "commit": "067e974",
+    "date_utc": "2026-11-19T00:29:23+00:00",
+    "arch": "arm64",
+    "chip": "arm",
+    "cores": 12,
+    "mem_bytes": 34359738368,
+    "os": "27.2.1",
+    "build": "release (opt-level 3)"
+  },
+  "wall_ms": 120660.8,
+  "rounds": 1000,
+  "exit_codes": {
+    "6": 1000
+  },
+  "per_round_classified_operator_sigterm": 1000,
+  "records_classified_operator_sigterm": 1000,
+  "report_records": 1000,
+  "rotation_records": 1,
+  "records_dropped_by_rotation": 857,
+  "report_file_bytes": 611533,
+  "respawn_failed": 0,
+  "orphans": 0,
+  "thresholds": {
+    "rounds": 1000,
+    "exit_code": 6,
+    "killed_by": "operator-sigterm",
+    "respawn_failed": 0,
+    "orphans": 0,
+    "report_max_kb": 512
+  },
+  "checks": {
+    "rounds": true,
+    "exit_code": true,
+    "killed_by": true,
+    "retained_all_classified": true,
+    "report_bounded": true,
+    "respawn_failed": true,
+    "orphans": true
+  },
+  "passed": true,
+  "loadavg_before": [
+    4.44,
+    3.98,
+    4.97
+  ],
+  "loadavg_after": [
+    10.25,
+    5.36,
+    5.32
+  ],
+  "caveats": [
+    "port-free-per-round is the orphan proof; process listing is not used",
+    "the report is bounded by design: at --report-max-kb the file rotates to <name>.1 keeping one previous generation, so report_records < rounds means rotation dropped the earlier generations, not lost records"
+  ]
+}

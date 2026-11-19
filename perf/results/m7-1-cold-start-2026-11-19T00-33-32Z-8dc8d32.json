@@ -1,0 +1,43 @@
+{
+  "milestone": "M7.1",
+  "workload": "1000 release-binary spawns of cold.js (20 warmup), wall-clock spawn->exit",
+  "environment": {
+    "commit": "8dc8d32",
+    "date_utc": "2026-11-19T00:33:32+00:00",
+    "arch": "x86_64",
+    "chip": "INTEL(R) XEON(R) PLATINUM 8573C",
+    "cores": 4,
+    "mem_bytes": 16759308288,
+    "os": "Linux 7.0.0-1017-azure",
+    "build": "release (opt-level 3)"
+  },
+  "cold_start_ms": {
+    "n": 1000,
+    "min": 11.915,
+    "p50": 14.649,
+    "p95": 19.261,
+    "p99": 21.748,
+    "mean": 15.271,
+    "max": 22.875
+  },
+  "failures": [],
+  "checks": {
+    "no_failed_spawns": true
+  },
+  "passed": true,
+  "peak_child_rss_bytes": 32944,
+  "loadavg_before": [
+    3.53,
+    1.57,
+    0.62
+  ],
+  "loadavg_after": [
+    3.76,
+    1.72,
+    0.69
+  ],
+  "caveats": [
+    "spawn includes macOS exec+dyld, not just V8 init",
+    "peak_child_rss is the worst single child's max RSS (getrusage RUSAGE_CHILDREN)"
+  ]
+}

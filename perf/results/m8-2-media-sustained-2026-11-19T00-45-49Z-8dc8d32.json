@@ -1,0 +1,56 @@
+{
+  "milestone": "M8.2",
+  "workload": "100000 rt.media.put over 64 distinct sources (~4-8 KiB each), dedup every 10th op, stat per distinct name",
+  "environment": {
+    "commit": "8dc8d32",
+    "date_utc": "2026-11-19T00:45:49+00:00",
+    "arch": "x86_64",
+    "chip": "INTEL(R) XEON(R) PLATINUM 8573C",
+    "cores": 4,
+    "mem_bytes": 16759308288,
+    "os": "Linux 7.0.0-1017-azure",
+    "build": "release (opt-level 3)"
+  },
+  "wall_ms": 63356.1,
+  "result": {
+    "puts": 100000,
+    "put_wall_ms": 63340,
+    "dedup_puts": 10000,
+    "put_bytes": 612751602,
+    "distinct_names": 64,
+    "stats": 64,
+    "stat_ok": 64
+  },
+  "stored_files": 64,
+  "stored_bytes": 392182,
+  "thresholds": {
+    "puts": 100000,
+    "distinct_names": 64,
+    "stored_files": 64,
+    "stored_tmp_files": 0,
+    "stored_bytes": 392182,
+    "stat_ok": 64,
+    "exit_code": 0
+  },
+  "checks": {
+    "puts": true,
+    "distinct_names": true,
+    "stored_files": true,
+    "stored_tmp_files": true,
+    "stored_bytes": true,
+    "stat_ok": true,
+    "exit_code": true
+  },
+  "passed": true,
+  "stderr": null,
+  "loadavg_before": [
+    1.32,
+    1.49,
+    1.12
+  ],
+  "loadavg_after": [
+    1.31,
+    1.46,
+    1.14
+  ]
+}
